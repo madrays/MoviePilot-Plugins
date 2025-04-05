@@ -23,7 +23,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -133,8 +133,15 @@ class FengchaoSignin(_PluginBase):
         """
         蜂巢签到
         """
+
+        # 获取系统代理配置
+        proxies = settings.PROXY if hasattr(settings, 'PROXY') else None
+        
         # 连接失败处理
-        res = RequestUtils(cookies=self._cookie).get_res(url="https://pting.club")
+        if proxies:
+            res = RequestUtils(cookies=self._cookie, proxies=proxies).get_res(url="https://pting.club")
+        else:
+            res = RequestUtils(cookies=self._cookie).get_res(url="https://pting.club")
         if not res or res.status_code != 200:
             logger.error("请求蜂巢错误")
             
@@ -304,8 +311,14 @@ class FengchaoSignin(_PluginBase):
             }
         }
 
+        # 获取系统代理配置
+        proxies = settings.PROXY if hasattr(settings, 'PROXY') else None
+
         # 开始签到
-        res = RequestUtils(headers=headers).post_res(url=f"https://pting.club/api/users/{userId}", json=data)
+        if proxies:
+            res = RequestUtils(headers=headers, proxies=proxies).post_res(url=f"https://pting.club/api/users/{userId}", json=data)
+        else:
+            res = RequestUtils(headers=headers).post_res(url=f"https://pting.club/api/users/{userId}", json=data)
 
         if not res or res.status_code != 200:
             logger.error("蜂巢签到失败")
