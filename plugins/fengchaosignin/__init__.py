@@ -238,7 +238,7 @@ class FengchaoSignin(_PluginBase):
                     
                     # 使用获取的cookie访问蜂巢
                     try:
-                        res = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.club")
+                        res = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.cc")
                     except Exception as e:
                         logger.error(f"请求蜂巢出错: {str(e)}")
                         if attempt < max_retries:
@@ -310,7 +310,7 @@ class FengchaoSignin(_PluginBase):
                     # 开始签到
                     try:
                         res = RequestUtils(headers=headers, proxies=proxies, timeout=30).post_res(
-                            url=f"https://pting.club/api/users/{userId}", 
+                            url=f"https://pting.cc/api/users/{userId}", 
                             json=data
                         )
                     except Exception as e:
@@ -1894,7 +1894,7 @@ class FengchaoSignin(_PluginBase):
                 
             # 使用获取的cookie访问蜂巢获取必要信息
             try:
-                res = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.club")
+                res = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.cc")
             except Exception as e:
                 logger.error(f"请求蜂巢出错: {str(e)}")
                 return
@@ -2027,7 +2027,7 @@ class FengchaoSignin(_PluginBase):
                 proxies = self._get_proxies()
                 
                 # 发送请求
-                url = f"https://pting.club/api/users/{user_id}"
+                url = f"https://pting.cc/api/users/{user_id}"
                 logger.info(f"准备更新蜂巢论坛PT人生数据: {len(formatted_stats.get('sites', []))} 个站点")
                 
                 try:
@@ -2358,7 +2358,7 @@ class FengchaoSignin(_PluginBase):
             }
             
             try:
-                res = req.get_res("https://pting.club", headers=headers)
+                res = req.get_res("https://pting.cc", headers=headers)
                 if not res or res.status_code != 200:
                     logger.error(f"GET请求失败，状态码: {res.status_code if res else '无响应'} (使用{proxy_info})")
                     return None
@@ -2419,7 +2419,7 @@ class FengchaoSignin(_PluginBase):
             
             try:
                 login_res = req.post_res(
-                    url="https://pting.club/login",
+                    url="https://pting.cc/login",
                     json=login_data,
                     headers=login_headers
                 )
@@ -2512,7 +2512,7 @@ class FengchaoSignin(_PluginBase):
             }
             
             try:
-                verify_res = req.get_res("https://pting.club", headers=headers)
+                verify_res = req.get_res("https://pting.cc", headers=headers)
                 if not verify_res or verify_res.status_code != 200:
                     logger.error(f"验证cookie失败，状态码: {verify_res.status_code if verify_res else '无响应'} (使用{proxy_info})")
                     return None
