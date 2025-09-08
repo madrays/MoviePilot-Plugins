@@ -701,8 +701,25 @@ class QmjSign(_PluginBase):
             text1 = resp1.text or ""
             logger.info(f"领取响应1: status={resp1.status_code}, len={len(text1)}")
 
-            # 简单关键字判断
-            success = ("恭喜您，任务已成功完成" in text1) or ("任务已成功完成" in text1)
+            # 成功关键字判定（更稳健）：
+            # 1) 直接包含成功文案
+            # 2) 包含跳转到 item=done 的链接或脚本
+            # 3) 其它可能变体
+            success = False
+            try:
+                patterns = [
+                    r"恭喜您，?任务已成功完成",
+                    r"任务已成功完成",
+                    r"home\.php\?mod=task&item=done",
+                    r"window\.location\.href\s*=\s*['\"]home\.php\?mod=task&item=done",
+                ]
+                for pat in patterns:
+                    if re.search(pat, text1):
+                        success = True
+                        break
+            except Exception:
+                # 回退到最简单包含判断
+                success = ("任务已成功完成" in text1) or ("item=done" in text1)
 
             # 第三步：查看完成页
             logger.info(f"请求查看完成页: {done_url}")
