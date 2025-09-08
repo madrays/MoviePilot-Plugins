@@ -175,12 +175,13 @@
     "name": "阡陌居签到",
     "description": "自动完成阡陌居每日签到，支持失败重试和历史记录",
     "labels": "签到,阡陌居",
-    "version": "1.0",
+    "version": "1.1.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/qmj.ico",
     "author": "madrays",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.1.0": "新增每日威望红包领取开关；解析并汇总财富六项（铜币/威望/贡献/发书数/积分/总积分）；通知与详情页展示优化（奖励列替代天数/积分）；精简日志",
       "v1.0": "首次发布"
     }
   },
