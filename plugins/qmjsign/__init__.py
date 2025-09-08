@@ -38,7 +38,7 @@ class QmjSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/qmj.ico"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -187,7 +187,8 @@ class QmjSign(_PluginBase):
                     sign_dict.update({
                         "message": last_success.get("message"),
                         "points": last_success.get("points"),
-                        "days": last_success.get("days")
+                        "days": last_success.get("days"),
+                        "coins_gain": last_success.get("coins_gain")
                     })
                 
                 # 发送通知 - 通知用户已经签到过了（附带威望信息）
@@ -652,11 +653,13 @@ class QmjSign(_PluginBase):
     def _claim_daily_prestige_reward(self, session: Optional[requests.Session]):
         """
         领取每日威望红包任务：
-        1) GET https://www.1000qm.vip/home.php?mod=task&do=draw&id=1
-        2) 跳转页 GET https://www.1000qm.vip/home.php?mod=task&item=done
+        1) GET https://www.1000qm.vip/home.php?mod=task&do=apply&id=1
+        2) GET https://www.1000qm.vip/home.php?mod=task&do=draw&id=1
+        3) 跳转页 GET https://www.1000qm.vip/home.php?mod=task&item=done
         无论成功或重复，都将响应摘要写入日志，便于后续优化。
         """
         try:
+            apply_url = "https://www.1000qm.vip/home.php?mod=task&do=apply&id=1"
             draw_url = "https://www.1000qm.vip/home.php?mod=task&do=draw&id=1"
             done_url = "https://www.1000qm.vip/home.php?mod=task&item=done"
 
@@ -686,6 +689,13 @@ class QmjSign(_PluginBase):
                 except Exception as e:
                     logger.warning(f"威望红包：解析Cookie失败（忽略继续）: {str(e)}")
 
+            # 第一步：申请任务
+            logger.info(f"请求申请威望红包任务: {apply_url}")
+            resp_apply = session.get(apply_url, headers=headers, timeout=(5, 15))
+            text_apply = resp_apply.text or ""
+            logger.info(f"领取响应-apply: status={resp_apply.status_code}, len={len(text_apply)}")
+
+            # 第二步：领取任务
             logger.info(f"请求领取威望红包: {draw_url}")
             resp1 = session.get(draw_url, headers=headers, timeout=(5, 15))
             text1 = resp1.text or ""
@@ -694,7 +704,7 @@ class QmjSign(_PluginBase):
             # 简单关键字判断
             success = ("恭喜您，任务已成功完成" in text1) or ("任务已成功完成" in text1)
 
-            # 第二步页面
+            # 第三步：查看完成页
             logger.info(f"请求查看完成页: {done_url}")
             resp2 = session.get(done_url, headers=headers, timeout=(5, 15))
             text2 = resp2.text or ""
