@@ -23,7 +23,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "1.0.8"
+    plugin_version = "1.0.9"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -136,6 +136,31 @@ class FengchaoSignin(_PluginBase):
                 mtype=NotificationType.SiteMessage,
                 title=title,
                 text=text
+            )
+
+    def _send_signin_failure_notification(self, error_message, attempt):
+        """
+        发送签到失败通知
+        :param error_message: 错误消息
+        :param attempt: 尝试次数
+        """
+        if self._notify:
+            self._send_notification(
+                title="【❌ 蜂巢签到失败】",
+                text=(
+                    f"📢 执行结果\n"
+                    f"━━━━━━━━━━\n"
+                    f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"❌ 状态：签到失败\n"
+                    f"🔍 失败原因：{error_message}\n"
+                    f"🔄 尝试次数：{attempt}\n"
+                    f"━━━━━━━━━━\n"
+                    f"💡 建议\n"
+                    f"• 检查网络连接是否正常\n"
+                    f"• 确认用户名密码是否正确\n"
+                    f"• 查看站点是否可正常访问\n"
+                    f"━━━━━━━━━━"
+                )
             )
 
     def _schedule_retry(self, hours=None):
@@ -345,11 +370,11 @@ class FengchaoSignin(_PluginBase):
                     if "canCheckin" in sign_dict['data']['attributes'] and not sign_dict['data']['attributes']['canCheckin']:
                         status_text = "已签到"
                         reward_text = "今日已领取奖励"
-                        logger.info(f"蜂巢已签到，当前花粉: {money}，累计签到: {totalContinuousCheckIn}")
+                        logger.info(f"蜂巢已签到，当前花粉: {round(money, 1)}，累计签到: {totalContinuousCheckIn}")
                     else:
                         status_text = "签到成功"
-                        reward_text = f"获得{lastCheckinMoney}花粉奖励"
-                        logger.info(f"蜂巢签到成功，获得{lastCheckinMoney}花粉，当前花粉: {money}，累计签到: {totalContinuousCheckIn}")
+                        reward_text = f"获得{round(lastCheckinMoney, 1)}花粉奖励"
+                        logger.info(f"蜂巢签到成功，获得{round(lastCheckinMoney, 1)}花粉，当前花粉: {round(money, 1)}，累计签到: {totalContinuousCheckIn}")
                     
                     # 发送通知
                     if self._notify:
@@ -363,7 +388,7 @@ class FengchaoSignin(_PluginBase):
                                 f"🎁 奖励：{reward_text}\n"
                                 f"━━━━━━━━━━\n"
                                 f"📊 积分统计\n"
-                                f"🌸 花粉：{money}\n"
+                                f"🌸 花粉：{round(money, 1)}\n"
                                 f"📆 签到天数：{totalContinuousCheckIn}\n"
                                 f"━━━━━━━━━━"
                             )
@@ -1190,7 +1215,7 @@ class FengchaoSignin(_PluginBase):
                                                                             {
                                                                                 'component': 'span',
                                                                                 'props': {'class': 'text-h6'},
-                                                                                'text': str(money)
+                                                                                'text': str(round(money, 1))
                                                                             }
                                                                         ]
                                                                     },
@@ -1427,12 +1452,12 @@ class FengchaoSignin(_PluginBase):
                             # 徽章部分
                             {
                                 'component': 'div',
-                                'props': {'class': 'mb-1 mt-1 pl-0'},
+                                'props': {'class': 'mb-1 mt-1 w-100', 'style': 'margin: 0 auto; padding: 0 16px;'},
                                 'content': [
                                     {
                                         'component': 'div',
                                         'props': {
-                                            'class': 'd-flex align-center mb-1 elevation-1 d-inline-block ml-0',
+                                            'class': 'd-flex align-center mb-1 elevation-1 d-inline-block',
                                             'style': 'background-color: rgba(255, 255, 255, 0.6); border-radius: 3px; width: fit-content; padding: 2px 8px 2px 5px;'
                                         },
                                         'content': [
@@ -1659,7 +1684,7 @@ class FengchaoSignin(_PluginBase):
                                     },
                                     {
                                         'component': 'span',
-                                        'text': record.get('money', '—')
+                                        'text': str(round(record.get('money', 0), 1)) if record.get('money') != '—' else '—'
                                     }
                                 ]
                             }
@@ -1711,7 +1736,7 @@ class FengchaoSignin(_PluginBase):
                                     },
                                     {
                                         'component': 'span',
-                                        'text': f"{record.get('lastCheckinMoney', 0)}花粉" if ("签到成功" in status_text or "已签到" in status_text) and record.get('lastCheckinMoney', 0) > 0 else '—'
+                                        'text': f"{round(record.get('lastCheckinMoney', 0), 1)}花粉" if ("签到成功" in status_text or "已签到" in status_text) and record.get('lastCheckinMoney', 0) > 0 else '—'
                                     }
                                 ]
                             }

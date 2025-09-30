@@ -80,12 +80,13 @@
     "name": "蜂巢论坛签到",
     "description": "自动完成蜂巢论坛每日签到，支持历史记录",
     "labels": "签到,蜂巢,论坛",
-    "version": "1.0.8",
+    "version": "1.0.9",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
     "author": "madrays",
     "level": 2,
     "v2": true,
     "history": {
+      "v1.0.9": "Fix：修复'FengchaoSignin' object has no attribute 执行失败错误；花粉数量浮点保留一位小数",
       "v1.0.8": "解除最多50个站点的限制"
     }
   },
