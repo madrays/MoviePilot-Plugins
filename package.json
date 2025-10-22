@@ -80,12 +80,13 @@
     "name": "蜂巢论坛签到",
     "description": "自动完成蜂巢论坛每日签到，支持历史记录",
     "labels": "签到,蜂巢,论坛",
-    "version": "1.0.9",
+    "version": "2.0.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
     "author": "madrays",
     "level": 2,
     "v2": true,
     "history": {
+      "v2.0.0": "蜂巢签到更新：\n1.若用户没有设置背景页面，则会读取个人页背景封面图\n2.更新了显示个人信息显示的效果\n3.恢复徽章显示，新增徽章分类，恢复用户组logo\n4.显示了签到，个人信息，pt人生的更新时间\n5.签到状态新增签到成功/已签到，若当天已经签过到，则提示为已签到\n6.设置新增更新个人信息选项，不进行签到操作\n7.设置新增定时更新个人信息选项\n8.新增签到失败次数记录\n9.新增新消息通知提示（需要更多验证）\n10.其他若干变化",
       "v1.0.9": "Fix：修复'FengchaoSignin' object has no attribute 执行失败错误；花粉数量浮点保留一位小数",
       "v1.0.8": "解除最多50个站点的限制"
     }
