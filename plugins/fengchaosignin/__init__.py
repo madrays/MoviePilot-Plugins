@@ -24,7 +24,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.0.1"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -93,7 +93,7 @@ class FengchaoSignin(_PluginBase):
             self._mp_push_interval = int(config.get("mp_push_interval", 1))
             self._use_proxy = config.get("use_proxy", True)
             self._username = config.get("username", "")
-            self._password = config.get("password", "")
+            self._password = config.get("user_password", "")
             self._timed_update_enabled = config.get("timed_update_enabled", False)
             self._timed_update_cron = config.get("timed_update_cron", "0 */2 * * *")
             self._timed_update_retry_count = int(config.get("timed_update_retry_count", 0))
@@ -189,7 +189,7 @@ class FengchaoSignin(_PluginBase):
             "mp_push_interval": self._mp_push_interval,
             "use_proxy": self._use_proxy,
             "username": self._username,
-            "password": self._password,
+            "user_password": self._password,
             "timed_update_enabled": self._timed_update_enabled,
             "timed_update_cron": self._timed_update_cron,
             "timed_update_retry_count": self._timed_update_retry_count,
@@ -793,6 +793,8 @@ class FengchaoSignin(_PluginBase):
         """
         拼装插件配置页面
         """
+        version = getattr(settings, "VERSION_FLAG", "v1")
+        cron_field_component = "VCronField" if version == "v2" else "VTextField"
         return [
             {
                 'component': 'VForm',
@@ -838,7 +840,7 @@ class FengchaoSignin(_PluginBase):
                                                 'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {'component': 'VSwitch',
-                                                     'props': {'model': 'enabled', 'label': '启用插件'}}
+                                                     'props': {'model': 'enabled', 'label': '启用插件', 'color': 'primary'}}
                                                 ]
                                             },
                                             {
@@ -846,9 +848,25 @@ class FengchaoSignin(_PluginBase):
                                                 'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {'component': 'VSwitch',
-                                                     'props': {'model': 'notify', 'label': '开启通知'}}
+                                                     'props': {'model': 'notify', 'label': '开启通知', 'color': 'info'}}
                                                 ]
                                             },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {'cols': 12, 'md': 4},
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'onlyonce',
+                                                            'label': '立即运行一次',
+                                                            'color': 'warning',
+                                                            'hint': '同时执行签到和信息更新任务',
+                                                            'persistent-hint': True
+                                                        }
+                                                    }
+                                                ]
+                                            }
                                         ]
                                     },
                                     {
@@ -861,9 +879,9 @@ class FengchaoSignin(_PluginBase):
                                                     {
                                                         'component': 'VSwitch',
                                                         'props': {
-                                                            'model': 'onlyonce',
-                                                            'label': '立即运行一次',
-                                                            'hint': '同时执行签到和信息更新任务',
+                                                            'model': 'use_proxy', 'label': '使用代理',
+                                                            'hint': '与蜂巢论坛通信时使用系统代理',
+                                                            'color': 'primary',
                                                             'persistent-hint': True
                                                         }
                                                     }
@@ -879,6 +897,7 @@ class FengchaoSignin(_PluginBase):
                                                             'model': 'update_info_now',
                                                             'label': '立即更新个人信息',
                                                             'hint': '不执行签到，仅刷新插件页面显示的用户信息',
+                                                            'color': 'info',
                                                             'persistent-hint': True
                                                         }
                                                     }
@@ -891,54 +910,39 @@ class FengchaoSignin(_PluginBase):
                                         'content': [
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
+                                                'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {
                                                         'component': 'VTextField',
                                                         'props': {
                                                             'model': 'username', 'label': '用户名',
                                                             'placeholder': '蜂巢论坛用户名',
-                                                            'hint': '自动登录获取Cookie'
+                                                            'hint': '自动登录获取Cookie',
+                                                            'autocomplete': 'new-username',
+                                                            'clearable': True,
                                                         }
                                                     }
                                                 ]
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
+                                                'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {
                                                         'component': 'VTextField',
                                                         'props': {
-                                                            'model': 'password', 'label': '密码',
+                                                            'model': 'user_password', 'label': '密码',
                                                             'placeholder': '蜂巢论坛密码', 'type': 'password',
-                                                            'hint': '自动登录获取Cookie'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
-                                                'content': [
-                                                    {
-                                                        'component': 'VCronField',
-                                                        'props': {
-                                                            'model': 'cron', 'label': '签到周期',
-                                                            'placeholder': '30 8 * * *',
-                                                            'hint': '五位cron表达式，每天早上8:30执行'
+                                                            'hint': '自动登录获取Cookie',
+                                                            'autocomplete': 'new-password',
+                                                            'clearable': True,
                                                         }
                                                     }
                                                 ]
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
+                                                'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {
                                                         'component': 'VTextField',
@@ -956,7 +960,21 @@ class FengchaoSignin(_PluginBase):
                                         'content': [
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
+                                                'props': {'cols': 12, 'md': 4},
+                                                'content': [
+                                                    {
+                                                        'component': cron_field_component,
+                                                        'props': {
+                                                            'model': 'cron', 'label': '签到周期',
+                                                            'placeholder': '30 8 * * *',
+                                                            'hint': '五位cron表达式，每天早上8:30执行'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {
                                                         'component': 'VTextField',
@@ -970,7 +988,7 @@ class FengchaoSignin(_PluginBase):
                                             },
                                             {
                                                 'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
+                                                'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {
                                                         'component': 'VTextField',
@@ -978,24 +996,6 @@ class FengchaoSignin(_PluginBase):
                                                             'model': 'retry_interval', 'label': '重试间隔(小时)',
                                                             'type': 'number', 'placeholder': '2',
                                                             'hint': '签到失败后多少小时后重试'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 6},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'use_proxy', 'label': '使用代理',
-                                                            'hint': '与蜂巢论坛通信时使用系统代理'
                                                         }
                                                     }
                                                 ]
@@ -1045,7 +1045,8 @@ class FengchaoSignin(_PluginBase):
                                                             'model': 'timed_update_enabled',
                                                             'label': '启用定时更新个人信息',
                                                             'hint': '若不启用，个人信息只会在签到时更新',
-                                                            'persistent-hint': True
+                                                            'persistent-hint': True,
+                                                            'color': 'primary'
                                                         }
                                                     }
                                                 ]
@@ -1060,7 +1061,7 @@ class FengchaoSignin(_PluginBase):
                                                 'props': {'cols': 12, 'md': 4},
                                                 'content': [
                                                     {
-                                                        'component': 'VCronField',
+                                                        'component': cron_field_component,
                                                         'props': {
                                                             'model': 'timed_update_cron',
                                                             'label': '更新周期',
@@ -1142,7 +1143,9 @@ class FengchaoSignin(_PluginBase):
                                                         'props': {
                                                             'model': 'mp_push_enabled',
                                                             'label': '启用PT人生数据更新',
-                                                            'hint': '每次签到时都会自动更新PT人生数据'
+                                                            'hint': '每次签到时都会自动更新PT人生数据',
+                                                            'color': 'primary',
+                                                            'persistent-hint': True
                                                         }
                                                     }
                                                 ]
@@ -1157,7 +1160,7 @@ class FengchaoSignin(_PluginBase):
             }
         ], {
             "enabled": False, "notify": True, "cron": "30 8 * * *", "onlyonce": False, "update_info_now": False,
-            "cookie": "", "username": "", "password": "", "history_days": 30, "retry_count": 0, "retry_interval": 2,
+            "cookie": "", "username": "", "user_password": "", "history_days": 30, "retry_count": 0, "retry_interval": 2,
             "mp_push_enabled": False, "mp_push_interval": 1, "use_proxy": True,
             "timed_update_enabled": False, "timed_update_cron": "0 */2 * * *",
             "timed_update_retry_count": 0, "timed_update_retry_interval": 0
@@ -1307,7 +1310,7 @@ class FengchaoSignin(_PluginBase):
 
                     all_category_cards.append({
                         'component': 'div',
-                        'props': {'class': 'ma-1 pa-2', 'style': f'{frost_style} border-radius: 12px;'},
+                        'props': {'class': 'ma-1', 'style': f'{frost_style} border-radius: 12px; padding: 4px;'},
                         'content': [
                             {'component': 'div',
                              'props': {'class': 'text-subtitle-2 grey--text text--darken-1',
@@ -1322,14 +1325,14 @@ class FengchaoSignin(_PluginBase):
 
                 badge_category_components.append({
                     'component': 'div',
-                    'props': {'class': 'd-flex flex-wrap'},
+                    'props': {'class': 'd-flex flex-wrap', 'style': 'padding-left: 12px; padding-right: 12px;'},
                     'content': all_category_cards
                 })
 
             # 未读消息提示
             username_display_content = [
                 {'component': 'div',
-                 'props': {'class': 'text-h6 mb-1 pa-2 d-inline-block elevation-2', 'style': frost_style},
+                 'props': {'class': 'text-h6 mb-1 d-inline-block elevation-2', 'style': f'{frost_style} padding: 4px;'},
                  'text': username}
             ]
             if unread_notifications > 0:
@@ -1439,7 +1442,7 @@ class FengchaoSignin(_PluginBase):
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center pa-2 elevation-2', 'style': frost_style},
+                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
@@ -1454,7 +1457,7 @@ class FengchaoSignin(_PluginBase):
                                          ]}]},
                                     {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center pa-2 elevation-2', 'style': frost_style},
+                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
@@ -1469,7 +1472,7 @@ class FengchaoSignin(_PluginBase):
                                          ]}]},
                                     {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center pa-2 elevation-2', 'style': frost_style},
+                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
@@ -1484,7 +1487,7 @@ class FengchaoSignin(_PluginBase):
                                          ]}]},
                                     {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center pa-2 elevation-2', 'style': frost_style},
+                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
@@ -1499,7 +1502,7 @@ class FengchaoSignin(_PluginBase):
                                          ]}]},
                                     {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center pa-2 elevation-2', 'style': frost_style},
+                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
@@ -1514,7 +1517,7 @@ class FengchaoSignin(_PluginBase):
                                          ]}]},
                                     {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center pa-2 elevation-2', 'style': frost_style},
+                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
@@ -1533,7 +1536,7 @@ class FengchaoSignin(_PluginBase):
                         *badge_category_components,
                         {'component': 'div', 'props': {
                             'class': 'mt-2 text-caption text-right pa-1 elevation-2 d-inline-block float-right',
-                            'style': frost_style}, 'text': footer_line}
+                            'style': f'{frost_style} border-radius: 8px 8px 0 0; margin-right: 16px;'}, 'text': footer_line}
                     ]}
                 ]
             }
