@@ -147,19 +147,6 @@
       "v1.0": "首次发布"
     }
   },
-  "P1115StrmHelper": {
-    "name": "VUE-115网盘STRM助手",
-    "description": "测试版仅供测试",
-    "labels": "STRM,115,网盘",
-    "version": "100000.1.1",
-    "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/u115.png",
-    "author": "VUE测试版",
-    "level": 1,
-    "v2": true,
-    "history": {
-      "v100000.1.1": "集成MediaWarp"
-    }
-  },
   "PluginManagerVue": {
     "name": "插件管理中心",
     "description": "集成插件热重载、彻底卸载、重装等功能，支持本地和在线插件管理。",
