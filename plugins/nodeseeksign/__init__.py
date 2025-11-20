@@ -49,7 +49,7 @@ class nodeseeksign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "2.0.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -78,6 +78,7 @@ class nodeseeksign(_PluginBase):
     _min_delay = 5         # 请求前最小随机等待（秒）
     _max_delay = 12        # 请求前最大随机等待（秒）
     _member_id = ""       # NodeSeek 成员ID（可选，用于获取用户信息）
+    _stats_days = 30
 
     _scraper = None        # cloudscraper 实例
 
@@ -128,6 +129,10 @@ class nodeseeksign(_PluginBase):
                     logger.warning("max_delay 配置无效，使用默认值 12")
                 self._member_id = (config.get("member_id") or "").strip()
                 self._clear_history = config.get("clear_history", False) # 初始化清除历史记录
+                try:
+                    self._stats_days = int(config.get("stats_days", 30))
+                except (ValueError, TypeError):
+                    self._stats_days = 30
                 
                 logger.info(f"配置: enabled={self._enabled}, notify={self._notify}, cron={self._cron}, "
                            f"random_choice={self._random_choice}, history_days={self._history_days}, "
@@ -136,16 +141,19 @@ class nodeseeksign(_PluginBase):
                 # 初始化 cloudscraper（可选，用于绕过 Cloudflare）
                 if HAS_CLOUDSCRAPER:
                     try:
-                        # 简化初始化，兼容不同 cloudscraper 版本
-                        self._scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows"})
-                        # 应用代理
+                        self._scraper = cloudscraper.create_scraper(browser="chrome")
+                    except Exception:
+                        try:
+                            self._scraper = cloudscraper.create_scraper()
+                        except Exception as e2:
+                            logger.warning(f"cloudscraper 初始化失败: {str(e2)}")
+                            self._scraper = None
+                    if self._scraper:
                         proxies = self._get_proxies()
                         if proxies:
                             self._scraper.proxies = proxies
                             logger.info(f"cloudscraper 初始化代理: {self._scraper.proxies}")
                         logger.info("cloudscraper 初始化成功")
-                    except Exception as e:
-                        logger.warning(f"cloudscraper 初始化失败: {str(e)}")
             
             if self._onlyonce:
                 logger.info("执行一次性签到")
@@ -169,7 +177,8 @@ class nodeseeksign(_PluginBase):
                     "min_delay": self._min_delay,
                     "max_delay": self._max_delay,
                     "member_id": self._member_id,
-                    "clear_history": self._clear_history # 保存清除历史记录配置
+                    "clear_history": self._clear_history,
+                    "stats_days": self._stats_days
                 })
 
                 # 启动任务
@@ -197,7 +206,8 @@ class nodeseeksign(_PluginBase):
                         "min_delay": self._min_delay,
                         "max_delay": self._max_delay,
                         "member_id": self._member_id,
-                        "clear_history": False  # 重置为 False
+                        "clear_history": False,
+                        "stats_days": self._stats_days
                     })
                     logger.info("已保存配置，clear_history 已重置为 False")
 
@@ -212,57 +222,6 @@ class nodeseeksign(_PluginBase):
         sign_dict = None
         
         try:
-            # 检查是否今日已成功签到（通过记录）
-            if self._is_already_signed_today():
-                logger.info("根据历史记录，今日已成功签到，获取签到奖励信息并通知用户")
-                
-                # 获取签到记录作为兜底
-                attendance_record = None
-                try:
-                    attendance_record = self._fetch_attendance_record()
-                except Exception as e:
-                    logger.warning(f"获取签到记录失败: {str(e)}")
-                
-                # 即使已签到，也要获取签到奖励信息并通知用户
-                sign_dict = {
-                    "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "status": "已签到",
-                    "message": "今日已完成签到"
-                }
-                
-                # 添加奖励信息到历史记录
-                if attendance_record and attendance_record.get("gain"):
-                    sign_dict["gain"] = attendance_record.get("gain")
-                    if attendance_record.get("rank"):
-                        sign_dict["rank"] = attendance_record.get("rank")
-                        sign_dict["total_signers"] = attendance_record.get("total_signers")
-                
-                # 保存历史记录
-                self._save_sign_history(sign_dict)
-                
-                # 获取用户信息（有成员ID就拉取）
-                user_info = None
-                try:
-                    if getattr(self, "_member_id", ""):
-                        user_info = self._fetch_user_info(self._member_id)
-                except Exception as e:
-                    logger.warning(f"获取用户信息失败: {str(e)}")
-
-                # 发送通知，告知用户今日已签到并显示奖励信息
-                if self._notify:
-                    try:
-                        self._send_sign_notification(sign_dict, {
-                            "success": True,
-                            "already_signed": True,
-                            "message": "今日已完成签到"
-                        }, user_info, attendance_record)
-                        logger.info("已签到状态通知发送成功")
-                    except Exception as e:
-                        logger.error(f"已签到状态通知发送失败: {str(e)}")
-                        # 通知失败不影响主流程，继续执行
-                
-                return sign_dict
-            
             # 检查Cookie
             if not self._cookie:
                 logger.error("未配置Cookie")
@@ -282,76 +241,27 @@ class nodeseeksign(_PluginBase):
             
             # 请求前随机等待
             self._wait_random_interval()
-
-            # 执行API签到
+            
+            # 无论任何情况都尝试执行API签到
             result = self._run_api_sign()
             
-            # 如果返回None，说明是特殊处理（时间验证失败），不记录失败历史
-            if result is None:
-                logger.info("签到响应异常，但通过时间验证判断为成功，不记录失败历史")
-                
-                # 获取签到记录来显示奖励信息
-                attendance_record = None
-                try:
-                    attendance_record = self._fetch_attendance_record()
-                except Exception as e:
-                    logger.warning(f"获取签到记录失败: {str(e)}")
-                
-                # 构建消息：签到成功，获得鸡腿 XX
-                message = "签到成功"
-                if attendance_record and attendance_record.get('gain'):
-                    message += f"，获得鸡腿 {attendance_record.get('gain')}"
-                
-                # 保存签到记录（包含奖励信息）
-                sign_dict = {
-                    "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "status": "签到成功（时间验证）",
-                    "message": message
-                }
-                
-                # 添加奖励信息到历史记录
-                if attendance_record and attendance_record.get("gain"):
-                    sign_dict["gain"] = attendance_record.get("gain")
-                    if attendance_record.get("rank"):
-                        sign_dict["rank"] = attendance_record.get("rank")
-                        sign_dict["total_signers"] = attendance_record.get("total_signers")
-                
-                # 保存历史记录
-                self._save_sign_history(sign_dict)
-                self._save_last_sign_date()
-                
-                # 获取用户信息（有成员ID就拉取）
-                user_info = None
-                try:
-                    if getattr(self, "_member_id", ""):
-                        user_info = self._fetch_user_info(self._member_id)
-                except Exception as e:
-                    logger.warning(f"获取用户信息失败: {str(e)}")
-
-                # 发送通知
-                if self._notify:
-                    try:
-                        self._send_sign_notification(sign_dict, {
-                            "success": True,
-                            "signed": True,
-                            "message": message
-                        }, user_info, attendance_record)
-                        logger.info("签到成功（时间验证）通知发送成功")
-                    except Exception as e:
-                        logger.error(f"签到成功（时间验证）通知发送失败: {str(e)}")
-                        # 通知失败不影响主流程，继续执行
-                
-                return sign_dict
+            # 始终获取最新用户信息
+            user_info = None
+            try:
+                if getattr(self, "_member_id", ""):
+                    user_info = self._fetch_user_info(self._member_id)
+            except Exception as e:
+                logger.warning(f"获取用户信息失败: {str(e)}")
+            
+            # 始终获取签到记录以获取奖励和排名
+            attendance_record = None
+            try:
+                attendance_record = self._fetch_attendance_record()
+            except Exception as e:
+                logger.warning(f"获取签到记录失败: {str(e)}")
             
             # 处理签到结果
             if result["success"]:
-                # 获取签到记录作为兜底
-                attendance_record = None
-                try:
-                    attendance_record = self._fetch_attendance_record()
-                except Exception as e:
-                    logger.warning(f"获取签到记录失败: {str(e)}")
-                
                 # 保存签到记录（包含奖励信息）
                 sign_dict = {
                     "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -370,14 +280,6 @@ class nodeseeksign(_PluginBase):
                 self._save_last_sign_date()
                 # 重置重试计数
                 self._retry_count = 0
-                
-                # 获取用户信息（有成员ID就拉取）
-                user_info = None
-                try:
-                    if getattr(self, "_member_id", ""):
-                        user_info = self._fetch_user_info(self._member_id)
-                except Exception as e:
-                    logger.warning(f"获取用户信息失败: {str(e)}")
 
                 # 发送通知
                 if self._notify:
@@ -387,6 +289,12 @@ class nodeseeksign(_PluginBase):
                     except Exception as e:
                         logger.error(f"签到成功通知发送失败: {str(e)}")
                         # 通知失败不影响主流程，继续执行
+                try:
+                    stats = self._get_signin_stats(self._stats_days)
+                    if stats:
+                        self.save_data('last_signin_stats', stats)
+                except Exception as e:
+                    logger.warning(f"获取收益统计失败: {str(e)}")
             else:
                 # 签到失败，安排重试
                 sign_dict = {
@@ -394,31 +302,43 @@ class nodeseeksign(_PluginBase):
                     "status": "签到失败",
                     "message": result.get("message", "")
                 }
-                self._save_sign_history(sign_dict)
                 
-                # 即使失败也要获取签到记录作为兜底判断
-                attendance_record = None
+                # 最后兜底：通过签到记录进行时间验证或当日确认
                 try:
-                    attendance_record = self._fetch_attendance_record()
-                    # 检查签到记录中是否有今日记录，如果有说明实际签到成功了
                     if attendance_record and attendance_record.get("created_at"):
-                        try:
-                            record_date = datetime.fromisoformat(attendance_record["created_at"].replace('Z', '+00:00'))
-                            today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                            if record_date.date() == today.date():
-                                # 今日有签到记录，说明实际签到成功了
-                                logger.info(f"从签到记录发现今日已签到: {attendance_record}")
+                        record_date = datetime.fromisoformat(attendance_record["created_at"].replace('Z', '+00:00'))
+                        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                        if record_date.date() == today.date():
+                            logger.info(f"从签到记录确认今日已签到: {attendance_record}")
+                            result["success"] = True
+                            result["already_signed"] = True
+                            result["message"] = "今日已签到（记录确认）"
+                            sign_dict["status"] = "已签到（记录确认）"
+                        else:
+                            # 兜底时间验证：仅当无其它成功信号时，且时间差极小才认为成功
+                            current_time = datetime.utcnow()
+                            record_time = datetime.fromisoformat(attendance_record["created_at"].replace('Z', '+00:00')).replace(tzinfo=None)
+                            time_diff = abs((current_time - record_time).total_seconds() / 3600)
+                            logger.info(f"兜底时间验证差值: {time_diff:.2f}h")
+                            if time_diff < 0.5:
+                                logger.info("时间差 < 0.5h，作为最后兜底判定为成功")
                                 result["success"] = True
-                                result["already_signed"] = True
-                                result["message"] = "今日已签到（从签到记录确认）"
-                                # 更新签到状态
-                                sign_dict["status"] = "已签到（从记录确认）"
-                                sign_dict["message"] = result["message"]
-                                self._save_sign_history(sign_dict)
-                        except Exception as e:
-                            logger.warning(f"解析签到记录日期失败: {str(e)}")
+                                result["signed"] = True
+                                sign_dict["status"] = "签到成功（兜底时间验证）"
+                                result["message"] = "签到成功（兜底时间验证）"
+                    else:
+                        logger.info("无有效签到记录用于兜底")
                 except Exception as e:
-                    logger.warning(f"获取签到记录失败: {str(e)}")
+                    logger.warning(f"兜底时间验证失败: {str(e)}")
+                
+                # 保存历史记录（包括可能通过兜底更改的状态）
+                self._save_sign_history(sign_dict)
+                try:
+                    stats = self._get_signin_stats(self._stats_days)
+                    if stats:
+                        self.save_data('last_signin_stats', stats)
+                except Exception as e:
+                    logger.warning(f"获取收益统计失败: {str(e)}")
                 
                 # 检查是否需要重试
                 # 确保 _max_retries 是整数类型
@@ -452,7 +372,7 @@ class nodeseeksign(_PluginBase):
                         trigger='date',
                         run_date=retry_time,
                         id=self._scheduled_retry,
-                        name=f"NodeSeek论坛签到重试 {self._retry_count}/{max_retries}"
+                    name=f"NodeSeek论坛签到重试 {self._retry_count}/{max_retries}"
                     )
                     
                     if self._notify:
@@ -462,21 +382,18 @@ class nodeseeksign(_PluginBase):
                             text=f"签到失败: {result.get('message', '未知错误')}\n将在 {retry_minutes} 分钟后进行第 {self._retry_count}/{max_retries} 次重试\n⏱️ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                         )
                 else:
-                    # 达到最大重试次数，不再重试
+                    # 达到最大重试次数或未配置重试
                     if max_retries == 0:
                         logger.info("未配置自动重试 (max_retries=0)，本次结束")
                     else:
                         logger.warning(f"已达到最大重试次数 ({max_retries})，今日不再重试")
                     
                     if self._notify:
-                        # 构建通知文本
-                        retry_text = "未配置自动重试 (max_retries=0)，本次结束" if max_retries == 0 else f"已达到最大重试次数 ({max_retries})，今日不再重试"
-                        text = f"签到失败: {result.get('message', '未知错误')}\n{retry_text}\n⏱️ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                        
+                        retry_text = "未配置自动重试" if max_retries == 0 else f"已达到最大重试次数 ({max_retries})"
                         self.post_message(
                             mtype=NotificationType.SiteMessage,
                             title="【NodeSeek论坛签到失败】",
-                            text=text
+                            text=f"签到失败: {result.get('message', '未知错误')}\n{retry_text}\n⏱️ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                         )
             
             return sign_dict
@@ -513,22 +430,13 @@ class nodeseeksign(_PluginBase):
         使用API执行NodeSeek签到
         """
         try:
-            logger.info("使用API执行NodeSeek签到...")
-            
-            # 初始化结果字典
-            result = {
-                "success": False,
-                "signed": False,
-                "already_signed": False,
-                "message": ""
-            }
-            
-            # 准备请求头
+            result = {"success": False, "signed": False, "already_signed": False, "message": ""}
             headers = {
                 'Accept': '*/*',
                 'Accept-Encoding': 'gzip, deflate, br, zstd',
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
                 'Content-Length': '0',
+                'Content-Type': 'application/json',
                 'Origin': 'https://www.nodeseek.com',
                 'Referer': 'https://www.nodeseek.com/board',
                 'Sec-CH-UA': '"Chromium";v="136", "Not:A-Brand";v="24", "Google Chrome";v="136"',
@@ -540,216 +448,105 @@ class nodeseeksign(_PluginBase):
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
                 'Cookie': self._cookie
             }
-            
-            # 构建签到URL，根据配置决定是否使用随机奖励
             random_param = "true" if self._random_choice else "false"
             url = f"https://www.nodeseek.com/api/attendance?random={random_param}"
-            
-            # 获取代理设置
             proxies = self._get_proxies()
-            
-            # 输出调试信息
-            if proxies:
-                logger.info(f"使用代理: {proxies}")
-            
-            logger.info(f"执行签到请求: {url}")
-            
-            # 通过统一请求适配层发送请求（优先 curl_cffi -> cloudscraper -> requests）
             response = self._smart_post(url=url, headers=headers, data=b'', proxies=proxies, timeout=30)
-            
-            # 解析响应（无论状态码是否200，先尝试读取JSON，按 message 判定）
             try:
-                # 检查响应头，处理压缩内容
-                content_encoding = response.headers.get('content-encoding', '').lower()
-                if content_encoding == 'br':
-                    logger.info("检测到Brotli压缩响应，尝试解压...")
-                    try:
-                        import brotli
-                        decompressed_content = brotli.decompress(response.content)
-                        response_text = decompressed_content.decode('utf-8')
-                        logger.info("Brotli解压成功")
-                    except ImportError:
-                        logger.warning("未安装brotli库，无法解压Brotli响应")
-                        response_text = response.text
-                    except Exception as e:
-                        logger.warning(f"Brotli解压失败: {str(e)}，使用原始响应")
-                        response_text = response.text
+                logger.info(f"签到响应状态码: {response.status_code}")
+                ct = response.headers.get('Content-Type') or response.headers.get('content-type')
+                if ct:
+                    logger.info(f"签到响应Content-Type: {ct}")
+            except Exception:
+                pass
+            try:
+                data = response.json()
+                msg = data.get('message', '')
+                if data.get('success') is True:
+                    result.update({"success": True, "signed": True, "message": msg})
+                    gain = data.get('gain', 0)
+                    current = data.get('current', 0)
+                    if gain:
+                        result.update({"gain": gain, "current": current})
+                elif "鸡腿" in msg:
+                    result.update({"success": True, "signed": True, "message": msg})
+                elif "已完成签到" in msg:
+                    result.update({"success": True, "already_signed": True, "message": msg})
+                elif msg == "USER NOT FOUND" or data.get('status') == 404:
+                    result.update({"message": "Cookie已失效，请更新"})
+                elif "签到" in msg and ("成功" in msg or "完成" in msg):
+                    result.update({"success": True, "signed": True, "message": msg})
                 else:
-                    response_text = response.text
-                
-                # 过滤掉包含 NUL 字符的响应内容
-                response_text = response_text.replace('\x00', '')
-                if response_text != response.text:
-                    logger.warning("响应内容包含 NUL 字符，已过滤")
-                
-                response_data = response.json()
-                logger.info(f"签到响应: {response_data}")
-                message = response_data.get('message', '')
-                
-                # 判断签到结果（参考示例脚本逻辑，优先检查success字段）
-                if response_data.get('success') is True:
-                    # 明确成功
-                    result["success"] = True
-                    result["signed"] = True
-                    result["message"] = message
-                    # 记录签到奖励信息
-                    gain = response_data.get('gain', 0)
-                    current = response_data.get('current', 0)
-                    if gain > 0:
-                        result["gain"] = gain
-                        result["current"] = current
-                        logger.info(f"签到成功: {message}, 获得{gain}个鸡腿，当前总计{current}个")
-                    else:
-                        logger.info(f"签到成功: {message}")
-                elif "鸡腿" in message:
-                    # 通过消息内容判断成功（兜底）
-                    result["success"] = True
-                    result["signed"] = True
-                    result["message"] = message
-                    logger.info(f"签到成功(通过消息判断): {message}")
-                elif "已完成签到" in message:
-                    # 今日已签到
-                    result["success"] = True
-                    result["already_signed"] = True
-                    result["message"] = message
-                    logger.info(f"今日已签到: {message}")
-                elif message == "USER NOT FOUND" or response_data.get('status') == 404:
-                    result["message"] = "Cookie已失效，请更新"
-                    logger.error("Cookie已失效，请更新")
+                    result.update({"message": msg or f"未知响应: {response.status_code}"})
+            except Exception:
+                text = response.text or ""
+                snippet = text[:400] if len(text) > 400 else text
+                logger.warning(f"非JSON签到响应文本片段: {snippet}")
+                self.save_data('last_sign_response', {
+                    'status_code': getattr(response, 'status_code', None),
+                    'content_type': response.headers.get('Content-Type', ''),
+                    'text_snippet': snippet
+                })
+                try:
+                    warm = self._scraper_warmup_and_attach_user_cookie()
+                    if warm:
+                        logger.info("尝试使用 cloudscraper 预热后携带用户Cookie再次POST")
+                        headers_retry = dict(headers)
+                        headers_retry.pop('Cookie', None)
+                        resp_retry = warm.post(url, headers=headers_retry, timeout=30)
+                        ct_retry = resp_retry.headers.get('Content-Type', '')
+                        if 'application/json' in (ct_retry or '').lower():
+                            data = resp_retry.json()
+                            msg = data.get('message', '')
+                            if data.get('success') is True:
+                                result.update({"success": True, "signed": True, "message": msg})
+                                gain = data.get('gain', 0)
+                                current = data.get('current', 0)
+                                if gain:
+                                    result.update({"gain": gain, "current": current})
+                                return result
+                            elif "已完成签到" in msg:
+                                result.update({"success": True, "already_signed": True, "message": msg})
+                                return result
+                except Exception as e2:
+                    logger.warning(f"预热+重试失败: {str(e2)}")
+                if any(k in text for k in ["鸡腿", "签到成功", "签到完成", "success"]):
+                    result.update({"success": True, "signed": True, "message": text[:80]})
+                elif "已完成签到" in text:
+                    result.update({"success": True, "already_signed": True, "message": text[:80]})
+                elif "Cannot GET /api/attendance" in text:
+                    result.update({"message": "服务端拒绝GET，需要POST；可能被WAF拦截"})
+                elif any(k in text for k in ["登录", "注册", "你好啊，陌生人"]):
+                    result.update({"message": "未登录或Cookie失效，返回登录页"})
                 else:
-                    # 其他情况，记录消息但不一定算失败
-                    result["message"] = message or f"未知响应: {response.status_code}"
-                    # 如果状态码非200但业务上成功，仍标记为成功
-                    if "签到" in message and ("成功" in message or "完成" in message):
-                        result["success"] = True
-                        result["signed"] = True
-                        logger.info(f"业务成功: {message}")
-                    else:
-                        logger.warning(f"签到响应({response.status_code}): {message}")
-                        
-            except (ValueError, UnicodeDecodeError) as json_error:
-                # 非JSON响应 - 可能是签到成功但返回了其他格式
-                logger.warning(f"JSON解析失败: {str(json_error)}")
-                
-                # 尝试检测编码并重新解码
-                try:
-                    if hasattr(response, 'encoding') and response.encoding:
-                        decoded_text = response.content.decode(response.encoding, errors='ignore')
-                    else:
-                        # 尝试常见编码
-                        for encoding in ['utf-8', 'gbk', 'gb2312', 'latin1']:
-                            try:
-                                decoded_text = response.content.decode(encoding, errors='ignore')
-                                break
-                            except UnicodeDecodeError:
-                                continue
-                        else:
-                            decoded_text = response.content.decode('utf-8', errors='ignore')
-                    
-                    # 过滤 NUL 字符
-                    decoded_text = decoded_text.replace('\x00', '')
-                    clean_text = decoded_text[:200] if len(decoded_text) > 200 else decoded_text
-                    
-                    # 检查是否包含成功关键词（即使不是JSON）
-                    if any(keyword in clean_text for keyword in ["鸡腿", "签到成功", "签到完成", "success"]):
-                        result["success"] = True
-                        result["signed"] = True
-                        result["message"] = f"签到成功(非JSON响应): {clean_text[:50]}..."
-                        logger.info(f"签到成功(非JSON): {clean_text[:100]}...")
-                    elif "已完成签到" in clean_text:
-                        result["success"] = True
-                        result["already_signed"] = True
-                        result["message"] = f"今日已签到(非JSON响应): {clean_text[:50]}..."
-                        logger.info(f"今日已签到(非JSON): {clean_text[:100]}...")
-                    else:
-                        # 特殊处理：如果获取到了签到记录且时间很接近，认为签到成功
-                        try:
-                            # 获取当前时间（UTC）
-                            current_time = datetime.utcnow()
-                            logger.info(f"当前UTC时间: {current_time}")
-                            
-                            # 尝试获取签到记录来判断是否成功
-                            attendance_record = self._fetch_attendance_record()
-                            if attendance_record and 'created_at' in attendance_record:
-                                record_time_str = attendance_record['created_at']
-                                try:
-                                    # 解析记录时间（UTC格式）
-                                    record_time = datetime.fromisoformat(record_time_str.replace('Z', '+00:00'))
-                                    # 转换为UTC时间
-                                    if record_time.tzinfo:
-                                        record_time = record_time.replace(tzinfo=None)
-                                    
-                                    # 计算时间差（小时）
-                                    time_diff = abs((current_time - record_time).total_seconds() / 3600)
-                                    logger.info(f"签到记录时间: {record_time}, 时间差: {time_diff:.2f}小时")
-                                    
-                                    # 如果时间差小于2小时，认为签到成功
-                                    if time_diff < 2.0:
-                                        logger.info(f"时间差小于2小时({time_diff:.2f}h)，认为签到成功")
-                                        result["success"] = True
-                                        result["signed"] = True
-                                        
-                                        # 构建消息：签到成功，获得鸡腿 XX
-                                        message = "签到成功"
-                                        if 'gain' in attendance_record:
-                                            message += f"，获得鸡腿 {attendance_record['gain']}"
-                                            result["gain"] = attendance_record['gain']
-                                            logger.info(f"从签到记录获取奖励: {attendance_record['gain']}个鸡腿")
-                                        
-                                        result["message"] = message
-                                        return result
-                                except Exception as time_error:
-                                    logger.warning(f"时间解析失败: {time_error}")
-                            
-                        except Exception as record_error:
-                            logger.warning(f"获取签到记录失败: {record_error}")
-                        
-                        # 如果时间验证失败，不记录失败历史，不发失败通知
-                        logger.warning(f"签到响应非JSON({response.status_code}): {clean_text[:100]}...")
-                        return None  # 返回None表示不处理，不记录失败
-                        
-                except Exception as decode_error:
-                    # 兜底处理
-                    logger.error(f"响应解码失败: {str(decode_error)}")
-                    clean_content = response.content[:100] if len(response.content) > 100 else response.content
-                    
-                    if response.status_code == 200:
-                        result["message"] = f"解析响应失败: {str(clean_content)}"
-                    else:
-                        result["message"] = f"请求失败，状态码: {response.status_code}"
-                    logger.error(f"签到响应解码失败({response.status_code}): {str(clean_content)}")
-
-            # 去除额外CloudFlare提示（全局处理，无需重复提示）
-                # 404/403 时对代理与直连互相回退一次
-                try:
-                    if response.status_code in (403, 404):
-                        if proxies:
-                            logger.info("检测到 403/404，尝试去代理直连回退一次...")
-                            response_retry = self._smart_post(url=url, headers=headers, proxies=None, timeout=30)
-                        else:
-                            logger.info("检测到 403/404，尝试走代理回退一次...")
-                            alt_proxies = self._get_proxies()
-                            response_retry = self._smart_post(url=url, headers=headers, proxies=alt_proxies, timeout=30)
-                        if response_retry and response_retry.status_code == 200:
-                            response_data = response_retry.json()
-                            message = response_data.get('message', '')
-                            if "鸡腿" in message or response_data.get('success') == True:
-                                result.update({"success": True, "signed": True, "message": message})
-                            elif "已完成签到" in message:
-                                result.update({"success": True, "already_signed": True, "message": message})
-                            else:
-                                result["message"] = f"回退后仍失败: {message}"
-                except Exception as e:
-                    logger.warning(f"回退请求失败（忽略）：{str(e)}")
-            
+                    result.update({"message": f"非JSON响应({response.status_code})"})
             return result
-            
         except Exception as e:
             logger.error(f"API签到出错: {str(e)}", exc_info=True)
-            return {
-                "success": False,
-                "message": f"API签到出错: {str(e)}"
-            }
+            return {"success": False, "message": f"API签到出错: {str(e)}"}
+
+    def _scraper_warmup_and_attach_user_cookie(self):
+        try:
+            if not (HAS_CLOUDSCRAPER and self._scraper):
+                return None
+            proxies = self._get_proxies()
+            if proxies:
+                self._scraper.proxies = self._normalize_proxies(proxies) or {}
+            self._scraper.get('https://www.nodeseek.com/board', timeout=30)
+            base = self._cookie or ''
+            try:
+                for part in base.split(';'):
+                    kv = part.strip().split('=', 1)
+                    if len(kv) == 2:
+                        name, value = kv[0].strip(), kv[1].strip()
+                        if name and value:
+                            self._scraper.cookies.set(name, value, domain='www.nodeseek.com')
+            except Exception:
+                pass
+            return self._scraper
+        except Exception as e:
+            logger.warning(f"cloudscraper 预热失败: {str(e)}")
+            return None
     
     def _get_proxies(self):
         """
@@ -815,7 +612,7 @@ class nodeseeksign(_PluginBase):
         """
         last_error = None
 
-        # 1) cloudscraper 优先（与示例一致）
+        # 1) cloudscraper 优先
         if HAS_CLOUDSCRAPER and self._scraper:
             try:
                 logger.info("使用 cloudscraper 发送请求")
@@ -823,9 +620,12 @@ class nodeseeksign(_PluginBase):
                     self._scraper.proxies = self._normalize_proxies(proxies) or {}
                     if self._scraper.proxies:
                         logger.info(f"cloudscraper 已应用代理: {self._scraper.proxies}")
-                if self._verify_ssl:
-                    return self._scraper.post(url, headers=headers, data=data, json=json, timeout=timeout, verify=True)
-                return self._scraper.post(url, headers=headers, data=data, json=json, timeout=timeout)
+                resp = self._scraper.post(url, headers=headers, data=data, json=json, timeout=timeout) if not self._verify_ssl else self._scraper.post(url, headers=headers, data=data, json=json, timeout=timeout, verify=True)
+                ct = resp.headers.get('Content-Type') or resp.headers.get('content-type') or ''
+                if resp.status_code in (400, 403) or ('text/html' in ct.lower()):
+                    logger.info("cloudscraper 返回非预期，尝试 curl_cffi 回退")
+                else:
+                    return resp
             except Exception as e:
                 last_error = e
                 logger.warning(f"cloudscraper 请求失败，将回退：{str(e)}")
@@ -833,30 +633,41 @@ class nodeseeksign(_PluginBase):
         # 2) curl_cffi 次选
         if HAS_CURL_CFFI:
             try:
-                logger.info("使用 curl_cffi 发送请求 (Chrome-124 仿真)")
-                session = curl_requests.Session(impersonate="chrome124")
+                logger.info("使用 curl_cffi 发送请求 (Chrome-110 仿真)")
+                session = curl_requests.Session(impersonate="chrome110")
                 if proxies:
                     session.proxies = self._normalize_proxies(proxies) or {}
                     if session.proxies:
                         logger.info(f"curl_cffi 已应用代理: {session.proxies}")
-                if self._verify_ssl:
-                    return session.post(url, headers=headers, data=data, json=json, timeout=timeout, verify=True)
-                return session.post(url, headers=headers, data=data, json=json, timeout=timeout)
+                resp = session.post(url, headers=headers, data=data, json=json, timeout=timeout) if not self._verify_ssl else session.post(url, headers=headers, data=data, json=json, timeout=timeout, verify=True)
+                ct = resp.headers.get('Content-Type') or resp.headers.get('content-type') or ''
+                if resp.status_code in (400, 403) or ('text/html' in ct.lower()):
+                    if proxies:
+                        try:
+                            logger.info("curl_cffi 返回非预期，尝试无代理回退")
+                            resp2 = session.post(url, headers=headers, data=data, json=json, timeout=timeout) if not self._verify_ssl else session.post(url, headers=headers, data=data, json=json, timeout=timeout, verify=True)
+                            ct2 = resp2.headers.get('Content-Type') or resp2.headers.get('content-type') or ''
+                            if resp2.status_code not in (400, 403) and ('text/html' not in ct2.lower()):
+                                return resp2
+                        except Exception as e2:
+                            logger.warning(f"无代理回退失败：{str(e2)}")
+                    logger.info("curl_cffi 返回非预期，尝试 requests 回退")
+                else:
+                    return resp
             except Exception as e:
                 last_error = e
                 logger.warning(f"curl_cffi 请求失败，将回退：{str(e)}")
 
         # 3) requests 兜底
         try:
-            logger.info("使用 requests 发送请求")
             norm = self._normalize_proxies(proxies)
-            if norm:
-                logger.info(f"requests 已应用代理: {norm}")
-            if self._verify_ssl:
-                return requests.post(url, headers=headers, data=data, json=json, proxies=norm, timeout=timeout, verify=True)
-            return requests.post(url, headers=headers, data=data, json=json, proxies=norm, timeout=timeout)
+            resp = requests.post(url, headers=headers, data=data, json=json, proxies=norm, timeout=timeout) if not self._verify_ssl else requests.post(url, headers=headers, data=data, json=json, proxies=norm, timeout=timeout, verify=True)
+            ct = resp.headers.get('Content-Type') or resp.headers.get('content-type') or ''
+            if resp.status_code in (400, 403) or ('text/html' in ct.lower()):
+                logger.warning("requests 返回非预期，不再继续使用 requests")
+                raise Exception("requests non-JSON/non-200")
+            return resp
         except Exception as e:
-            logger.error(f"requests 请求失败：{str(e)}")
             if last_error:
                 logger.error(f"此前错误：{str(last_error)}")
             raise
@@ -866,31 +677,46 @@ class nodeseeksign(_PluginBase):
         统一的GET请求适配器（顺序同 _smart_post）
         """
         last_error = None
-        if HAS_CURL_CFFI:
-            try:
-                session = curl_requests.Session(impersonate="chrome124")
-                if proxies:
-                    session.proxies = self._normalize_proxies(proxies) or {}
-                    if session.proxies:
-                        logger.info(f"curl_cffi 已应用代理: {session.proxies}")
-                if self._verify_ssl:
-                    return session.get(url, headers=headers, timeout=timeout, verify=True)
-                return session.get(url, headers=headers, timeout=timeout)
-            except Exception as e:
-                last_error = e
-                logger.warning(f"curl_cffi GET 失败，将回退：{str(e)}")
         if HAS_CLOUDSCRAPER and self._scraper:
             try:
                 if proxies:
                     self._scraper.proxies = self._normalize_proxies(proxies) or {}
                     if self._scraper.proxies:
                         logger.info(f"cloudscraper 已应用代理: {self._scraper.proxies}")
-                if self._verify_ssl:
-                    return self._scraper.get(url, headers=headers, timeout=timeout, verify=True)
-                return self._scraper.get(url, headers=headers, timeout=timeout)
+                resp = self._scraper.get(url, headers=headers, timeout=timeout) if not self._verify_ssl else self._scraper.get(url, headers=headers, timeout=timeout, verify=True)
+                ct = resp.headers.get('Content-Type') or resp.headers.get('content-type') or ''
+                if resp.status_code in (400, 403) or ('text/html' in ct.lower()):
+                    logger.info("cloudscraper GET 返回非预期，尝试 curl_cffi 回退")
+                else:
+                    return resp
             except Exception as e:
                 last_error = e
                 logger.warning(f"cloudscraper GET 失败，将回退：{str(e)}")
+        if HAS_CURL_CFFI:
+            try:
+                session = curl_requests.Session(impersonate="chrome110")
+                if proxies:
+                    session.proxies = self._normalize_proxies(proxies) or {}
+                    if session.proxies:
+                        logger.info(f"curl_cffi 已应用代理: {session.proxies}")
+                resp = session.get(url, headers=headers, timeout=timeout) if not self._verify_ssl else session.get(url, headers=headers, timeout=timeout, verify=True)
+                ct = resp.headers.get('Content-Type') or resp.headers.get('content-type') or ''
+                if resp.status_code in (400, 403) or ('text/html' in ct.lower()):
+                    if proxies:
+                        try:
+                            logger.info("curl_cffi GET 返回非预期，尝试无代理回退")
+                            resp2 = session.get(url, headers=headers, timeout=timeout) if not self._verify_ssl else session.get(url, headers=headers, timeout=timeout, verify=True)
+                            ct2 = resp2.headers.get('Content-Type') or resp2.headers.get('content-type') or ''
+                            if resp2.status_code not in (400, 403) and ('text/html' not in ct2.lower()):
+                                return resp2
+                        except Exception as e2:
+                            logger.warning(f"无代理回退失败：{str(e2)}")
+                    logger.info("curl_cffi GET 返回非预期，尝试 requests 回退")
+                else:
+                    return resp
+            except Exception as e:
+                last_error = e
+                logger.warning(f"curl_cffi GET 失败，将回退：{str(e)}")
         try:
             norm = self._normalize_proxies(proxies)
             if norm:
@@ -974,7 +800,24 @@ class nodeseeksign(_PluginBase):
             else:
                 response_text = resp.text
             
-            data = resp.json()
+            try:
+                logger.info(f"签到记录响应状态码: {resp.status_code}")
+                ct = resp.headers.get('Content-Type') or resp.headers.get('content-type')
+                if ct:
+                    logger.info(f"签到记录响应Content-Type: {ct}")
+            except Exception:
+                pass
+            try:
+                data = resp.json()
+            except Exception:
+                snippet = (resp.text or "")[:400]
+                logger.warning(f"签到记录非JSON响应文本片段: {snippet}")
+                self.save_data('last_attendance_response', {
+                    'status_code': getattr(resp, 'status_code', None),
+                    'content_type': resp.headers.get('Content-Type', ''),
+                    'text_snippet': snippet
+                })
+                return {}
             record = data.get("record", {})
             if record:
                 # 获取用户排名信息
@@ -1616,6 +1459,24 @@ class nodeseeksign(_PluginBase):
                                     }
                                 ]
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'stats_days',
+                                            'label': '收益统计天数',
+                                            'type': 'number',
+                                            'placeholder': '30'
+                                        }
+                                    }
+                                ]
+                            },
 
                         ]
                     },
@@ -1656,7 +1517,8 @@ class nodeseeksign(_PluginBase):
             "min_delay": 5,
             "max_delay": 12,
             "member_id": "",
-            "clear_history": False # 初始化清除历史记录配置
+            "clear_history": False,
+            "stats_days": 30
         }
 
     def get_page(self) -> List[dict]:
@@ -1858,8 +1720,39 @@ class nodeseeksign(_PluginBase):
                 }
             ]
 
-        # 最终页面组装
-        return user_info_card + [
+        stats = self.get_data('last_signin_stats') or {}
+
+        stats_card = []
+        if stats:
+            period = stats.get('period') or f"近{self._stats_days}天"
+            days_count = stats.get('days_count', 0)
+            total_amount = stats.get('total_amount', 0)
+            average = stats.get('average', 0)
+            stats_card = [
+                {
+                    'component': 'VCard',
+                    'props': {'variant': 'outlined', 'class': 'mb-4'},
+                    'content': [
+                        {'component': 'VCardTitle', 'props': {'class': 'text-h6'}, 'text': '📈 NodeSeek收益统计'},
+                        {
+                            'component': 'VCardText',
+                            'content': [
+                                {'component': 'div', 'props': {'class': 'mb-2'}, 'text': f'{period} 已签到 {days_count} 天'},
+                                {
+                                    'component': 'VRow',
+                                    'content': [
+                                        {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VChip', 'props': {'variant': 'outlined', 'color': 'amber-darken-2'}, 'text': f'总鸡腿 {total_amount}'}]},
+                                        {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VChip', 'props': {'variant': 'outlined', 'color': 'primary'}, 'text': f'平均/日 {average}'}]},
+                                        {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VChip', 'props': {'variant': 'outlined'}, 'text': f'统计天数 {days_count}'}]},
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+
+        return user_info_card + stats_card + [
             # 标题
             {
                 'component': 'VCard',
@@ -1926,3 +1819,68 @@ class nodeseeksign(_PluginBase):
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [] 
+
+    def _get_signin_stats(self, days: int = 30) -> dict:
+        if not self._cookie:
+            return {}
+        if days <= 0:
+            days = 1
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+            'origin': 'https://www.nodeseek.com',
+            'referer': 'https://www.nodeseek.com/board',
+            'Cookie': self._cookie
+        }
+        tz = pytz.timezone('Asia/Shanghai')
+        now_shanghai = datetime.now(tz)
+        query_start_time = now_shanghai - timedelta(days=days)
+        all_records = []
+        page = 1
+        proxies = self._get_proxies()
+        while page <= 20:
+            url = f'https://www.nodeseek.com/api/account/credit/page-{page}'
+            resp = self._smart_get(url=url, headers=headers, proxies=proxies, timeout=30)
+            data = {}
+            try:
+                data = resp.json()
+            except Exception:
+                break
+            if not data.get('success') or not data.get('data'):
+                break
+            records = data.get('data', [])
+            if not records:
+                break
+            try:
+                last_record_time = datetime.fromisoformat(records[-1][3].replace('Z', '+00:00')).astimezone(tz)
+            except Exception:
+                break
+            if last_record_time < query_start_time:
+                for record in records:
+                    try:
+                        record_time = datetime.fromisoformat(record[3].replace('Z', '+00:00')).astimezone(tz)
+                    except Exception:
+                        continue
+                    if record_time >= query_start_time:
+                        all_records.append(record)
+                break
+            else:
+                all_records.extend(records)
+            page += 1
+        signin_records = []
+        for record in all_records:
+            try:
+                amount, balance, description, timestamp = record
+                record_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00')).astimezone(tz)
+            except Exception:
+                continue
+            if record_time >= query_start_time and ('签到收益' in description and '鸡腿' in description):
+                signin_records.append({'amount': amount, 'date': record_time.strftime('%Y-%m-%d'), 'description': description})
+        period_desc = f'近{days}天' if days != 1 else '今天'
+        if not signin_records:
+            stats = {'total_amount': 0, 'average': 0, 'days_count': 0, 'records': [], 'period': period_desc}
+            return stats
+        total_amount = sum(r['amount'] for r in signin_records)
+        days_count = len(signin_records)
+        average = round(total_amount / days_count, 2) if days_count > 0 else 0
+        stats = {'total_amount': total_amount, 'average': average, 'days_count': days_count, 'records': signin_records, 'period': period_desc}
+        return stats

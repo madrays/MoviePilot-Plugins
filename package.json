@@ -62,12 +62,13 @@
     "name": "NodeSeek论坛签到",
     "description": "懒羊羊定制：自动完成NodeSeek论坛每日签到，支持随机奖励和自动重试功能",
     "labels": "签到,NodeSeek,论坛",
-    "version": "1.6.0",
+    "version": "2.0.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png",
     "author": "madrays",
     "level": 2,
     "v2": true,
     "history": {
+      "v2.0.0": "重构签到：时间验证兜底；始终拉取用户与奖励；简化解析；新增近N天收益统计；修复cloudscraper初始化",
       "v1.6.0": "增加时间验证，规避签到成功但返回非JSON的情况",
       "v1.5.0": "增强签到成功判断逻辑，规避签到成功但返回非JSON的情况",
       "v1.4.0": "修复响应解析问题：优化非JSON响应处理、过滤NUL字符、增强签到成功判断逻辑优化业务语义解析",
@@ -217,4 +218,4 @@
     }
   }
 
-} 
+}
