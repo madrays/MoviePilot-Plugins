@@ -19,7 +19,7 @@
     "version": "2.5.4",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fnos.ico",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v2.5.4": "尝试解决0点签到卡住（尽量还是别设置0点签到，暂时无法验证是否解决）",
@@ -35,7 +35,7 @@
     "version": "1.0.5",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/lemon.ico",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v1.0.5": "修复神游成功后，未能正确获取神游状态的bug。"
@@ -48,7 +48,7 @@
     "version": "1.2.6",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nexusinvitee.png",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v1.2.6": "尝试修复hh后宫",
@@ -65,7 +65,7 @@
     "version": "2.0.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v2.0.0": "重构签到：时间验证兜底；始终拉取用户与奖励；简化解析；新增近N天收益统计；修复cloudscraper初始化",
@@ -84,7 +84,7 @@
     "version": "2.0.1",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v2.0.1": "优化UI界面(有点强迫症)，修复密码输入框无法以密文方式显示的问题。",
@@ -100,7 +100,7 @@
     "version": "1.1.4",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v1.1.4": "补充未定义变量"
@@ -113,7 +113,7 @@
     "version": "1.0.5",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hardlink.png",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v1.0.5": "首次发布，支持SHA1重复文件识别，硬链接替换，保持种子文件名"
@@ -198,7 +198,7 @@
     "version": "1.0.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/agsv.png",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
       "v1.0.0": "首次发布，支持自动识别AGSVPT站点、访问mybonus.php获取官种数据、5TB体积检查、基于开始日期的退休进度计算、使用TB作为单位显示"
@@ -211,7 +211,7 @@
     "version": "1.0.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/xiaomi.png",
     "author": "madrays",
-    "level": 2,
+    "level": 1,
     "v2": true,
     "history": {
         "v1.0.0": "首次发布：登录、状态监控、端口列表/添加/删除、通知"
