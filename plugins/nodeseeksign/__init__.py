@@ -25,6 +25,7 @@ from app.log import logger
 from app.schemas import NotificationType
 import requests
 from urllib.parse import urlencode
+import json
 
 # cloudscraper 作为 Cloudflare 备用方案
 try:
@@ -49,7 +50,7 @@ class nodeseeksign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nodeseeksign.png"
     # 插件版本
-    plugin_version = "2.0.0"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -275,6 +276,8 @@ class nodeseeksign(_PluginBase):
                     if attendance_record.get("rank"):
                         sign_dict["rank"] = attendance_record.get("rank")
                         sign_dict["total_signers"] = attendance_record.get("total_signers")
+                elif result.get("gain"):
+                    sign_dict["gain"] = result.get("gain")
                 
                 self._save_sign_history(sign_dict)
                 self._save_last_sign_date()
@@ -807,17 +810,30 @@ class nodeseeksign(_PluginBase):
                     logger.info(f"签到记录响应Content-Type: {ct}")
             except Exception:
                 pass
+            data = None
             try:
                 data = resp.json()
             except Exception:
-                snippet = (resp.text or "")[:400]
-                logger.warning(f"签到记录非JSON响应文本片段: {snippet}")
-                self.save_data('last_attendance_response', {
-                    'status_code': getattr(resp, 'status_code', None),
-                    'content_type': resp.headers.get('Content-Type', ''),
-                    'text_snippet': snippet
-                })
-                return {}
+                try:
+                    data = json.loads(response_text or "")
+                except Exception:
+                    snippet = (resp.text or "")[:400]
+                    logger.warning(f"签到记录非JSON响应文本片段: {snippet}")
+                    self.save_data('last_attendance_response', {
+                        'status_code': getattr(resp, 'status_code', None),
+                        'content_type': resp.headers.get('Content-Type', ''),
+                        'text_snippet': snippet
+                    })
+                    cached = self.get_data('last_attendance_record') or {}
+                    try:
+                        if cached and cached.get('created_at'):
+                            sh_tz = pytz.timezone('Asia/Shanghai')
+                            rec_dt = datetime.fromisoformat(cached['created_at'].replace('Z', '+00:00')).astimezone(sh_tz)
+                            if rec_dt.date() == datetime.now(sh_tz).date():
+                                return cached
+                    except Exception:
+                        pass
+                    return {}
             record = data.get("record", {})
             if record:
                 # 获取用户排名信息
@@ -1019,16 +1035,49 @@ class nodeseeksign(_PluginBase):
             rank_info = ""
             try:
                 logger.info(f"开始构建已签到状态的奖励信息，attendance_record: {attendance_record}")
+                today_gain = None
                 if attendance_record and attendance_record.get("gain"):
-                    gain_info = f"🎁 今日获得: {attendance_record.get('gain')}个鸡腿"
-                    
-                    # 添加排名信息
-                    if attendance_record.get("rank"):
-                        rank_info = f"🏆 排名: 第{attendance_record.get('rank')}名"
-                        if attendance_record.get("total_signers"):
-                            rank_info += f" (共{attendance_record.get('total_signers')}人)"
-                    elif attendance_record.get("total_signers"):
-                        rank_info = f"📊 今日共{attendance_record.get('total_signers')}人签到"
+                    today_gain = attendance_record.get('gain')
+                elif result and result.get("gain"):
+                    today_gain = result.get("gain")
+                else:
+                    try:
+                        history = self.get_data('sign_history') or []
+                        today_str = datetime.now().strftime('%Y-%m-%d')
+                        latest = None
+                        for rec in history:
+                            if rec.get("date", "").startswith(today_str) and rec.get("gain"):
+                                latest = rec
+                                break
+                        if latest:
+                            today_gain = latest.get('gain')
+                    except Exception:
+                        pass
+                if today_gain is not None:
+                    gain_info = f"🎁 今日获得: {today_gain}个鸡腿"
+                
+                # 添加排名信息
+                if attendance_record.get("rank"):
+                    rank_info = f"🏆 排名: 第{attendance_record.get('rank')}名"
+                    if attendance_record.get("total_signers"):
+                        rank_info += f" (共{attendance_record.get('total_signers')}人)"
+                elif attendance_record.get("total_signers"):
+                    rank_info = f"📊 今日共{attendance_record.get('total_signers')}人签到"
+                else:
+                    try:
+                        cached = self.get_data('last_attendance_record') or {}
+                        if cached and cached.get('created_at'):
+                            sh_tz = pytz.timezone('Asia/Shanghai')
+                            rec_dt = datetime.fromisoformat(cached['created_at'].replace('Z', '+00:00')).astimezone(sh_tz)
+                            if rec_dt.date() == datetime.now(sh_tz).date():
+                                if cached.get('rank'):
+                                    rank_info = f"🏆 排名: 第{cached.get('rank')}名"
+                                    if cached.get('total_signers'):
+                                        rank_info += f" (共{cached.get('total_signers')}人)"
+                                elif cached.get('total_signers'):
+                                    rank_info = f"📊 今日共{cached.get('total_signers')}人签到"
+                    except Exception:
+                        pass
                     
                     # 组合奖励和排名信息
                     if rank_info:
@@ -1837,35 +1886,38 @@ class nodeseeksign(_PluginBase):
         all_records = []
         page = 1
         proxies = self._get_proxies()
-        while page <= 20:
-            url = f'https://www.nodeseek.com/api/account/credit/page-{page}'
-            resp = self._smart_get(url=url, headers=headers, proxies=proxies, timeout=30)
-            data = {}
-            try:
-                data = resp.json()
-            except Exception:
-                break
-            if not data.get('success') or not data.get('data'):
-                break
-            records = data.get('data', [])
-            if not records:
-                break
-            try:
-                last_record_time = datetime.fromisoformat(records[-1][3].replace('Z', '+00:00')).astimezone(tz)
-            except Exception:
-                break
-            if last_record_time < query_start_time:
-                for record in records:
-                    try:
-                        record_time = datetime.fromisoformat(record[3].replace('Z', '+00:00')).astimezone(tz)
-                    except Exception:
-                        continue
-                    if record_time >= query_start_time:
-                        all_records.append(record)
-                break
-            else:
-                all_records.extend(records)
-            page += 1
+        try:
+            while page <= 20:
+                url = f'https://www.nodeseek.com/api/account/credit/page-{page}'
+                resp = self._smart_get(url=url, headers=headers, proxies=proxies, timeout=30)
+                data = {}
+                try:
+                    data = resp.json()
+                except Exception:
+                    break
+                if not data.get('success') or not data.get('data'):
+                    break
+                records = data.get('data', [])
+                if not records:
+                    break
+                try:
+                    last_record_time = datetime.fromisoformat(records[-1][3].replace('Z', '+00:00')).astimezone(tz)
+                except Exception:
+                    break
+                if last_record_time < query_start_time:
+                    for record in records:
+                        try:
+                            record_time = datetime.fromisoformat(record[3].replace('Z', '+00:00')).astimezone(tz)
+                        except Exception:
+                            continue
+                        if record_time >= query_start_time:
+                            all_records.append(record)
+                    break
+                else:
+                    all_records.extend(records)
+                page += 1
+        except Exception:
+            pass
         signin_records = []
         for record in all_records:
             try:
@@ -1877,10 +1929,26 @@ class nodeseeksign(_PluginBase):
                 signin_records.append({'amount': amount, 'date': record_time.strftime('%Y-%m-%d'), 'description': description})
         period_desc = f'近{days}天' if days != 1 else '今天'
         if not signin_records:
-            stats = {'total_amount': 0, 'average': 0, 'days_count': 0, 'records': [], 'period': period_desc}
-            return stats
+            try:
+                history = self.get_data('sign_history') or []
+                success_statuses = ["签到成功", "已签到", "签到成功（时间验证）", "已签到（从记录确认）"]
+                fallback_records = []
+                for rec in history:
+                    try:
+                        rec_dt = datetime.strptime(rec.get('date', ''), '%Y-%m-%d %H:%M:%S').astimezone(tz)
+                    except Exception:
+                        continue
+                    if rec_dt >= query_start_time and rec.get('status') in success_statuses and rec.get('gain'):
+                        fallback_records.append({'amount': rec.get('gain', 0), 'date': rec_dt.strftime('%Y-%m-%d'), 'description': '本地历史-签到收益'})
+                if not fallback_records:
+                    return {'total_amount': 0, 'average': 0, 'days_count': 0, 'records': [], 'period': period_desc}
+                total_amount = sum(r['amount'] for r in fallback_records)
+                days_count = len(fallback_records)
+                average = round(total_amount / days_count, 2) if days_count > 0 else 0
+                return {'total_amount': total_amount, 'average': average, 'days_count': days_count, 'records': fallback_records, 'period': period_desc}
+            except Exception:
+                return {'total_amount': 0, 'average': 0, 'days_count': 0, 'records': [], 'period': period_desc}
         total_amount = sum(r['amount'] for r in signin_records)
         days_count = len(signin_records)
         average = round(total_amount / days_count, 2) if days_count > 0 else 0
-        stats = {'total_amount': total_amount, 'average': average, 'days_count': days_count, 'records': signin_records, 'period': period_desc}
-        return stats
+        return {'total_amount': total_amount, 'average': average, 'days_count': days_count, 'records': signin_records, 'period': period_desc}
