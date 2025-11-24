@@ -43,7 +43,7 @@ class HdhiveSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -70,10 +70,15 @@ class HdhiveSign(_PluginBase):
     _current_trigger_type = None  # 保存当前执行的触发类型
 
     # 影巢站点配置（域名可配置）
-    _base_url = "https://hdhive.online"
+    _base_url = "https://hdhive.com"
     _site_url = f"{_base_url}/"
     _signin_api = f"{_base_url}/api/customer/user/checkin"
     _user_info_api = f"{_base_url}/api/customer/user/info"
+    _login_api_candidates = [
+        "/api/customer/user/login",
+        "/api/customer/auth/login",
+    ]
+    _login_page = "/login"
 
     def init_plugin(self, config: dict = None):
         # 停止现有任务
@@ -88,7 +93,7 @@ class HdhiveSign(_PluginBase):
                 self._cron = config.get("cron")
                 self._onlyonce = config.get("onlyonce")
                 # 新增：站点地址配置
-                self._base_url = (config.get("base_url") or self._base_url or "").rstrip("/") or "https://hdhive.online"
+                self._base_url = (config.get("base_url") or self._base_url or "").rstrip("/") or "https://hdhive.com"
                 # 基于 base_url 统一构建接口地址
                 self._site_url = f"{self._base_url}/"
                 self._signin_api = f"{self._base_url}/api/customer/user/checkin"
@@ -96,6 +101,8 @@ class HdhiveSign(_PluginBase):
                 self._max_retries = int(config.get("max_retries", 3))
                 self._retry_interval = int(config.get("retry_interval", 30))
                 self._history_days = int(config.get("history_days", 30))
+                self._username = (config.get("username") or "").strip()
+                self._password = (config.get("password") or "").strip()
                 logger.info(f"影巢签到插件已加载，配置：enabled={self._enabled}, notify={self._notify}, cron={self._cron}")
             
             # 清理所有可能的延长重试任务
@@ -228,23 +235,60 @@ class HdhiveSign(_PluginBase):
                 return sign_dict
             
             if not self._cookie:
-                logger.error("未配置Cookie")
-                sign_dict = {
-                    "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
-                    "status": "签到失败: 未配置Cookie",
-                }
-                self._save_sign_history(sign_dict)
-                
-                if self._notify:
-                    self.post_message(
-                        mtype=NotificationType.SiteMessage,
-                        title="【影巢签到失败】",
-                        text="❌ 未配置Cookie，请在设置中添加Cookie"
-                    )
-                    notification_sent = True
-                return sign_dict
+                # 尝试自动登录获取 Cookie
+                new_cookie = self._auto_login()
+                if new_cookie:
+                    self._cookie = new_cookie
+                    self.update_config({
+                        "enabled": self._enabled,
+                        "notify": self._notify,
+                        "cron": self._cron,
+                        "cookie": self._cookie,
+                        "base_url": self._base_url,
+                        "max_retries": self._max_retries,
+                        "retry_interval": self._retry_interval,
+                        "history_days": self._history_days,
+                        "username": getattr(self, "_username", ""),
+                        "password": getattr(self, "_password", ""),
+                    })
+                    logger.info("已通过自动登录获取新Cookie")
+                else:
+                    logger.error("未配置Cookie且自动登录失败")
+                    sign_dict = {
+                        "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+                        "status": "签到失败: 未配置Cookie",
+                    }
+                    self._save_sign_history(sign_dict)
+                    
+                    if self._notify:
+                        self.post_message(
+                            mtype=NotificationType.SiteMessage,
+                            title="【影巢签到失败】",
+                            text="❌ 未配置Cookie，且自动登录失败，请在设置中添加Cookie或用户名密码"
+                        )
+                        notification_sent = True
+                    return sign_dict
             
             logger.info("执行签到...")
+
+            try:
+                ensured = self._ensure_valid_cookie()
+                if ensured:
+                    self._cookie = ensured
+                    self.update_config({
+                        "enabled": self._enabled,
+                        "notify": self._notify,
+                        "cron": self._cron,
+                        "cookie": self._cookie,
+                        "base_url": self._base_url,
+                        "max_retries": self._max_retries,
+                        "retry_interval": self._retry_interval,
+                        "history_days": self._history_days,
+                        "username": getattr(self, "_username", ""),
+                        "password": getattr(self, "_password", ""),
+                    })
+            except Exception:
+                pass
             
             state, message = self._signin_base()
             
@@ -295,14 +339,42 @@ class HdhiveSign(_PluginBase):
             else:
                 # 签到失败, a real failure that needs retry
                 logger.error(f"影巢签到失败: {message}")
+
+                # 检测鉴权失败，尝试自动登录刷新 Cookie 后重试一次
+                if any(k in (message or "") for k in ["未配置Cookie", "缺少'token'", "未授权", "Unauthorized", "token", "csrf", "登录已过期", "过期", "expired"]):
+                    logger.info("检测到Cookie或鉴权问题，尝试自动登录刷新Cookie后重试一次")
+                    new_cookie = self._auto_login()
+                    if new_cookie:
+                        self._cookie = new_cookie
+                        self.update_config({
+                            "enabled": self._enabled,
+                            "notify": self._notify,
+                            "cron": self._cron,
+                            "cookie": self._cookie,
+                            "base_url": self._base_url,
+                            "max_retries": self._max_retries,
+                            "retry_interval": self._retry_interval,
+                            "history_days": self._history_days,
+                            "username": getattr(self, "_username", ""),
+                            "password": getattr(self, "_password", ""),
+                        })
+                        logger.info("自动登录成功，使用新Cookie重试签到")
+                        state2, message2 = self._signin_base()
+                        if state2:
+                            sign_status = "签到成功" if "签到" in (message2 or "") and "已" not in message2 else "已签到"
+                            sign_dict = {
+                                "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+                                "status": sign_status,
+                                "message": message2,
+                            }
+                            # 解析奖励积分
+                            points_match = re.search(r'获得 (\d+) 积分', message2 or "")
+                            sign_dict['points'] = int(points_match.group(1)) if points_match else "—"
+                            self._save_sign_history(sign_dict)
+                            self._send_sign_notification(sign_dict)
+                            return sign_dict
                 
-                # 保存失败记录
-                sign_dict = {
-                    "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
-                    "status": "签到失败",
-                    "message": message
-                }
-                self._save_sign_history(sign_dict)
+                # 暂不保存失败记录，视重试策略决定是否写入
                 
                 # 常规重试逻辑
                 if retry_count < self._max_retries:
@@ -692,6 +764,46 @@ class HdhiveSign(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'username',
+                                            'label': '用户名/邮箱（用于自动登录）',
+                                            'placeholder': '例如：email@example.com'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'password',
+                                            'label': '密码（用于自动登录）',
+                                            'placeholder': '请输入密码',
+                                            'type': 'password'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
                                 },
                                 'content': [
                                     {
@@ -809,11 +921,13 @@ class HdhiveSign(_PluginBase):
             "notify": True,
             "onlyonce": False,
             "cookie": "",
-            "base_url": "https://hdhive.online",
+            "base_url": "https://hdhive.com",
             "cron": "0 8 * * *",
             "max_retries": 3,
             "retry_interval": 30,
-            "history_days": 30
+            "history_days": 30,
+            "username": "",
+            "password": ""
         }
 
     def get_page(self) -> List[dict]:
@@ -957,6 +1071,243 @@ class HdhiveSign(_PluginBase):
             and record.get("status") in ["签到成功", "已签到"]
             for record in history
         )
+
+    def _ensure_valid_cookie(self) -> Optional[str]:
+        try:
+            if not self._cookie:
+                return None
+            token = None
+            for part in self._cookie.split(';'):
+                p = part.strip()
+                if p.startswith('token='):
+                    token = p.split('=', 1)[1]
+                    break
+            if not token:
+                return None
+            try:
+                decoded = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+                exp_ts = decoded.get('exp')
+            except Exception:
+                exp_ts = None
+            if exp_ts and isinstance(exp_ts, (int, float)):
+                import time as _t
+                now_ts = int(_t.time())
+                if exp_ts <= now_ts:
+                    return self._auto_login()
+            return None
+        except Exception:
+            return None
+
+    def _auto_login(self) -> Optional[str]:
+        try:
+            if not getattr(self, "_username", None) or not getattr(self, "_password", None):
+                logger.warning("未配置用户名或密码，无法自动登录")
+                return None
+            try:
+                import cloudscraper
+                scraper = cloudscraper.create_scraper()
+                logger.info("自动登录: 使用 cloudscraper")
+            except Exception as e:
+                logger.warning(f"cloudscraper 不可用，将尝试 requests：{e}")
+                scraper = requests
+                logger.info("自动登录: 回退到 requests")
+            # 预热登录页，拿到初始 Cookie
+            login_url = f"{self._base_url}{self._login_page}"
+            try:
+                logger.info(f"自动登录: 预热 {login_url}")
+                resp_warm = scraper.get(login_url, timeout=30, proxies=settings.PROXY)
+                logger.info(f"自动登录: 预热状态码 {getattr(resp_warm, 'status_code', 'unknown')} Content-Type {getattr(resp_warm.headers, 'get', lambda k: '')('Content-Type')}")
+            except Exception:
+                pass
+            # 尝试 API 登录候选
+            for path in self._login_api_candidates:
+                url = f"{self._base_url}{path}"
+                headers = {
+                    'User-Agent': settings.USER_AGENT,
+                    'Accept': 'application/json, text/plain, */*',
+                    'Origin': self._base_url,
+                    'Referer': login_url,
+                    'Content-Type': 'application/json'
+                }
+                payload = {
+                    'username': getattr(self, "_username", ""),
+                    'password': getattr(self, "_password", "")
+                }
+                try:
+                    logger.info(f"自动登录: 尝试 API 登录 {url}")
+                    resp = scraper.post(url, headers=headers, json=payload, timeout=30, proxies=settings.PROXY)
+                    logger.info(f"自动登录: API 登录状态码 {getattr(resp, 'status_code', 'unknown')} Content-Type {getattr(resp.headers, 'get', lambda k: '')('Content-Type')}")
+                    # 成功条件：响应包含 set-cookie 或 JSON 内含 meta.access_token
+                    cookies_dict = None
+                    try:
+                        cookies_dict = getattr(resp, 'cookies', None).get_dict() if getattr(resp, 'cookies', None) else {}
+                    except Exception:
+                        cookies_dict = {}
+                    token_cookie = cookies_dict.get('token')
+                    csrf_cookie = cookies_dict.get('csrf_access_token')
+                    if not token_cookie:
+                        try:
+                            data = resp.json()
+                            logger.info(f"自动登录: API 登录返回JSON keys {list(data.keys()) if isinstance(data, dict) else 'non-dict'}")
+                            meta = (data.get('meta') or {})
+                            acc = meta.get('access_token')
+                            ref = meta.get('refresh_token')
+                            if acc:
+                                # 将 access_token 写入 token Cookie
+                                if hasattr(scraper, 'cookies'):
+                                    try:
+                                        scraper.cookies.set('token', acc, domain=self._base_url.replace('https://','').replace('http://',''))
+                                        token_cookie = acc
+                                    except Exception:
+                                        token_cookie = acc
+                                else:
+                                    token_cookie = acc
+                        except Exception:
+                            pass
+                    if token_cookie:
+                        cookie_items = [f"token={token_cookie}"]
+                        if csrf_cookie:
+                            cookie_items.append(f"csrf_access_token={csrf_cookie}")
+                        cookie_str = "; ".join(cookie_items)
+                        logger.info("API登录成功，已生成Cookie")
+                        return cookie_str
+                except Exception as e:
+                    logger.debug(f"API登录候选失败: {path} -> {e}")
+            # 尝试 Next.js Server Action 登录
+            url = f"{self._base_url}{self._login_page}"
+            headers = {
+                'User-Agent': settings.USER_AGENT,
+                'Accept': 'text/x-component',
+                'Origin': self._base_url,
+                'Referer': login_url,
+                'Content-Type': 'text/plain;charset=UTF-8'
+            }
+            # 从预热页面尝试提取 next-action token
+            next_action_token = None
+            try:
+                warm_text = getattr(resp_warm, 'text', '') or ''
+                # 常见形式：next-action":"<token>" 或 name="next-action" value="<token>"
+                import re as _re
+                m = _re.search(r'next-action"\s*:\s*"([a-fA-F0-9]{16,64})"', warm_text)
+                if not m:
+                    m = _re.search(r'name="next-action"\s+value="([a-fA-F0-9]{16,64})"', warm_text)
+                if m:
+                    next_action_token = m.group(1)
+                    headers['next-action'] = next_action_token
+                    # 参考样例的最小 router state（静态值）
+                    headers['next-router-state-tree'] = '%5B%22%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22login%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Flogin%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%2Ctrue%5D'
+                    logger.info(f"自动登录: 提取 next-action={next_action_token}")
+                else:
+                    logger.info("自动登录: 未在页面提取到 next-action token")
+            except Exception as e:
+                logger.debug(f"自动登录: 提取 next-action 失败: {e}")
+            body = json.dumps([{'username': getattr(self, "_username", ""), 'password': getattr(self, "_password", "")}])
+            try:
+                logger.info(f"自动登录: 尝试 Server Action 登录 {url}")
+                resp = scraper.post(url, headers=headers, data=body, timeout=30, proxies=settings.PROXY)
+                logger.info(f"自动登录: SA 登录状态码 {getattr(resp, 'status_code', 'unknown')} Content-Type {getattr(resp.headers, 'get', lambda k: '')('Content-Type')}")
+                cookies_dict = None
+                try:
+                    cookies_dict = getattr(resp, 'cookies', None).get_dict() if getattr(resp, 'cookies', None) else {}
+                except Exception:
+                    cookies_dict = {}
+                token_cookie = cookies_dict.get('token')
+                csrf_cookie = cookies_dict.get('csrf_access_token')
+                if token_cookie:
+                    cookie_items = [f"token={token_cookie}"]
+                    if csrf_cookie:
+                        cookie_items.append(f"csrf_access_token={csrf_cookie}")
+                    cookie_str = "; ".join(cookie_items)
+                    logger.info("Server Action 登录成功，已生成Cookie")
+                    return cookie_str
+            except Exception as e:
+                logger.warning(f"Server Action 登录失败: {e}")
+            # 浏览器自动化兜底：使用 Playwright 直接执行页面登录并读取 Cookie
+            try:
+                from playwright.sync_api import sync_playwright
+                logger.info("自动登录: 尝试使用 Playwright 浏览器自动化")
+                proxy = None
+                try:
+                    pxy = settings.PROXY or {}
+                    server = pxy.get('http') or pxy.get('https')
+                    if server:
+                        proxy = {"server": server}
+                except Exception:
+                    proxy = None
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch(headless=True, proxy=proxy) if proxy else pw.chromium.launch(headless=True)
+                    context = browser.new_context()
+                    page = context.new_page()
+                    page.goto(login_url, wait_until="domcontentloaded")
+                    # 选择器启发式
+                    selectors = [
+                        "input[name='username']",
+                        "input[name='email']",
+                        "input[type='email']",
+                        "input[placeholder*='邮箱']",
+                        "input[placeholder*='email']",
+                        "input[placeholder*='用户名']",
+                    ]
+                    pwd_selectors = [
+                        "input[name='password']",
+                        "input[type='password']",
+                        "input[placeholder*='密码']",
+                    ]
+                    for sel in selectors:
+                        try:
+                            if page.query_selector(sel):
+                                page.fill(sel, getattr(self, "_username", ""))
+                                break
+                        except Exception:
+                            continue
+                    for sel in pwd_selectors:
+                        try:
+                            if page.query_selector(sel):
+                                page.fill(sel, getattr(self, "_password", ""))
+                                break
+                        except Exception:
+                            continue
+                    # 点击提交按钮
+                    try:
+                        btn = page.query_selector("button[type='submit']") or page.query_selector("button:has-text('登录')") or page.query_selector("button:has-text('Login')")
+                        if btn:
+                            btn.click()
+                        else:
+                            page.keyboard.press("Enter")
+                    except Exception:
+                        page.keyboard.press("Enter")
+                    # 等待可能的跳转或网络静止
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except Exception:
+                        pass
+                    # 读取 Cookie
+                    cookies = context.cookies()
+                    token_cookie = None
+                    csrf_cookie = None
+                    for c in cookies:
+                        if c.get('name') == 'token':
+                            token_cookie = c.get('value')
+                        elif c.get('name') == 'csrf_access_token':
+                            csrf_cookie = c.get('value')
+                    context.close()
+                    browser.close()
+                    if token_cookie:
+                        cookie_items = [f"token={token_cookie}"]
+                        if csrf_cookie:
+                            cookie_items.append(f"csrf_access_token={csrf_cookie}")
+                        cookie_str = "; ".join(cookie_items)
+                        logger.info("Playwright 登录成功，已生成Cookie")
+                        return cookie_str
+                logger.error("自动登录失败，未获取到有效Cookie")
+                return None
+            except Exception as e:
+                logger.error(f"Playwright 自动登录异常: {e}")
+                logger.error("自动登录失败，未获取到有效Cookie")
+                return None
+        except Exception as e:
+            logger.error(f"自动登录异常: {str(e)}")
+            return None
 
     def _get_last_sign_time(self) -> str:
         """
