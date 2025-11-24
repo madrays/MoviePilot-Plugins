@@ -182,12 +182,13 @@
     "name": "影巢签到",
     "description": "自动完成影巢每日签到，支持失败重试和历史记录",
     "labels": "签到,影巢",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico",
     "author": "madrays",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.3.0": "用户信息卡片美化；通知追加用户摘要；重复签到与执行前预拉取用户信息；RSC解析兜底",
       "v1.2.0": "自动登录刷新Cookie：cloudscraper与Playwright兜底；修复重复失败记录；默认域名更新为 hdhive.com",
       "v1.1.0": "域名改为可配置；统一API拼接；精简日志",
       "v1.0": "首次发布"

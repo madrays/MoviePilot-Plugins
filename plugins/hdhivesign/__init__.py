@@ -1,6 +1,6 @@
 """
 影巢签到插件
-版本: 1.1.0
+版本: 1.3.0
 作者: madrays
 功能:
 - 自动完成影巢(HDHive)每日签到
@@ -43,7 +43,7 @@ class HdhiveSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -231,6 +231,18 @@ class HdhiveSign(_PluginBase):
                         title=title,
                         text=text
                     )
+                try:
+                    cookies = {}
+                    if self._cookie:
+                        for cookie_item in self._cookie.split(';'):
+                            if '=' in cookie_item:
+                                name, value = cookie_item.strip().split('=', 1)
+                                cookies[name] = value
+                    token = cookies.get('token')
+                    if token:
+                        self._fetch_user_info(cookies, token)
+                except Exception:
+                    pass
                 
                 return sign_dict
             
@@ -287,6 +299,20 @@ class HdhiveSign(_PluginBase):
                         "username": getattr(self, "_username", ""),
                         "password": getattr(self, "_password", ""),
                     })
+            except Exception:
+                pass
+
+            try:
+                cookies = {}
+                if self._cookie:
+                    for cookie_item in self._cookie.split(';'):
+                        if '=' in cookie_item:
+                            name, value = cookie_item.strip().split('=', 1)
+                            cookies[name] = value
+                token = cookies.get('token')
+                if token:
+                    logger.info("尝试预拉取用户信息用于页面展示")
+                    self._fetch_user_info(cookies, token)
             except Exception:
                 pass
             
@@ -508,9 +534,17 @@ class HdhiveSign(_PluginBase):
             message = signin_result.get('message', '无明确消息')
             
             if signin_result.get('success'):
+                try:
+                    self._fetch_user_info(cookies, token)
+                except Exception:
+                    pass
                 return True, message
 
             if "已经签到" in message or "签到过" in message:
+                try:
+                    self._fetch_user_info(cookies, token)
+                except Exception:
+                    pass
                 return True, message 
 
             logger.error(f"签到失败, HTTP状态码: {signin_res.status_code}, 消息: {message}")
@@ -560,6 +594,130 @@ class HdhiveSign(_PluginBase):
         except Exception as e:
             logger.error(f"保存签到历史记录失败: {str(e)}", exc_info=True)
 
+    def _fetch_user_info(self, cookies: Dict[str, str], token: str) -> Optional[dict]:
+        try:
+            referer = self._site_url
+            try:
+                decoded_token = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+                user_id = decoded_token.get('sub')
+                if user_id:
+                    referer = f"{self._base_url}/user/{user_id}"
+            except Exception:
+                pass
+            headers = {
+                'User-Agent': settings.USER_AGENT,
+                'Accept': 'application/json, text/plain, */*',
+                'Origin': self._base_url,
+                'Referer': referer,
+                'Authorization': f'Bearer {token}',
+            }
+            resp = requests.get(self._user_info_api, headers=headers, cookies=cookies, proxies=settings.PROXY, timeout=30, verify=False)
+            logger.info(f"拉取用户信息 API 状态码: {getattr(resp,'status_code','unknown')} CT: {getattr(resp.headers,'get',lambda k:'' )('Content-Type')}")
+            data = {}
+            try:
+                data = resp.json()
+            except Exception:
+                data = {}
+            # 统一解析 response.data / detail / data 结构
+            detail = (data.get('response') or {}).get('data') or data.get('detail') or data.get('data') or {}
+            if not isinstance(detail, dict):
+                detail = {}
+            info = {
+                'id': detail.get('id') or detail.get('member_id'),
+                'nickname': detail.get('nickname') or detail.get('member_name'),
+                'avatar_url': detail.get('avatar_url') or detail.get('gravatar_url'),
+                'created_at': detail.get('created_at'),
+                'points': ((detail.get('user_meta') or {}).get('points')),
+                'signin_days_total': ((detail.get('user_meta') or {}).get('signin_days_total')),
+                'warnings_nums': detail.get('warnings_nums'),
+            }
+            # 若 API 未返回完整信息，尝试 RSC 页面解析
+            if not info.get('nickname') or info.get('points') is None or info.get('signin_days_total') is None:
+                try:
+                    rsc_headers = {
+                        'User-Agent': settings.USER_AGENT,
+                        'Accept': 'text/x-component',
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                        'Origin': self._base_url,
+                        'Referer': referer,
+                        'rsc': '1',
+                    }
+                    rsc_url = referer
+                    rsc_resp = requests.get(rsc_url, headers=rsc_headers, cookies=cookies, proxies=settings.PROXY, timeout=30, verify=False)
+                    logger.info(f"RSC 用户页状态码: {getattr(rsc_resp,'status_code','unknown')} CT: {getattr(rsc_resp.headers,'get',lambda k:'' )('Content-Type')}")
+                    rsc_text = rsc_resp.text or ''
+                    import re as _re
+                    m_nick = _re.search(r'"nickname":"([^"]+)"', rsc_text)
+                    m_points = _re.search(r'"points":(\d+)', rsc_text)
+                    m_days = _re.search(r'"signin_days_total":(\d+)', rsc_text)
+                    m_avatar = _re.search(r'"avatar_url":"([^"]+)"', rsc_text)
+                    m_created = _re.search(r'"created_at":"([^"]+)"', rsc_text)
+                    if m_nick:
+                        info['nickname'] = m_nick.group(1)
+                    if m_points:
+                        info['points'] = int(m_points.group(1))
+                    if m_days:
+                        info['signin_days_total'] = int(m_days.group(1))
+                    if m_avatar:
+                        info['avatar_url'] = m_avatar.group(1)
+                    if m_created:
+                        info['created_at'] = m_created.group(1)
+                    if (not info.get('nickname') or info.get('points') is None or info.get('signin_days_total') is None) and '"user":' in rsc_text:
+                        user_json = self._extract_rsc_object(rsc_text, 'user')
+                        if user_json:
+                            try:
+                                obj = json.loads(user_json)
+                                info['id'] = obj.get('id') or info.get('id')
+                                info['nickname'] = obj.get('nickname') or info.get('nickname')
+                                info['avatar_url'] = obj.get('avatar_url') or info.get('avatar_url')
+                                info['created_at'] = obj.get('created_at') or info.get('created_at')
+                                meta = obj.get('user_meta') or {}
+                                if isinstance(meta, dict):
+                                    if meta.get('points') is not None:
+                                        info['points'] = meta.get('points')
+                                    if meta.get('signin_days_total') is not None:
+                                        info['signin_days_total'] = meta.get('signin_days_total')
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            self.save_data('hdhive_user_info', info)
+            return info
+        except Exception as e:
+            logger.warning(f"获取用户信息失败: {e}")
+            return None
+
+    def _extract_rsc_object(self, text: str, key: str) -> Optional[str]:
+        try:
+            marker = f'"{key}":'
+            idx = text.find(marker)
+            if idx == -1:
+                return None
+            brace_idx = text.find('{', idx + len(marker))
+            if brace_idx == -1:
+                return None
+            depth = 0
+            i = brace_idx
+            in_str = False
+            prev = ''
+            while i < len(text):
+                ch = text[i]
+                if ch == '"' and prev != '\\':
+                    in_str = not in_str
+                if not in_str:
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            segment = text[brace_idx:i+1]
+                            return segment
+                prev = ch
+                i += 1
+            return None
+        except Exception:
+            return None
+
     def _send_sign_notification(self, sign_dict):
         """
         发送签到通知
@@ -572,6 +730,11 @@ class HdhiveSign(_PluginBase):
         points = sign_dict.get("points", "—")
         days = sign_dict.get("days", "—")
         sign_time = sign_dict.get("date", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        user = self.get_data('hdhive_user_info') or {}
+        nickname = user.get('nickname') or '—'
+        user_points = user.get('points') if user.get('points') is not None else '—'
+        signin_days_total = user.get('signin_days_total') if user.get('signin_days_total') is not None else '—'
+        created_at = user.get('created_at') or '—'
 
         # 检查奖励信息是否为空
         info_missing = message == "—" and points == "—" and days == "—"
@@ -591,6 +754,12 @@ class HdhiveSign(_PluginBase):
                     f"📍 方式：{trigger_type}\n"
                     f"✨ 状态：{status}\n"
                     f"⚠️ 详细信息获取失败，请手动查看\n"
+                    f"━━━━━━━━━━\n"
+                    f"👤 用户信息\n"
+                    f"昵称：{nickname}\n"
+                    f"积分：{user_points}\n"
+                    f"累计签到天数（站点）：{signin_days_total}\n"
+                    f"加入时间：{created_at}\n"
                     f"━━━━━━━━━━"
                 )
             else:
@@ -605,6 +774,12 @@ class HdhiveSign(_PluginBase):
                     f"💬 消息：{message}\n"
                     f"🎁 奖励：{points}\n"
                     f"📆 天数：{days}\n"
+                    f"━━━━━━━━━━\n"
+                    f"👤 用户信息\n"
+                    f"昵称：{nickname}\n"
+                    f"积分：{user_points}\n"
+                    f"累计签到天数（站点）：{signin_days_total}\n"
+                    f"加入时间：{created_at}\n"
                     f"━━━━━━━━━━"
                 )
         elif "已签到" in status:
@@ -619,6 +794,12 @@ class HdhiveSign(_PluginBase):
                     f"✨ 状态：{status}\n"
                     f"ℹ️ 说明：今日已完成签到\n"
                     f"⚠️ 详细信息获取失败，请手动查看\n"
+                    f"━━━━━━━━━━\n"
+                    f"👤 用户信息\n"
+                    f"昵称：{nickname}\n"
+                    f"积分：{user_points}\n"
+                    f"累计签到天数（站点）：{signin_days_total}\n"
+                    f"加入时间：{created_at}\n"
                     f"━━━━━━━━━━"
                 )
             else:
@@ -634,6 +815,12 @@ class HdhiveSign(_PluginBase):
                     f"💬 消息：{message}\n"
                     f"🎁 奖励：{points}\n"
                     f"📆 天数：{days}\n"
+                    f"━━━━━━━━━━\n"
+                    f"👤 用户信息\n"
+                    f"昵称：{nickname}\n"
+                    f"积分：{user_points}\n"
+                    f"累计签到天数（站点）：{signin_days_total}\n"
+                    f"加入时间：{created_at}\n"
                     f"━━━━━━━━━━"
                 )
         else:
@@ -935,9 +1122,55 @@ class HdhiveSign(_PluginBase):
         构建插件详情页面，展示签到历史 (完全参照 qmjsign)
         """
         historys = self.get_data('sign_history') or []
+        user = self.get_data('hdhive_user_info') or {}
+        consecutive_days = self.get_data('consecutive_days') or 0
+
+        info_card = []
+        if user:
+            avatar = user.get('avatar_url') or ''
+            nickname = user.get('nickname') or '—'
+            points = user.get('points') if user.get('points') is not None else '—'
+            signin_days_total = user.get('signin_days_total') if user.get('signin_days_total') is not None else '—'
+            created_at = user.get('created_at') or '—'
+            info_card = [{
+                'component': 'VCard',
+                'props': {'variant': 'outlined', 'class': 'mb-4'},
+                'content': [
+                    {
+                        'component': 'VCardTitle',
+                        'props': {'class': 'd-flex align-center justify-space-between'},
+                        'content': [
+                            {
+                                'component': 'div',
+                                'content': [
+                                    {'component': 'span', 'props': {'class': 'text-h6'}, 'text': '👤 影巢用户信息'},
+                                    {'component': 'div', 'props': {'class': 'text-caption'}, 'text': f'加入时间：{created_at}'}
+                                ]
+                            },
+                            {'component': 'VAvatar', 'props': {'size': 64}, 'content': [{'component': 'img', 'props': {'src': avatar, 'alt': nickname}}]}
+                        ]
+                    },
+                    {'component': 'VDivider'},
+                    {
+                        'component': 'VCardText',
+                        'content': [
+                            {
+                                'component': 'VRow',
+                                'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [{'component': 'VChip', 'props': {'variant': 'elevated', 'color': 'primary', 'class': 'mb-2'}, 'text': f'用户：{nickname}'}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [{'component': 'VChip', 'props': {'variant': 'elevated', 'color': 'amber-darken-2', 'class': 'mb-2'}, 'text': f'积分：{points}'}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [{'component': 'VChip', 'props': {'variant': 'elevated', 'color': 'success', 'class': 'mb-2'}, 'text': f'累计签到天数（站点）：{signin_days_total}'}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [{'component': 'VChip', 'props': {'variant': 'elevated', 'color': 'cyan-darken-2', 'class': 'mb-2'}, 'text': f'连续签到天数（插件）：{consecutive_days}'}]},
+                                ]
+                            },
+                            {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'class': 'mt-2', 'text': '注：累计签到天数来自站点数据；插件统计的是连续天数，两者可能不同'}},
+                        ]
+                    }
+                ]
+            }]
 
         if not historys:
-            return [{
+            return info_card + [{
                 'component': 'VAlert',
                 'props': {
                     'type': 'info', 'variant': 'tonal',
@@ -976,7 +1209,7 @@ class HdhiveSign(_PluginBase):
                 ]
             })
 
-        return [{
+        return info_card + [{
             'component': 'VCard',
             'props': {'variant': 'outlined', 'class': 'mb-4'},
             'content': [
