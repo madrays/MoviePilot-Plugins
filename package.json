@@ -221,7 +221,7 @@
     }
   }
   ,
-  "UgreenDiscuz": {
+  "ugreendiscuz": {
     "name": "绿联论坛签到",
     "description": "自动登录刷新Cookie或手动Cookie，登录即签到；抓取头像、积分等信息并展示与通知",
     "labels": "签到,绿联,论坛",
