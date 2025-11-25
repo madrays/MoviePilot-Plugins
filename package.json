@@ -220,5 +220,19 @@
         "v1.0.0": "首次发布：登录、状态监控、端口列表/添加/删除、通知"
     }
   }
+  ,
+  "UgreenDiscuz": {
+    "name": "绿联论坛签到",
+    "description": "自动登录刷新Cookie或手动Cookie，登录即签到；抓取头像、积分等信息并展示与通知",
+    "labels": "签到,绿联,论坛",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/lvlian.jpg",
+    "author": "madrays",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v1.0.0": "首次发布"
+    }
+  }
 
 }
