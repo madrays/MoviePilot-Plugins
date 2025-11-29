@@ -17,7 +17,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；100点数可兑换10天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -363,7 +363,7 @@ class gladossign(_PluginBase):
                             {'component': 'VCardText', 'content': [
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 8}, 'content': [
-                                        {'component': 'div', 'props': {'class': 'text-body-2'}, 'text': 'GlaDOS感觉挺佛系，靠每日签到可长期使用，有需求可以点击注册体验。'},
+                                        {'component': 'div', 'props': {'class': 'text-body-2'}, 'text': 'GlaDOS感觉挺佛系的，靠每日签到可长期使用，有需求可以点击注册体验。'},
                                         {'component': 'div', 'props': {'class': 'text-caption text-medium-emphasis mt-2'}, 'text': '提示：注册后每日签到获取点数，网站会自动兑换时长(100 点数=10 天)。'},
                                         {'component': 'VBtn', 'props': {'href': 'https://glados.space/landing/1F8CJ-TKYWO-KHOV3-PN7X2', 'target': '_blank', 'rel': 'noopener', 'color': 'indigo', 'variant': 'elevated', 'class': 'mt-2'}, 'text': '✨ 立即注册'}
                                     ]},
