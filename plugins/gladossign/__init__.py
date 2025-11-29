@@ -17,7 +17,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；100点数可兑换10天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -319,7 +319,7 @@ class gladossign(_PluginBase):
                 'content': [
                     {
                         'component': 'VCard',
-                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg', 'class': 'mb-4'},
+                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg', 'class': 'mb-3'},
                         'content': [
                             {'component': 'VCardTitle', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '基础设置'},
                             {'component': 'VCardText', 'content': [
@@ -327,13 +327,17 @@ class gladossign(_PluginBase):
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VSwitch', 'props': {'model': 'notify', 'label': '开启通知'}}]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [{'component': 'VSwitch', 'props': {'model': 'onlyonce', 'label': '立即运行一次'}}]},
+                                ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [{'component': 'VCronField', 'props': {'model': 'cron', 'label': '签到周期'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [{'component': 'VTextField', 'props': {'model': 'history_days', 'label': '历史保留天数', 'type': 'number', 'placeholder': '30'}}]},
                                 ]}
                             ]}
                         ]
                     },
                     {
                         'component': 'VCard',
-                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg', 'class': 'mb-4'},
+                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg', 'class': 'mb-3'},
                         'content': [
                             {'component': 'VCardTitle', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '域名与认证'},
                             {'component': 'VCardText', 'content': [
@@ -353,7 +357,26 @@ class gladossign(_PluginBase):
                     },
                     {
                         'component': 'VCard',
-                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg', 'class': 'mb-4'},
+                        'props': {'variant': 'elevated', 'elevation': 2, 'rounded': 'lg', 'class': 'mb-3'},
+                        'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '🎁 注册与福利(AFF)'},
+                            {'component': 'VCardText', 'content': [
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 8}, 'content': [
+                                        {'component': 'div', 'props': {'class': 'text-body-2'}, 'text': 'GlaDOS感觉是个佛系机场，靠每日签到可长期使用，有需求可以点击注册体验。'},
+                                        {'component': 'div', 'props': {'class': 'text-caption text-medium-emphasis mt-2'}, 'text': '提示：注册后每日签到获取点数，网站会自动兑换时长(100 点数=10 天)。'},
+                                        {'component': 'VBtn', 'props': {'href': 'https://glados.space/landing/1F8CJ-TKYWO-KHOV3-PN7X2', 'target': '_blank', 'rel': 'noopener', 'color': 'indigo', 'variant': 'elevated', 'class': 'mt-2'}, 'text': '✨ 立即注册'}
+                                    ]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                        {'component': 'VImg', 'props': {'src': 'https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png', 'height': 120, 'class': 'rounded-lg'}}
+                                    ]}
+                                ]}
+                            ]}
+                        ]
+                    },
+                    {
+                        'component': 'VCard',
+                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg', 'class': 'mb-3'},
                         'content': [
                             {'component': 'VCardTitle', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '网络与重试'},
                             {'component': 'VCardText', 'content': [
@@ -371,19 +394,7 @@ class gladossign(_PluginBase):
                             ]}
                         ]
                     },
-                    {
-                        'component': 'VCard',
-                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg'},
-                        'content': [
-                            {'component': 'VCardTitle', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '计划与清理'},
-                            {'component': 'VCardText', 'content': [
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [{'component': 'VCronField', 'props': {'model': 'cron', 'label': '签到周期'}}]},
-                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [{'component': 'VTextField', 'props': {'model': 'history_days', 'label': '历史保留天数', 'type': 'number', 'placeholder': '30'}}]},
-                                ]}
-                            ]}
-                        ]
-                    }
+                    
                 ]
             }
         ], {
