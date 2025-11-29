@@ -234,5 +234,19 @@
       "v1.0.0": "首次发布"
     }
   }
+  ,
+  "gladossign": {
+    "name": "GlaDOS 签到",
+    "description": "每日签到获取点数；100点数可兑换10天套餐时长",
+    "labels": "签到,GlaDOS,VPN",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png",
+    "author": "madrays",
+    "level": 2,
+    "v2": true,
+    "history": {
+      "v1.0.0": "首次发布"
+    }
+  }
 
 }
