@@ -17,7 +17,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；100点数可兑换10天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -136,11 +136,8 @@ class gladossign(_PluginBase):
                     t_ms = now_ms if code == 1 else t_ms_server
                     dt = datetime.fromtimestamp(t_ms/1000.0)
                     dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
-                    status = '签到成功' if (code == 0 and points_gain > 0) else ('已签到' if code == 1 else '签到失败')
-                    msg_cn = (
-                        f"签到成功！获得 {points_gain} 点数" if status == '签到成功' else (
-                        "重复签到！请明天再试" if status == '已签到' else (msg_en or '签到失败'))
-                    )
+                    status = '签到成功' if (points_gain > 0) else ('已签到' if (code == 1 or ('Repeats' in msg_en) or ('Try Tomorrow' in msg_en)) else '签到失败')
+                    msg_cn = (f"签到成功！获得 {points_gain} 点数" if status == '签到成功' else ("重复签到！请明天再试" if status == '已签到' else (msg_en or '签到失败')))
                     logger.info(f"业务摘要: 状态={status}, 本次点数={points_gain}, 余额={balance}, 用户ID={uid}")
                     bal_int = self._to_int(balance)
                     rec = {
