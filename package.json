@@ -217,10 +217,9 @@
     "level": 2,
     "v2": true,
     "history": {
-        "v1.0.0": "首次发布：登录、状态监控、端口列表/添加/删除、通知"
+      "v1.0.0": "首次发布：登录、状态监控、端口列表/添加/删除、通知"
     }
-  }
-  ,
+  },
   "ugreendiscuz": {
     "name": "绿联论坛签到",
     "description": "自动登录刷新Cookie或手动Cookie，登录即签到；抓取头像、积分等信息并展示与通知",
@@ -233,23 +232,22 @@
     "history": {
       "v1.0.0": "首次发布"
     }
-  }
-  ,
+  },
   "gladossign": {
     "name": "GlaDOS 签到",
-    "description": "每日签到获取点数；100点数可兑换10天套餐时长",
+    "description": "每日签到获取点数；积累点数可兑换 10~100 天套餐时长",
     "labels": "签到,GlaDOS,VPN",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png",
     "author": "madrays",
     "level": 2,
     "v2": true,
     "history": {
+      "v1.4.0": "适配新版 API：以 /api/user/points 数据为准；UI 修正：明确展示三种兑换方案；修复重复签到时的奖励展示",
       "v1.3.0": "修复签到状态判断：以点数为准，重复签到判定优化",
       "v1.2.0": "UI 更新",
       "v1.1.0": "UI 更新",
       "v1.0.0": "首次发布"
     }
   }
-
 }

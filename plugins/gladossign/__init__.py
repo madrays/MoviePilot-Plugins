@@ -15,9 +15,9 @@ import requests
 
 class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
-    plugin_desc = "每日签到获取点数；100点数可兑换10天套餐时长"
+    plugin_desc = "每日签到获取点数；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -139,43 +139,52 @@ class gladossign(_PluginBase):
                     status = '签到成功' if (points_gain > 0) else ('已签到' if (code == 1 or ('Repeats' in msg_en) or ('Try Tomorrow' in msg_en)) else '签到失败')
                     msg_cn = (f"签到成功！获得 {points_gain} 点数" if status == '签到成功' else ("重复签到！请明天再试" if status == '已签到' else (msg_en or '签到失败')))
                     logger.info(f"业务摘要: 状态={status}, 本次点数={points_gain}, 余额={balance}, 用户ID={uid}")
-                    bal_int = self._to_int(balance)
-                    rec = {
-                        'date': dt_str,
-                        'ts': t_ms,
-                        'status': status,
-                        'message': msg_cn,
-                        'points_gain': points_gain,
-                        'balance': bal_int,
-                        'user_id': uid,
-                    }
-                    self._save_history(rec)
-                    if status in ('签到成功', '已签到'):
-                        info = {
-                            'user_id': uid,
-                            'last_gain': points_gain,
-                            'last_balance': bal_int,
-                            'last_time': dt_str,
-                        }
-                        more = self._fetch_user_summary(headers, px)
-                        if more:
-                            info.update(more)
-                        self.save_data('glados_last_info', info)
+                    
+                    # 尝试拉取最新的 Points 接口数据作为权威数据
+                    self._fetch_user_summary(headers, px)
+                    
+                    # 重新读取数据用于通知
+                    info_out = self.get_data('glados_user') or {}
+                    last_point_info = self.get_data('glados_points_info') or {}
+                    
+                    # 优先使用 api/user/points 的数据
+                    current_points = last_point_info.get('points') 
+                    if current_points is None:
+                         current_points = self._to_int(balance)
+                    
+                    # 修正：如果是“已签到”状态，尝试从历史记录中查找今天的签到记录，以展示“今日已获点数”
+                    try:
+                        tz = pytz.timezone(settings.TZ)
+                        today_ymd = datetime.now(tz).strftime('%Y-%m-%d')
+                        history_list = self.get_data('glados_history') or []
+                        # 查找 message 或 date 匹配今天的记录 (API detail: checkin:2026-01-20-...)
+                        todays_rec = next((h for h in history_list if today_ymd in str(h.get('message','')) and 'checkin' in str(h.get('message','')).lower()), None)
+                        
+                        if todays_rec:
+                            # 找到了今天的权威记录
+                            real_gain = int(todays_rec.get('points_gain', 0))
+                            if status == '已签到':
+                                points_gain = real_gain
+                                msg_cn = f"重复签到！今日已获 {points_gain} 点数"
+                    except Exception as e:
+                        logger.warning(f"匹配今日记录失败: {e}")
+
+                    # 更新通知逻辑
                     if self._notify:
                         title = '✅ GlaDOS 签到成功' if status == '签到成功' else ('✅ 今日已签到' if status == '已签到' else '🔴 GlaDOS 签到失败')
                         emoji = '📈' if points_gain > 0 else ('➖' if points_gain == 0 else '📉')
-                        info_out = self.get_data('glados_last_info') or {}
+                        
                         text_parts = [
                             f"🆔 用户ID：{uid}" if uid else "",
                             f"{emoji} 本次点数：{points_gain}",
-                            f"💰 当前点数：{bal_int}" if bal_int is not None else "",
+                            f"💰 当前点数：{current_points}" if current_points is not None else "",
                             f"⏰ 时间：{dt_str}",
                             (f"📅 已用天数：{info_out.get('days')}" if info_out.get('days') is not None else ""),
                             (f"🕒 剩余天数：{info_out.get('leftDays')}" if info_out.get('leftDays') is not None else ""),
                             (f"📧 邮箱：{info_out.get('email')}" if info_out.get('email') else ""),
                         ]
                         self.post_message(mtype=NotificationType.SiteMessage, title=title, text="\n".join([x for x in text_parts if x]))
-                    return rec
+                    return {} # 历史记录统一由 _fetch_user_summary 处理
                 except Exception as e:
                     last_error = e
                     logger.warning(f"请求失败(第{idx+1}组{'使用代理' if px else '不使用代理'}第{attempt}/{self._max_attempts}次): {e}")
@@ -233,18 +242,35 @@ class gladossign(_PluginBase):
             return None
 
     def _fetch_user_summary(self, headers: Dict[str, str], proxies: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        """
+        拉取用户信息，包括 /api/user/points (积分/历史) 和 /api/user/info (账号详情)
+        """
         try:
-            urls = [
-                f"{self._base_url.rstrip('/')}/api/user/status",
-                f"{self._base_url.rstrip('/')}/api/user/info",
-            ]
+            # 1. 获取积分和历史记录 (Source of Truth)
+            url_points = f"{self._base_url.rstrip('/')}/api/user/points"
+            try:
+                r = requests.get(url_points, headers=headers, timeout=12, proxies=proxies)
+                if r.status_code == 200:
+                    d = r.json() or {}
+                    if d.get('code') == 0:
+                        # 保存原始 Points 数据
+                        self.save_data('glados_points_info', d)
+                        
+                        # 同步历史记录
+                        history_list = d.get('history', [])
+                        self._sync_history_from_api(history_list)
+            except Exception as e:
+                logger.warning(f"获取 Points 失败: {e}")
+
+            # 2. 获取账号基本信息 (days, email etc)
+            # /api/user/status 也可以，但 /api/user/info 似乎更常用于获取天数
+            urls = [f"{self._base_url.rstrip('/')}/api/user/status"]
             for u in urls:
                 r = requests.get(u, headers=headers, timeout=12, proxies=proxies)
                 d = {}
-                try:
-                    d = r.json() or {}
-                except Exception:
-                    d = {}
+                try: d = r.json() or {}
+                except Exception: d = {}
+                
                 code = d.get('code')
                 if code == 0 and isinstance(d.get('data'), dict):
                     data = d.get('data')
@@ -260,9 +286,75 @@ class gladossign(_PluginBase):
                     }
                     self.save_data('glados_user', out)
                     return out
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"拉取用户信息异常: {e}")
         return {}
+
+    def _sync_history_from_api(self, api_history: List[Dict]):
+        """
+        将 API 返回的历史记录同步到本地存储
+        API Item Example:
+        {
+            "id": 128424869,
+            "user_id": 661475,
+            "time": 1768695420698,
+            "asset": "points",
+            "business": "system:checkin:2026-01-18",
+            "change": "3.00000000",
+            "balance": "240.0000000000000000",
+            "detail": "checkin:2026-01-18-661475"
+        }
+        """
+        if not api_history:
+            return
+            
+        formatted_history = []
+        for item in api_history:
+            try:
+                ts = int(item.get('time') or 0)
+                change = float(item.get('change') or 0)
+                # 转换为整数展示，更简洁
+                change_int = int(change) if change.is_integer() else change
+                
+                balance = float(item.get('balance') or 0)
+                balance_int = int(balance) if balance.is_integer() else balance
+                
+                business = item.get('business', '')
+                detail = item.get('detail', '')
+                
+                # 构造存入本地的格式
+                dt = datetime.fromtimestamp(ts/1000.0)
+                dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
+                
+                # 简单的状态推断
+                status = "变动"
+                if "checkin" in business or "checkin" in detail:
+                    status = "签到"
+                elif "exchange" in business or "exchange" in detail:
+                    status = "兑换"
+                
+                # 构造消息
+                msg = detail
+                if not msg:
+                    msg = business
+                    
+                formatted_history.append({
+                    'date': dt_str,
+                    'ts': ts,
+                    'status': status,
+                    'message': msg,
+                    'points_gain': change_int, # 复用字段名，实际是 change
+                    'balance': balance_int,
+                    'user_id': item.get('user_id')
+                })
+            except Exception:
+                continue
+        
+        # 保存，由于 API 返回的是完整的最近记录，直接覆盖即可
+        # 但为了保留更久的数据，可以做合并。此处简单起见，且 User 想要 API 数据，直接保存 API 返回的最新数据的解析结果
+        # 如果需要保留更久，可以与 self.get_data('glados_history') 合并去重
+        # 考虑到 API 给的是 authoritative 的历史，直接覆盖显示最准确
+        self.save_data('glados_history', formatted_history)
 
     def _save_history(self, record: Dict[str, Any]):
         try:
@@ -339,14 +431,19 @@ class gladossign(_PluginBase):
                             {'component': 'VCardTitle', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '域名与认证'},
                             {'component': 'VCardText', 'content': [
                                 {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextField', 'props': {'model': 'base_url', 'label': '基础域名', 'placeholder': 'https://glados.space'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                                        {'component': 'VAlert', 'props': {'type': 'warning', 'variant': 'outlined', 'class': 'mb-2', 'text': '重要提示：请务必确认您的账号所属 Base URL。不同账号可能分配在不同域名 (如 https://glados.one 或 https://glados.cloud) ，填写错误将无法签到。请登录官网查看浏览器地址栏确认。'}}
+                                    ]},
+                                ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextField', 'props': {'model': 'base_url', 'label': 'Base URL (基础域名)', 'placeholder': '例如 https://glados.one'}}]},
                                 ]},
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextarea', 'props': {'model': 'cookie', 'label': 'Cookie', 'rows': 3, 'placeholder': 'koa:sess=...; koa:sess.sig=...'}}]},
                                 ]},
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': '建议：使用浏览器登录 glados.space 后复制 Cookie（koa:sess 与 koa:sess.sig）。本插件负责签到与信息展示；套餐时长兑换由网站自动进行，无需操作。100 点数将自动兑换 10 天套餐时长。'}}
+                                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': '从浏览器复制 Cookie (包含 koa:sess 和 koa:sess.sig)。插件仅负责签到和展示信息，请积攒点数后并在官网手动兑换 (100点=10天 / 200点=30天 / 500点=100天)。'}}
                                     ]},
                                 ]},
                             ]}
@@ -361,7 +458,7 @@ class gladossign(_PluginBase):
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 8}, 'content': [
                                         {'component': 'div', 'props': {'class': 'text-body-2'}, 'text': 'GlaDOS感觉挺佛系的，靠每日签到可长期使用，有需求可以点击注册体验。'},
-                                        {'component': 'div', 'props': {'class': 'text-caption text-medium-emphasis mt-2'}, 'text': '提示：注册后每日签到获取点数，网站会自动兑换时长(100 点数=10 天)。'},
+                                        {'component': 'div', 'props': {'class': 'text-caption text-medium-emphasis mt-2'}, 'text': '提示：注册后每日签到获取点数，可兑换套餐时长 (100点=10天 / 200点=30天 / 500点=100天)。'},
                                         {'component': 'VBtn', 'props': {'href': 'https://glados.space/landing/1F8CJ-TKYWO-KHOV3-PN7X2', 'target': '_blank', 'rel': 'noopener', 'color': 'indigo', 'variant': 'elevated', 'class': 'mt-2'}, 'text': '✨ 立即注册'}
                                     ]},
                                     {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
@@ -409,24 +506,40 @@ class gladossign(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        info = self.get_data('glados_last_info') or {}
-        user = self.get_data('glados_user') or {}
+        # 从 _fetch_user_summary 存储的数据中读取
+        user_info = self.get_data('glados_user') or {}
+        points_info = self.get_data('glados_points_info') or {}
         historys = self.get_data('glados_history') or []
+        
+        # 排序
         historys = sorted(historys, key=lambda x: int(x.get('ts') or 0), reverse=True)
+        
         card = []
-        if info:
-            uid = info.get('user_id')
-            balance = info.get('last_balance')
-            gain = info.get('last_gain', 0)
-            last_time = info.get('last_time', '-')
-            business = info.get('last_business')
-            email = user.get('email')
-            days = user.get('days')
-            left_days = user.get('leftDays')
+        if user_info or points_info:
+            uid = user_info.get('user_id')
+            email = user_info.get('email')
+            days = user_info.get('days')
+            left_days = user_info.get('leftDays')
+            
+            # 优先从 points_info 获取积分余额
+            balance = points_info.get('points')
+            if balance is None:
+                 balance = "-"
+            else:
+                 # 格式化，去掉多余的 0
+                 try:
+                     balance = float(balance)
+                     balance = int(balance) if balance.is_integer() else balance
+                 except: pass
+
             latest = historys[0] if historys else {}
             latest_status = latest.get('status', '-')
-            latest_color = 'success' if any(kw in str(latest_status) for kw in ['成功', '已签到']) else 'error'
-            gain_emoji = '📈' if int(gain or 0) > 0 else ('➖' if int(gain or 0) == 0 else '📉')
+            latest_gain = latest.get('points_gain', 0)
+            latest_color = 'success' if int(latest_gain) > 0 else ('error' if int(latest_gain) < 0 else 'grey')
+            latest_time = latest.get('date', '-')
+            
+            gain_emoji = '📈' if int(latest_gain or 0) > 0 else ('➖' if int(latest_gain or 0) == 0 else '📉')
+            
             card = [
                 {
                     'component': 'VCard',
@@ -464,7 +577,7 @@ class gladossign(_PluginBase):
                             ]},
                             {'component': 'VRow', 'props': {'class': 'mt-3'}, 'content': [
                                 {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                    {'component': 'VChip', 'props': {'size': 'default', 'variant': 'tonal', 'color': 'indigo'}, 'text': '💡 提示：网站会自动兑换，100 点数自动换 10 天套餐'}
+                                    {'component': 'VChip', 'props': {'size': 'default', 'variant': 'tonal', 'color': 'indigo'}, 'text': '💡 提示：点数可兑换套餐：100点=10天 / 200点=30天 / 500点=100天'}
                                 ]}
                             ]},
                         ]}
