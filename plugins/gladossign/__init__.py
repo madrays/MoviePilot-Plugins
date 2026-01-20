@@ -17,7 +17,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -123,12 +123,18 @@ class gladossign(_PluginBase):
                         data = resp.json() or {}
                     except Exception:
                         data = {}
-                    logger.info(f"解析JSON: keys={list(data.keys())}")
+                    logger.info(f"解析JSON: {data}")
                     code = int(data.get('code') or -1)
-                    points_gain = int(data.get('points') or 0)
+                    # 尝试从 root 获取 points，也可能在 list[0]
+                    points_gain = int(data.get('points') or 0) 
                     msg_en = str(data.get('message') or '')
                     lst = data.get('list') or []
                     item = lst[0] if lst else {}
+                    # 如果 root 没 point，尝试从 item 获取 (部分 API 变种)
+                    if points_gain == 0 and item.get('points'):
+                         try: points_gain = int(item.get('points'))
+                         except: pass
+
                     uid = item.get('user_id')
                     balance = item.get('balance')
                     now_ms = int(time.time()*1000)
@@ -138,7 +144,11 @@ class gladossign(_PluginBase):
                     dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
                     status = '签到成功' if (points_gain > 0) else ('已签到' if (code == 1 or ('Repeats' in msg_en) or ('Try Tomorrow' in msg_en)) else '签到失败')
                     msg_cn = (f"签到成功！获得 {points_gain} 点数" if status == '签到成功' else ("重复签到！请明天再试" if status == '已签到' else (msg_en or '签到失败')))
-                    logger.info(f"业务摘要: 状态={status}, 本次点数={points_gain}, 余额={balance}, 用户ID={uid}")
+                    
+                    if status == '已签到':
+                        logger.info(f"检测到重复签到 (Code={code}), API通常不返回余额/UID, 将通过 User/Points 接口获取")
+                    else:
+                        logger.info(f"业务摘要: 状态={status}, 本次点数={points_gain}, 余额={balance}, 用户ID={uid}")
                     
                     # 尝试拉取最新的 Points 接口数据作为权威数据
                     self._fetch_user_summary(headers, px)
@@ -148,7 +158,7 @@ class gladossign(_PluginBase):
                     last_point_info = self.get_data('glados_points_info') or {}
                     
                     # 优先使用 api/user/points 的数据
-                    current_points = last_point_info.get('points') 
+                    current_points = self._to_int(last_point_info.get('points')) 
                     if current_points is None:
                          current_points = self._to_int(balance)
                     
@@ -158,7 +168,13 @@ class gladossign(_PluginBase):
                         today_ymd = datetime.now(tz).strftime('%Y-%m-%d')
                         history_list = self.get_data('glados_history') or []
                         # 查找 message 或 date 匹配今天的记录 (API detail: checkin:2026-01-20-...)
-                        todays_rec = next((h for h in history_list if today_ymd in str(h.get('message','')) and 'checkin' in str(h.get('message','')).lower()), None)
+                        logger.info(f"正在匹配今日记录: {today_ymd}, 历史记录数: {len(history_list)}")
+                        if history_list:
+                            logger.info(f"第一条记录: {history_list[0]}")
+                        
+                        # 逻辑修正：由于 message 可能已被翻译为 "每日签到奖励"，不能仅依赖 message 中的日期
+                        # 应该检查 date 字段 (YYYY-MM-DD HH:MM:SS) 是否包含今日日期
+                        todays_rec = next((h for h in history_list if today_ymd in str(h.get('date','')) and ('checkin' in str(h.get('message','')).lower() or '签到' in str(h.get('message','')))), None)
                         
                         if todays_rec:
                             # 找到了今天的权威记录
@@ -334,9 +350,21 @@ class gladossign(_PluginBase):
                     status = "兑换"
                 
                 # 构造消息
-                msg = detail
-                if not msg:
-                    msg = business
+                msg = detail or business or ""
+                # 简单翻译
+                if 'exchange' in msg and 'points for' in msg:
+                    # exchange 200 points for 30 days
+                    try:
+                        import re
+                        m = re.search(r'exchange (\d+) points for (\d+) days', msg)
+                        if m:
+                            pts, dys = m.groups()
+                            msg = f"积分兑换{dys}天 (-{pts}点)"
+                    except:
+                        msg = "积分兑换套餐"
+                elif 'checkin' in msg:
+                    # checkin:2026-01-20-661475
+                    msg = "每日签到奖励"
                     
                 formatted_history.append({
                     'date': dt_str,
@@ -533,10 +561,16 @@ class gladossign(_PluginBase):
                  except: pass
 
             latest = historys[0] if historys else {}
-            latest_status = latest.get('status', '-')
-            latest_gain = latest.get('points_gain', 0)
+            
+            # 查找最近一次【签到】记录用于首页展示 (忽略兑换记录)
+            latest_checkin = next((h for h in historys if h.get('status') == '签到'), None)
+            # 如果没有签到记录，则回退到第一条
+            display_rec = latest_checkin if latest_checkin else latest
+            
+            latest_status = display_rec.get('status', '-')
+            latest_gain = display_rec.get('points_gain', 0)
             latest_color = 'success' if int(latest_gain) > 0 else ('error' if int(latest_gain) < 0 else 'grey')
-            latest_time = latest.get('date', '-')
+            latest_time = display_rec.get('date', '-')
             
             gain_emoji = '📈' if int(latest_gain or 0) > 0 else ('➖' if int(latest_gain or 0) == 0 else '📉')
             
@@ -555,7 +589,7 @@ class gladossign(_PluginBase):
                                     {'component': 'VChip', 'props': {'size': 'large', 'variant': 'tonal', 'color': 'amber-darken-2'}, 'text': f'💰 点数 {balance or "-"}'}
                                 ]},
                                 {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
-                                    {'component': 'VChip', 'props': {'size': 'large', 'variant': 'tonal', 'color': latest_color}, 'text': f'{gain_emoji} 本次 {gain}'}
+                                    {'component': 'VChip', 'props': {'size': 'large', 'variant': 'tonal', 'color': latest_color}, 'text': f'{gain_emoji} 本次 {latest_gain}'}
                                 ]},
                             ]},
                             {'component': 'VDivider'},
@@ -572,7 +606,7 @@ class gladossign(_PluginBase):
                             ]},
                             {'component': 'VRow', 'props': {'class': 'mt-3'}, 'content': [
                                 {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                    {'component': 'VChip', 'props': {'size': 'default', 'variant': 'tonal'}, 'text': f'⏰ 更新时间 {last_time}'}
+                                    {'component': 'VChip', 'props': {'size': 'default', 'variant': 'tonal'}, 'text': f'⏰ 更新时间 {latest_time}'}
                                 ]},
                             ]},
                             {'component': 'VRow', 'props': {'class': 'mt-3'}, 'content': [
