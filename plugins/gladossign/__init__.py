@@ -17,7 +17,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -104,7 +104,9 @@ class gladossign(_PluginBase):
         proxies = self._get_proxies()
         logger.info(f"使用代理: {'是' if (proxies is not None) else '否'}")
         logger.info(f"Cookie: {'有' if bool(self._cookie) else '无'}")
-        body = {"token": "glados.one"}
+        # 提取域名作为 token (例如 glados.cloud 或 glados.one)
+        domain = self._base_url.replace('https://', '').replace('http://', '').split('/')[0]
+        body = {"token": domain}
         attempts = [None]
         if proxies:
             attempts = [proxies] + ([None] if self._retry_no_proxy_fallback else [])
