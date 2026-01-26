@@ -17,7 +17,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -28,7 +28,7 @@ class gladossign(_PluginBase):
     _notify = True
     _onlyonce = False
     _cron = "0 9 * * *"
-    _base_url = "https://glados.space"
+    _base_url = "https://glados.cloud"
     _cookie = ""
     _proxy_enabled = False
     _timeout_seconds = 30
@@ -45,7 +45,15 @@ class gladossign(_PluginBase):
             self._notify = config.get("notify", True)
             self._onlyonce = config.get("onlyonce", False)
             self._cron = config.get("cron", "0 9 * * *")
-            self._base_url = (config.get("base_url") or self._base_url).strip() or self._base_url
+            
+            # 优化 base_url 获取逻辑，防止被默认值误覆盖
+            cfg_url = config.get("base_url")
+            if cfg_url:
+                self._base_url = str(cfg_url).strip()
+            else:
+                self._base_url = "https://glados.cloud"
+            logger.info(f"加载配置: Base URL={self._base_url}")
+            
             self._cookie = (config.get("cookie") or "").strip()
             self._proxy_enabled = bool(config.get("proxy_enabled", False))
             try:
@@ -466,7 +474,7 @@ class gladossign(_PluginBase):
                                     ]},
                                 ]},
                                 {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextField', 'props': {'model': 'base_url', 'label': 'Base URL (基础域名)', 'placeholder': '例如 https://glados.one'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextField', 'props': {'model': 'base_url', 'label': 'Base URL (基础域名)', 'placeholder': '例如 https://glados.cloud'}}]},
                                 ]},
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextarea', 'props': {'model': 'cookie', 'label': 'Cookie', 'rows': 3, 'placeholder': 'koa:sess=...; koa:sess.sig=...'}}]},
@@ -525,7 +533,7 @@ class gladossign(_PluginBase):
             "enabled": False,
             "notify": True,
             "onlyonce": False,
-            "base_url": "https://glados.space",
+            "base_url": "https://glados.cloud",
             "cookie": "",
             "proxy_enabled": True,
             "timeout_seconds": 30,
