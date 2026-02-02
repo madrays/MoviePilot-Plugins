@@ -1,6 +1,7 @@
 import json
 import re
 import time
+import calendar
 from collections import defaultdict
 from datetime import datetime, timedelta, date
 
@@ -24,7 +25,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "2.0.1"
+    plugin_version = "2.1.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -390,6 +391,47 @@ class FengchaoSignin(_PluginBase):
             user_info = res_api.json()
             self.save_data("user_info", user_info)
             self.save_data("user_info_updated_at", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+            # --- 同步签到历史记录 START ---
+            try:
+                attrs = user_info.get('data', {}).get('attributes', {})
+                last_checkin_time = attrs.get('lastCheckinTime')
+                if last_checkin_time:
+                    # API返回的时间格式例如 "2025-12-01 07:35:15"
+                    today_str = datetime.now().strftime('%Y-%m-%d')
+                    # 检查是否是今天的签到
+                    if last_checkin_time.startswith(today_str):
+                        # 获取现有历史记录
+                        history = self.get_data('history') or []
+                        record_date = last_checkin_time.split(" ")[0]
+                        skip_update = False
+                        
+                        # 检查今天是否已有“成功”或“已签到”的记录
+                        for item in history:
+                            if item.get("date", "").startswith(record_date):
+                                current_status = item.get("status", "")
+                                # 核心修复：如果已经是“成功”或“已签到”状态，则跳过覆盖，防止丢失详细奖励信息
+                                if "成功" in current_status or "已签到" in current_status:
+                                    skip_update = True
+                                    logger.info(f"今日已存在有效签到记录({current_status})，跳过从用户信息同步签到状态")
+                                break
+                        
+                        if not skip_update:
+                            history_record = {
+                                "date": last_checkin_time,
+                                "status": "已签到",  # 标记为已签到
+                                "money": attrs.get('money', 0),
+                                "totalContinuousCheckIn": attrs.get('totalContinuousCheckIn', 0),
+                                "lastCheckinMoney": attrs.get('lastCheckinMoney', 0),
+                                "failure_count": 0
+                            }
+                            # 保存到历史记录（_save_history 会处理覆盖逻辑）
+                            self._save_history(history_record)
+                            logger.info(f"同步个人信息时检测到今日已签到，已更新本地记录。奖励: {attrs.get('lastCheckinMoney', 0)}")
+            except Exception as e:
+                logger.warning(f"同步签到历史记录失败: {e}")
+            # --- 同步签到历史记录 END ---
+
             logger.info("成功更新并保存了蜂巢用户信息。")
 
             try:
@@ -702,38 +744,51 @@ class FengchaoSignin(_PluginBase):
 
     def _save_history(self, record: Dict[str, Any]):
         """
-        保存签到历史记录，实现同日失败记录的更新和成功记录的覆盖。
+        保存签到历史记录，确保同一天只有一条记录（以日期为Key）
         """
         history = self.get_data('history') or []
-        today_str = date.today().strftime('%Y-%m-%d')
+        
+        # 提取传入记录的日期部分 (YYYY-MM-DD)
+        try:
+            record_date = record.get("date", "").split(" ")[0]
+        except Exception:
+            record_date = date.today().strftime('%Y-%m-%d')
 
-        last_today_index = -1
-        for i in range(len(history) - 1, -1, -1):
-            if history[i].get("date", "").startswith(today_str):
-                last_today_index = i
+        # 在历史记录中查找同日期的记录索引
+        existing_index = -1
+        for i, item in enumerate(history):
+            if item.get("date", "").startswith(record_date):
+                existing_index = i
                 break
 
         is_new_success = "成功" in record.get("status", "") or "已签到" in record.get("status", "")
 
-        if last_today_index != -1:
-            last_record = history[last_today_index]
+        if existing_index != -1:
+            last_record = history[existing_index]
             is_last_success = "成功" in last_record.get("status", "") or "已签到" in last_record.get("status", "")
 
-            if not is_new_success and not is_last_success:
-                last_record["failure_count"] = last_record.get("failure_count", 0) + record.get("failure_count", 1)
-                last_record["date"] = record["date"]
-                last_record["reason"] = record.get("reason", "")
-                logger.info(f"更新当天签到失败记录，累计失败: {last_record['failure_count']}次")
-            elif is_new_success and not is_last_success:
-                record['failure_count'] = last_record.get('failure_count', 0)
-                history[last_today_index] = record
-                logger.info(f"签到成功，覆盖当天失败记录，并记录累计失败次数: {record['failure_count']}")
+            if is_new_success:
+                # 只要新记录是成功的，就覆盖旧记录（无论是之前是失败还是成功）
+                if not is_last_success:
+                    record['failure_count'] = last_record.get('failure_count', 0)
+                history[existing_index] = record
+                logger.info(f"更新日期 {record_date} 的签到记录 (状态: {record.get('status')})")
             else:
-                history.append(record)
+                # 新记录是失败
+                if not is_last_success:
+                    # 如果旧记录也是失败，累加失败次数并更新时间
+                    last_record["failure_count"] = last_record.get("failure_count", 0) + 1
+                    last_record["date"] = record["date"]
+                    last_record["reason"] = record.get("reason", "")
+                    logger.info(f"更新日期 {record_date} 的失败记录，累计次数: {last_record['failure_count']}")
+                else:
+                    # 如果旧记录是成功，新记录是失败（可能是重复重试导致的），忽略新记录
+                    logger.info(f"日期 {record_date} 已有成功记录，忽略新的失败记录")
         else:
+            # 没有当天的记录，直接追加
             history.append(record)
 
-        # 如果是失败状态，添加重试信息
+        # 失败记录添加重试信息
         if "失败" in record.get("status", ""):
             record["retry"] = {
                 "enabled": self._retry_count > 0,
@@ -1218,12 +1273,13 @@ class FengchaoSignin(_PluginBase):
         if user_info and 'data' in user_info and 'attributes' in user_info['data']:
             user_attrs = user_info['data']['attributes']
             username = user_attrs.get('displayName', '未知用户')
+            user_id = user_info.get('data', {}).get('id', '—') # 获取用户ID
             avatar_url = user_attrs.get('avatarUrl', '')
             money = self._format_pollen(user_attrs.get('money', 0))
             discussion_count = user_attrs.get('discussionCount', 0)
             comment_count = user_attrs.get('commentCount', 0)
-            follower_count = 0  # API响应中似乎没有此字段，暂时设为0
-            following_count = 0  # API响应中似乎没有此字段，暂时设为0
+            hive_bank_balance = user_attrs.get('hive_bank_balance', '0.00')
+            best_answer_count = user_attrs.get('bestAnswerCount', 0)
             last_checkin_time = user_attrs.get('lastCheckinTime', '未知')
             total_continuous_checkin = user_attrs.get('totalContinuousCheckIn', 0)
             join_time_str = user_attrs.get('joinTime', '')
@@ -1353,13 +1409,170 @@ class FengchaoSignin(_PluginBase):
                     ]
                 })
 
-            # 页脚信息
-            footer_texts = [f'最后签到: {last_checkin_time}']
+            # 页脚信息（Flex布局，不换行）
+            footer_items = []
+            if last_checkin_time:
+                footer_items.append({
+                    'component': 'div',
+                    'props': {'class': 'mr-3 mb-1 text-caption font-weight-medium', 'style': 'white-space: nowrap;'},
+                    'content': [{'component': 'span', 'text': f'最后签到: {last_checkin_time}'}]
+                })
             if user_info_updated_at:
-                footer_texts.append(f'数据更新: {user_info_updated_at}')
+                footer_items.append({
+                    'component': 'div',
+                    'props': {'class': 'mr-3 mb-1 text-caption font-weight-medium', 'style': 'white-space: nowrap;'},
+                    'content': [{'component': 'span', 'text': f'数据更新: {user_info_updated_at}'}]
+                })
             if pt_life_updated_at:
-                footer_texts.append(f'PT人生更新: {pt_life_updated_at}')
-            footer_line = ' • '.join(footer_texts)
+                footer_items.append({
+                    'component': 'div',
+                    'props': {'class': 'mb-1 text-caption font-weight-medium', 'style': 'white-space: nowrap;'},
+                    'content': [{'component': 'span', 'text': f'PT人生更新: {pt_life_updated_at}'}]
+                })
+
+            # --- 日历数据准备 ---
+            now = datetime.now()
+            year = now.year
+            month = now.month
+            # 修复：设置周日为一周的开始，以匹配下方的表头 ['日', '一', ...]
+            cal = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
+            today_day = now.day
+            
+            # 提取本月签到记录 (包含奖励信息)
+            current_month_str = now.strftime('%Y-%m')
+            signed_days = {} # {day_int: {'reward': str, 'status': str}}
+            
+            for record in history:
+                rec_date_str = record.get('date', '')
+                if rec_date_str.startswith(current_month_str):
+                    status = record.get("status", "")
+                    if "成功" in status or "已签到" in status or "失败" in status:
+                        try:
+                            # 提取日期
+                            day_part = int(rec_date_str.split(' ')[0].split('-')[2])
+                            
+                            # 确定显示状态
+                            display_status = "success"
+                            if "失败" in status:
+                                display_status = "failure"
+                            elif "已签到" in status:
+                                display_status = "checked"
+                            else:
+                                display_status = "success"
+                            
+                            # 提取奖励
+                            last_checkin_money = record.get('lastCheckinMoney', 0)
+                            formatted_reward = None
+                            if last_checkin_money > 0:
+                                formatted_reward = self._format_pollen(last_checkin_money)
+                                
+                            signed_days[day_part] = {
+                                'reward': formatted_reward,
+                                'status': display_status
+                            }
+                        except:
+                            pass
+
+            week_headers = ['日', '一', '二', '三', '四', '五', '六']
+            calendar_rows = []
+            
+            # 日历表头
+            header_cells = []
+            for day_name in week_headers:
+                header_cells.append({
+                    'component': 'div',
+                    'props': {'class': 'text-caption font-weight-bold text-center', 'style': 'width: 14.28%; color: rgba(var(--v-theme-on-surface), 0.6);'},
+                    'text': day_name
+                })
+            calendar_rows.append({'component': 'div', 'props': {'class': 'd-flex justify-space-between mb-1'}, 'content': header_cells})
+
+            # 日历主体
+            for week in cal:
+                week_cells = []
+                for day in week:
+                    if day == 0:
+                        week_cells.append({'component': 'div', 'props': {'style': 'width: 14.28%; height: 32px;'}})
+                    else:
+                        is_today = (day == today_day)
+                        day_data = signed_days.get(day)
+                        
+                        # 样式逻辑
+                        bg_style = ''
+                        border = ''
+                        text_color = ''
+                        
+                        if day_data:
+                            status = day_data.get('status')
+                            if status == "success": # 签到成功 - 绿色
+                                bg_style = 'background-color: rgba(76, 175, 80, 0.15);' 
+                                text_color = 'color: #2E7D32;'
+                            elif status == "checked": # 已签到 - 蓝色
+                                bg_style = 'background-color: rgba(33, 150, 243, 0.15);'
+                                text_color = 'color: #1565C0;'
+                            elif status == "failure": # 失败 - 红色
+                                bg_style = 'background-color: rgba(244, 67, 54, 0.15);'
+                                text_color = 'color: #C62828;'
+                        
+                        if is_today and not day_data:
+                             # 今天但未签到，显示边框
+                            border = 'border: 1px solid #FFC107;'
+                        
+                        cell_inner_content = [
+                            {'component': 'div', 'props': {'class': 'text-caption', 'style': 'line-height: 1; font-size: 0.65rem; opacity: 0.7;'}, 'text': str(day)}
+                        ]
+                        
+                        if day_data and day_data.get('reward'):
+                            reward_val = day_data.get('reward')
+                            reward_str = f"+{int(float(reward_val)) if float(reward_val).is_integer() else reward_val}"
+                            cell_inner_content.append({
+                                'component': 'div',
+                                'props': {'class': 'font-weight-black', 'style': 'font-size: 10px; line-height: 1; margin-top: -2px; color: #2E7D32; white-space: nowrap; transform: scale(0.9); transform-origin: center top;'},
+                                'text': reward_str
+                            })
+
+                        week_cells.append({
+                            'component': 'div',
+                            'props': {
+                                'class': 'd-flex justify-center align-center',
+                                'style': f'width: 14.28%; height: 32px;'
+                            },
+                            'content': [
+                                {
+                                    'component': 'div',
+                                    'props': {
+                                        'class': 'd-flex flex-column justify-center align-center text-caption',
+                                        'style': f'width: 28px; height: 28px; border-radius: 6px; {bg_style} {border} {text_color}'
+                                    },
+                                    'content': cell_inner_content
+                                }
+                            ]
+                        })
+                calendar_rows.append({'component': 'div', 'props': {'class': 'd-flex justify-space-between mb-1'}, 'content': week_cells})
+            
+            # 日历说明（图例）
+            calendar_rows.append({
+                'component': 'div', 
+                'props': {'class': 'd-flex justify-center mt-2 flex-wrap gap-2', 'style': 'font-size: 0.7rem; gap: 8px;'}, 
+                'content': [
+                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
+                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #4CAF50; margin-right: 4px;'}},
+                        {'component': 'span', 'text': '成功'}
+                    ]},
+                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
+                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #2196F3; margin-right: 4px;'}},
+                        {'component': 'span', 'text': '已签'}
+                    ]},
+                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
+                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #F44336; margin-right: 4px;'}},
+                        {'component': 'span', 'text': '未签'}
+                    ]},
+                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
+                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #E0E0E0; margin-right: 4px;'}},
+                        {'component': 'span', 'text': '无数据'}
+                    ]}
+                ]
+            })
+            # --- 日历组件构建结束 ---
 
             user_info_card = {
                 'component': 'VCard',
@@ -1369,24 +1582,26 @@ class FengchaoSignin(_PluginBase):
                     {'component': 'VDivider'},
                     {'component': 'VCardText', 'content': [
                         {'component': 'VRow', 'props': {'class': 'ma-1'}, 'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 5}, 'content': [
-                                {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
+                            # 左侧：个人信息 (md=4) - 左右排布 + 头像放大
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+                                {'component': 'div', 'props': {'class': 'd-flex flex-row align-center'}, 'content': [
+                                    # 头像容器 (放大)
                                     {'component': 'div',
-                                     'props': {'class': 'mr-3',
-                                               'style': 'position: relative; width: 90px; height: 90px;'},
+                                     'props': {'class': 'mr-4 flex-shrink-0',
+                                               'style': 'position: relative; width: 140px; height: 140px;'},
                                      'content': [
-                                         {'component': 'VAvatar', 'props': {'size': 60, 'rounded': 'circle',
-                                                                            'style': 'position: absolute; top: 15px; left: 15px; z-index: 1;'},
+                                         {'component': 'VAvatar', 'props': {'size': 100, 'rounded': 'circle',
+                                                                            'style': 'position: absolute; top: 20px; left: 20px; z-index: 1;'},
                                           'content': [
                                               {'component': 'VImg', 'props': {'src': avatar_url, 'alt': username}}]},
                                          {'component': 'div', 'props': {
-                                             'style': f"position: absolute; top: 0; left: 0; width: 90px; height: 90px; background-image: url('{user_attrs.get('decorationAvatarFrame', '')}'); background-size: contain; background-repeat: no-repeat; background-position: center; z-index: 2;"}} if user_attrs.get(
+                                             'style': f"position: absolute; top: 0; left: 0; width: 140px; height: 140px; background-image: url('{user_attrs.get('decorationAvatarFrame', '')}'); background-size: contain; background-repeat: no-repeat; background-position: center; z-index: 2;"}} if user_attrs.get(
                                              'decorationAvatarFrame') else {}
                                      ]},
-                                    {'component': 'div', 'content': [
-                                        {'component': 'div', 'props': {'class': 'd-flex align-center'},
-                                         'content': username_display_content},
-                                        {'component': 'div', 'props': {'class': 'd-flex flex-wrap mt-1'},
+                                     # 用户名和用户组 (右侧)
+                                     {'component': 'div', 'props': {'class': 'd-flex flex-column align-start'}, 'content': [
+                                         {'component': 'div', 'props': {'class': 'mb-1'}, 'content': username_display_content},
+                                         {'component': 'div', 'props': {'class': 'd-flex flex-wrap'},
                                          'content': [
                                              {'component': 'VChip', 'props': {
                                                  'style': f"background-color: {group.get('color', '#6B7CA8')}; color: white;",
@@ -1398,145 +1613,172 @@ class FengchaoSignin(_PluginBase):
                                                   {'component': 'span', 'text': group.get('name')}
                                               ]} for group in groups
                                          ]}
-                                    ]}
+                                     ]}
                                 ]},
-                                {'component': 'VRow', 'props': {'class': 'mt-2'}, 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                        {'component': 'div',
-                                         'props': {'class': 'pa-1 elevation-2 mb-1',
-                                                   'style': f'{frost_style} width: fit-content;'},
-                                         'content': [
-                                             {'component': 'div', 'props': {'class': 'd-flex align-center text-caption'},
-                                              'content': [
-                                                  {'component': 'VIcon',
-                                                   'props': {'style': 'color: #4CAF50;', 'size': 'x-small',
-                                                             'class': 'mr-1'}, 'text': 'mdi-calendar'},
-                                                  {'component': 'span', 'text': f'注册于 {join_time}'}
-                                              ]}]},
-                                        {'component': 'div',
-                                         'props': {'class': 'pa-1 elevation-2 mb-1',
-                                                   'style': f'{frost_style} width: fit-content;'},
-                                         'content': [
-                                             {'component': 'div', 'props': {'class': 'd-flex align-center text-caption'},
-                                              'content': [
-                                                  {'component': 'VIcon',
-                                                   'props': {'style': 'color: #2196F3;', 'size': 'x-small',
-                                                             'class': 'mr-1'}, 'text': 'mdi-clock-outline'},
-                                                  {'component': 'span', 'text': f'最后访问 {last_seen_at}'}
-                                              ]}]},
-                                        {'component': 'div',
-                                         'props': {'class': 'pa-1 elevation-2',
-                                                   'style': f'{frost_style} width: fit-content;'},
-                                         'content': [
-                                             {'component': 'div', 'props': {'class': 'd-flex align-center text-caption'},
-                                              'content': [
-                                                  {'component': 'VIcon',
-                                                   'props': {'style': 'color: #E64A19;', 'size': 'x-small',
-                                                             'class': 'mr-1'}, 'text': 'mdi-medal-outline'},
-                                                  {'component': 'span', 'text': f'拥有 {badge_count} 枚徽章'}
-                                              ]}]}
-                                    ]}
+                                # 注册时间等信息 (下方左对齐，动态宽度)
+                                {'component': 'div', 'props': {'class': 'mt-3 w-100'}, 'content': [
+                                    # 新增用户ID
+                                    {'component': 'div',
+                                     'props': {'class': 'pa-1 elevation-2 mb-1',
+                                               'style': f'{frost_style} width: fit-content;'},
+                                     'content': [
+                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
+                                          'content': [
+                                              {'component': 'VIcon',
+                                               'props': {'style': 'color: #607D8B;', 'size': 'x-small', # Blue Grey
+                                                         'class': 'mr-2'}, 'text': 'mdi-identifier'},
+                                              {'component': 'span', 'text': f'UID: {user_id}'}
+                                          ]}]},
+                                    {'component': 'div',
+                                     'props': {'class': 'pa-1 elevation-2 mb-1',
+                                               'style': f'{frost_style} width: fit-content;'},
+                                     'content': [
+                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
+                                          'content': [
+                                              {'component': 'VIcon',
+                                               'props': {'style': 'color: #4CAF50;', 'size': 'x-small',
+                                                         'class': 'mr-2'}, 'text': 'mdi-calendar'},
+                                              {'component': 'span', 'text': f'注册时间: {join_time}'}
+                                          ]}]},
+                                    {'component': 'div',
+                                     'props': {'class': 'pa-1 elevation-2 mb-1',
+                                               'style': f'{frost_style} width: fit-content;'},
+                                     'content': [
+                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
+                                          'content': [
+                                              {'component': 'VIcon',
+                                               'props': {'style': 'color: #2196F3;', 'size': 'x-small',
+                                                         'class': 'mr-2'}, 'text': 'mdi-clock-outline'},
+                                              {'component': 'span', 'text': f'最后访问: {last_seen_at}'}
+                                          ]}]},
+                                    {'component': 'div',
+                                     'props': {'class': 'pa-1 elevation-2',
+                                               'style': f'{frost_style} width: fit-content;'},
+                                     'content': [
+                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
+                                          'content': [
+                                              {'component': 'VIcon',
+                                               'props': {'style': 'color: #E64A19;', 'size': 'x-small',
+                                                         'class': 'mr-2'}, 'text': 'mdi-medal-outline'},
+                                              {'component': 'span', 'text': f'徽章数量: {badge_count}'}
+                                          ]}]}
                                 ]}
                             ]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 7}, 'content': [
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
+                            # 中间：统计数据 (md=5)
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 5}, 'content': [
+                                {'component': 'VRow', 'props': {'dense': True}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
+                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
                                                  {'component': 'VIcon',
-                                                  'props': {'style': 'color: #FFC107;', 'class': 'mr-1'},
+                                                  'props': {'style': 'color: #FFC107;', 'class': 'mr-2'},
                                                   'text': 'mdi-flower'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6'},
+                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
                                                   'text': str(money)}
                                              ]},
                                              {'component': 'div', 'props': {'class': 'text-caption mt-1'},
                                               'text': '花粉'}
                                          ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
+                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
                                                  {'component': 'VIcon',
-                                                  'props': {'style': 'color: #3F51B5;', 'class': 'mr-1'},
+                                                  'props': {'style': 'color: #3F51B5;', 'class': 'mr-2'},
                                                   'text': 'mdi-forum'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6'},
+                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
                                                   'text': str(discussion_count)}
                                              ]},
                                              {'component': 'div', 'props': {'class': 'text-caption mt-1'},
                                               'text': '主题'}
                                          ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
+                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
                                                  {'component': 'VIcon',
-                                                  'props': {'style': 'color: #00BCD4;', 'class': 'mr-1'},
+                                                  'props': {'style': 'color: #00BCD4;', 'class': 'mr-2'},
                                                   'text': 'mdi-comment-text-multiple'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6'},
+                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
                                                   'text': str(comment_count)}
                                              ]},
                                              {'component': 'div', 'props': {'class': 'text-caption mt-1'},
                                               'text': '评论'}
                                          ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
+                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
                                                  {'component': 'VIcon',
-                                                  'props': {'style': 'color: #673AB7;', 'class': 'mr-1'},
-                                                  'text': 'mdi-account-group'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6'},
-                                                  'text': str(follower_count)}
+                                                  'props': {'style': 'color: #673AB7;', 'class': 'mr-2'},
+                                                  'text': 'mdi-bank'},
+                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
+                                                  'text': str(hive_bank_balance)}
                                              ]},
                                              {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '粉丝'}
+                                              'text': '银行'}
                                          ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
+                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
                                                  {'component': 'VIcon',
-                                                  'props': {'style': 'color: #03A9F4;', 'class': 'mr-1'},
-                                                  'text': 'mdi-account-multiple-plus'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6'},
-                                                  'text': str(following_count)}
+                                                  'props': {'style': 'color: #03A9F4;', 'class': 'mr-2'},
+                                                  'text': 'mdi-hand-heart'},
+                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
+                                                  'text': str(best_answer_count)}
                                              ]},
                                              {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '关注'}
+                                              'text': '助人'}
                                          ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6, 'sm': 4}, 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
                                         {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2', 'style': f'{frost_style} padding: 4px;'},
+                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
                                          'content': [
                                              {'component': 'div',
                                               'props': {'class': 'd-flex justify-center align-center'}, 'content': [
                                                  {'component': 'VIcon',
-                                                  'props': {'style': 'color: #009688;', 'class': 'mr-1'},
+                                                  'props': {'style': 'color: #009688;', 'class': 'mr-2'},
                                                   'text': 'mdi-calendar-check'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6'},
+                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
                                                   'text': str(total_continuous_checkin)}
                                              ]},
                                              {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '连续签到'}
+                                              'text': '连签'}
                                          ]}]}
                                 ]}
+                            ]},
+                            # 右侧：签到日历 (md=3) - 收窄
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
+                                {'component': 'div', 
+                                 'props': {'class': 'pa-2 elevation-2', 'style': f'{frost_style} height: 100%;'},
+                                 'content': [
+                                     # 日历标题：使用 relative + absolute icon 实现完美居中
+                                     {'component': 'div', 'props': {'class': 'd-flex align-center justify-center mb-2 w-100', 'style': 'position: relative;'}, 'content': [
+                                         {'component': 'VIcon', 'props': {'icon': 'mdi-calendar-month', 'size': 'small', 'color': 'primary', 'style': 'position: absolute; left: 0;'}},
+                                         {'component': 'span', 'props': {'class': 'font-weight-bold'}, 'text': f"{year}年{month}月"}
+                                     ]},
+                                     {'component': 'VDivider', 'props': {'class': 'mb-2'}},
+                                     *calendar_rows
+                                 ]}
                             ]}
                         ]},
                         *badge_category_components,
                         {'component': 'div', 'props': {
-                            'class': 'mt-2 text-caption text-right pa-1 elevation-2 d-inline-block float-right',
-                            'style': f'{frost_style} border-radius: 8px 8px 0 0; margin-right: 16px;'}, 'text': footer_line}
+                            'class': 'mt-2 text-caption px-2 py-0.5 elevation-1 d-inline-block float-right d-flex flex-wrap justify-end',
+                            'style': f'{frost_style} border-radius: 8px 8px 0 0; margin-right: 16px;'}, 
+                            'content': footer_items}
                     ]}
                 ]
             }
@@ -1624,8 +1866,9 @@ class FengchaoSignin(_PluginBase):
                             {'component': 'VIcon', 'props': {'style': 'color: #FF8F00;', 'class': 'mr-1'},
                              'text': 'mdi-gift'},
                             {'component': 'span',
+                             # 修改处：增加 "已签到" 的判断条件
                              'text': f"{self._format_pollen(record.get('lastCheckinMoney', 0))}花粉" if (
-                                         "签到成功" in status_text) and record.get('lastCheckinMoney', 0) > 0 else '—'}
+                                         ("签到成功" in status_text or "已签到" in status_text) and record.get('lastCheckinMoney', 0) > 0) else '—'}
                         ]}]}
                 ]
             })
