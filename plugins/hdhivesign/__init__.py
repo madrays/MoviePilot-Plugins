@@ -1620,7 +1620,65 @@ class HdhiveSign(_PluginBase):
         else:
             logger.warning("自动登录: 未找到 next-action token，跳过 Server Action")
 
-        # ── 策略 3：Playwright 浏览器自动化兜底 ───────────────────────
+        # ── 策略 3：从 JS bundle 挖掘真实登录 API 并直接调用 ──────────
+        try:
+            logger.info("自动登录: 尝试从 JS bundle 提取登录 API")
+            js_srcs = _re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', warm_text)
+            found_apis = []
+            api_patterns = [
+                r"fetch\([\"'](/api/[^\"']+)[\"']",
+                r"post\([\"'](/api/[^\"']+)[\"']",
+                r"\"(/api/[^\"]+(?:login|auth|signin)[^\"]*)\"",
+            ]
+            for src in js_srcs:
+                try:
+                    r_js = scraper.get(f"{self._base_url}{src}", timeout=15, proxies=proxies,
+                                       headers={'User-Agent': ua})
+                    js_text = r_js.text or ''
+                    for pat in api_patterns:
+                        for m in _re.finditer(pat, js_text):
+                            api = m.group(1)
+                            if api not in found_apis and any(k in api for k in ['login','auth','signin']):
+                                found_apis.append(api)
+                except Exception:
+                    continue
+            logger.info(f"自动登录: JS bundle 发现的 API 路径={found_apis}")
+            login_payloads = [
+                {'username': username, 'password': password},
+                {'email': username, 'password': password},
+            ]
+            for api_path in found_apis:
+                url = f"{self._base_url}{api_path}"
+                for payload in login_payloads:
+                    try:
+                        r = scraper.post(url, json=payload, timeout=20, proxies=proxies,
+                                         headers={
+                                             'User-Agent': ua,
+                                             'Content-Type': 'application/json',
+                                             'Referer': login_url,
+                                             'Origin': self._base_url,
+                                         })
+                        logger.info(f"自动登录: POST {api_path} 状态={r.status_code} 响应={r.text[:200]}")
+                        cd = _extract_cookies(r)
+                        if cd.get('token'):
+                            logger.info(f"自动登录: JS bundle API 登录成功 ({api_path})")
+                            return _build_cookie_str(cd)
+                        try:
+                            rj = r.json()
+                            t = (rj.get('token') or rj.get('access_token') or
+                                 (rj.get('data') or {}).get('token') or
+                                 (rj.get('meta') or {}).get('access_token'))
+                            if t:
+                                logger.info(f"自动登录: 从响应体提取 token ({api_path})")
+                                return f"token={t}"
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        logger.debug(f"自动登录: {api_path} 失败 {e}")
+        except Exception as e:
+            logger.warning(f"自动登录: JS bundle 策略异常 {e}")
+
+        # ── 策略 4：Playwright 浏览器自动化兜底 ───────────────────────
         try:
             from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
             logger.info("自动登录: 尝试 Playwright 浏览器自动化")
