@@ -1511,7 +1511,6 @@ class HdhiveSign(_PluginBase):
             resp_warm = scraper.get(login_url, timeout=30, proxies=proxies)
             warm_text = getattr(resp_warm, 'text', '') or ''
             logger.info(f"自动登录: 预热状态码 {getattr(resp_warm, 'status_code', '?')}")
-            logger.info(f"自动登录: 预热响应前300字符={warm_text[:300]}")
         except Exception as e:
             logger.warning(f"自动登录: 预热失败 {e}")
 
@@ -1618,7 +1617,7 @@ class HdhiveSign(_PluginBase):
                 ]:
                     try:
                         r_sa = scraper.post(login_url, headers=sa_hdrs, data=body, timeout=30, proxies=proxies)
-                        logger.info(f"自动登录: SA({sa_id[:12]}) 状态={r_sa.status_code} 响应={r_sa.text[:200]}")
+                        logger.info(f"自动登录: SA({sa_id[:12]}) 状态={r_sa.status_code}")
                         cd = _extract_cookies(r_sa)
                         logger.info(f"自动登录: SA Cookie keys={list(cd.keys())}")
                         if cd.get("token"):
@@ -1679,10 +1678,6 @@ class HdhiveSign(_PluginBase):
                                 found_apis.append(api)
                 except Exception:
                     continue
-            # 打印完整 HTML 的 script 标签，诊断 JS 路径格式
-            all_scripts = _re.findall(r'<script[^>]*src=["\']([^"\']+)["\'][^>]*>', warm_text)
-            logger.info(f"自动登录: 页面所有script src={all_scripts[:10]}")
-            logger.info(f"自动登录: warm_text长度={len(warm_text)}")
             # 扫描 JS bundle，打印所有 /api/ 路径（不过滤关键词）
             all_apis = []
             broad_pat = r'["\'](\/api\/[^\"\'\s]{3,60})["\']'  
@@ -1696,27 +1691,6 @@ class HdhiveSign(_PluginBase):
                             all_apis.append(p)
                 except Exception:
                     continue
-            logger.info(f"自动登录: JS bundle 所有 /api/ 路径={all_apis}")
-            # 在登录 JS 里找 Server Action ID
-            login_src = next((s for s in all_scripts if "ed18" in s), None)
-            if not login_src:
-                login_src = all_scripts[0] if all_scripts else None
-            if login_src:
-                try:
-                    r_ljs = scraper.get(f"{self._base_url}{login_src}", timeout=15,
-                                        proxies=proxies, headers={"User-Agent": ua})
-                    js_full = r_ljs.text or ""
-                    hex_ids = list(set(_re.findall(r'["\']([a-fA-F0-9]{40,64})["\']\s*[,)}\'"]', js_full)))
-                    logger.info(f"自动登录: ed18 JS 长十六进制串={hex_ids[:10]}")
-                    for pat in [
-                        r'createServerReference\s*\(\s*["\']([0-9a-fA-F]{10,})',
-                        r'\$\$id\s*[:=]\s*["\']([0-9a-fA-F]{10,})',
-                        r'action\s*[:=]\s*["\']([0-9a-fA-F]{40,})',
-                    ]:
-                        for m in _re.finditer(pat, js_full):
-                            logger.info(f"自动登录: ServerAction ID候选={m.group(1)[:24]}")
-                except Exception as e:
-                    logger.warning(f"自动登录: 分析登录JS失败 {e}")
             logger.info(f"自动登录: JS bundle 发现的 API 路径={found_apis}")
             login_payloads = [
                 {'username': username, 'password': password},
