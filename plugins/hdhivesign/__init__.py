@@ -1650,28 +1650,49 @@ class HdhiveSign(_PluginBase):
                 )
                 context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});window.chrome = {runtime: {}};")
 
-                # 注入 scraper 已通过 Cloudflare 验证的 Cookie
+                # 注入 curl_cffi/scraper 已通过 Cloudflare 验证的 Cookie
                 try:
                     cf_cookies = {}
-                    if hasattr(scraper, 'cookies'):
+                    c = getattr(scraper, 'cookies', None)
+                    if c is not None:
+                        # curl_cffi Session: cookies 是 Cookies 对象，迭代取 (name, value)
                         try:
-                            cf_cookies = scraper.cookies.get_dict()
+                            for cookie in c:
+                                cf_cookies[cookie.name] = cookie.value
                         except Exception:
+                            pass
+                        if not cf_cookies:
                             try:
-                                cf_cookies = dict(scraper.cookies)
+                                cf_cookies = dict(c)
                             except Exception:
                                 pass
+                        if not cf_cookies:
+                            try:
+                                cf_cookies = c.get_dict()
+                            except Exception:
+                                pass
+                    # 也从 resp_warm 的响应 Cookie 里补充
+                    if resp_warm is not None:
+                        try:
+                            for cookie in getattr(resp_warm, 'cookies', []):
+                                try:
+                                    cf_cookies[cookie.name] = cookie.value
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    logger.info(f"自动登录: scraper Cookie keys={list(cf_cookies.keys())}")
                     if cf_cookies:
                         pw_cookies = [
                             {"name": k, "value": v, "domain": domain, "path": "/"}
                             for k, v in cf_cookies.items()
                         ]
                         context.add_cookies(pw_cookies)
-                        logger.info(f"自动登录: 已注入 scraper Cookie，keys={list(cf_cookies.keys())}")
+                        logger.info(f"自动登录: 已注入 Cookie 到 Playwright，共 {len(pw_cookies)} 个")
                     else:
-                        logger.info("自动登录: scraper 无 Cookie 可注入")
+                        logger.warning("自动登录: scraper 无 Cookie 可注入，Playwright 可能被 Cloudflare 拦截")
                 except Exception as e:
-                    logger.debug(f"自动登录: Cookie 注入失败 {e}")
+                    logger.warning(f"自动登录: Cookie 注入失败 {e}")
 
                 page = context.new_page()
 
