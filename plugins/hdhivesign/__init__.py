@@ -1619,8 +1619,20 @@ class HdhiveSign(_PluginBase):
                 page.on("response", on_response)
 
                 page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+                logger.info(f"自动登录: Playwright 页面加载完成，当前URL={page.url}")
+
+                # 列出页面所有 input，帮助诊断选择器
+                try:
+                    all_inputs = page.eval_on_selector_all(
+                        'input',
+                        'els => els.map(e => ({type: e.type, name: e.name, placeholder: e.placeholder, id: e.id}))'
+                    )
+                    logger.info(f"自动登录: 页面 input 列表={all_inputs}")
+                except Exception as e:
+                    logger.debug(f"自动登录: 无法列出 input {e}")
 
                 # 填写用户名
+                user_filled = False
                 for sel in ["input[name='username']", "input[name='email']",
                             "input[type='email']", "input[placeholder*='邮箱']",
                             "input[placeholder*='用户名']", "input[placeholder*='email']"]:
@@ -1628,47 +1640,81 @@ class HdhiveSign(_PluginBase):
                         el = page.query_selector(sel)
                         if el and el.is_visible():
                             el.fill(username)
+                            user_filled = True
+                            logger.info(f"自动登录: 用户名已填入，选择器={sel}")
                             break
                     except Exception:
                         continue
+                if not user_filled:
+                    logger.warning("自动登录: 未找到用户名输入框，尝试填入第一个 input")
+                    try:
+                        page.eval_on_selector('input:first-of-type', f'el => el.value = "{username}"')
+                    except Exception:
+                        pass
 
                 # 填写密码
+                pwd_filled = False
                 for sel in ["input[name='password']", "input[type='password']",
                             "input[placeholder*='密码']"]:
                     try:
                         el = page.query_selector(sel)
                         if el and el.is_visible():
                             el.fill(password)
+                            pwd_filled = True
+                            logger.info(f"自动登录: 密码已填入，选择器={sel}")
                             break
                     except Exception:
                         continue
+                if not pwd_filled:
+                    logger.warning("自动登录: 未找到密码输入框")
 
                 # 点击登录
+                btn_clicked = False
                 try:
                     btn = (page.query_selector("button[type='submit']")
                            or page.query_selector("button:has-text('登录')")
-                           or page.query_selector("button:has-text('Login')"))
+                           or page.query_selector("button:has-text('Login')")
+                           or page.query_selector("button:has-text('Sign in')")
+                           or page.query_selector("button:has-text('登 录')"))
                     if btn:
+                        btn_text = btn.inner_text() if btn else ''
+                        logger.info(f"自动登录: 点击登录按钮，文本='{btn_text}'")
                         btn.click()
+                        btn_clicked = True
                     else:
+                        # 列出所有 button 帮助诊断
+                        try:
+                            all_btns = page.eval_on_selector_all('button', 'els => els.map(e => e.innerText)')
+                            logger.warning(f"自动登录: 未找到登录按钮，页面所有按钮={all_btns}")
+                        except Exception:
+                            pass
                         page.keyboard.press("Enter")
-                except Exception:
+                        btn_clicked = True
+                        logger.info("自动登录: 通过 Enter 键提交")
+                except Exception as e:
+                    logger.warning(f"自动登录: 点击按钮异常 {e}，改用 Enter")
                     page.keyboard.press("Enter")
 
                 # 等待跳转或网络静止
                 try:
                     page.wait_for_url(lambda url: '/login' not in url, timeout=10000)
+                    logger.info(f"自动登录: 登录后跳转到 {page.url}")
                 except PWTimeout:
-                    pass
+                    logger.warning(f"自动登录: 等待跳转超时，当前仍在 {page.url}，可能登录失败或账号密码错误")
                 except Exception:
                     try:
                         page.wait_for_load_state("networkidle", timeout=8000)
+                        logger.info(f"自动登录: 网络静止，当前URL={page.url}")
                     except Exception:
                         pass
 
+                # 打印所有 Cookie 帮助诊断
+                all_cookies = context.cookies()
+                logger.info(f"自动登录: 当前所有Cookie名={[c.get('name') for c in all_cookies]}")
+
                 # 优先用响应拦截到的 token
                 if not captured_token.get('token'):
-                    for c in context.cookies():
+                    for c in all_cookies:
                         if c.get('name') == 'token':
                             captured_token['token'] = c.get('value')
                         elif c.get('name') == 'csrf_access_token':
