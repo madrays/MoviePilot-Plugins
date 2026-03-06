@@ -1454,21 +1454,42 @@ class HdhiveSign(_PluginBase):
         domain = self._base_url.replace('https://', '').replace('http://', '').split('/')[0]
 
         def _extract_cookies(resp):
-            """从响应中提取 token 和 csrf_access_token"""
+            """从响应中提取 token 和 csrf_access_token，兼容 curl_cffi / requests / cloudscraper"""
+            cd = {}
             try:
-                cd = getattr(resp, 'cookies', None)
-                cd = cd.get_dict() if cd else {}
+                c = getattr(resp, 'cookies', None)
+                if c is not None:
+                    try:
+                        cd = c.get_dict()
+                    except Exception:
+                        try:
+                            cd = dict(c)
+                        except Exception:
+                            try:
+                                cd = {i.name: i.value for i in c}
+                            except Exception:
+                                pass
             except Exception:
-                cd = {}
-            # 也从 Set-Cookie header 里兜底提取
+                pass
+            # 从 Set-Cookie header 兜底提取（curl_cffi 有时只在 header 里）
             if not cd.get('token'):
-                sc = getattr(resp.headers, 'get', lambda k, d=None: d)('set-cookie', '') or ''
-                m = _re.search(r'token=([^;,\s]+)', sc)
-                if m:
-                    cd['token'] = m.group(1)
-                m2 = _re.search(r'csrf_access_token=([^;,\s]+)', sc)
-                if m2:
-                    cd['csrf_access_token'] = m2.group(1)
+                sc = ''
+                try:
+                    sc = resp.headers.get('set-cookie', '') or ''
+                except Exception:
+                    pass
+                if not sc:
+                    try:
+                        sc = ' '.join(resp.headers.get_list('set-cookie') or [])
+                    except Exception:
+                        pass
+                if sc:
+                    m = _re.search(r'(?<!\w)token=([^;,\s]+)', sc)
+                    if m:
+                        cd['token'] = m.group(1)
+                    m2 = _re.search(r'csrf_access_token=([^;,\s]+)', sc)
+                    if m2:
+                        cd['csrf_access_token'] = m2.group(1)
             return cd
 
         def _build_cookie_str(cd):
@@ -1495,6 +1516,7 @@ class HdhiveSign(_PluginBase):
             logger.info(f"自动登录: 尝试 NextAuth GET {csrf_url}")
             r_csrf = scraper.get(csrf_url, timeout=15, proxies=proxies,
                                  headers={'User-Agent': ua, 'Referer': login_url})
+            logger.info(f"自动登录: NextAuth csrf 状态码 {r_csrf.status_code}")
             if r_csrf.status_code == 200:
                 csrf_token = (r_csrf.json() or {}).get('csrfToken', '')
                 logger.info(f"自动登录: NextAuth csrfToken={'已获取' if csrf_token else '未获取'}")
@@ -1514,8 +1536,9 @@ class HdhiveSign(_PluginBase):
                                               'Referer': login_url,
                                               'Origin': self._base_url,
                                           })
-                    logger.info(f"自动登录: NextAuth 登录状态码 {r_sign.status_code}")
+                    logger.info(f"自动登录: NextAuth 登录状态码 {r_sign.status_code} 响应={r_sign.text[:300]}")
                     cd = _extract_cookies(r_sign)
+                    logger.info(f"自动登录: NextAuth 响应Cookie keys={list(cd.keys())}")
                     if cd.get('token'):
                         logger.info("自动登录: NextAuth 登录成功")
                         return _build_cookie_str(cd)
