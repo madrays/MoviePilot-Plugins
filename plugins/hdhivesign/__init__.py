@@ -1646,6 +1646,20 @@ class HdhiveSign(_PluginBase):
             all_scripts = _re.findall(r'<script[^>]*src=["\']([^"\']+)["\'][^>]*>', warm_text)
             logger.info(f"自动登录: 页面所有script src={all_scripts[:10]}")
             logger.info(f"自动登录: warm_text长度={len(warm_text)}")
+            # 扫描 JS bundle，打印所有 /api/ 路径（不过滤关键词）
+            all_apis = []
+            broad_pat = r'["\'](\/api\/[^\"\'\s]{3,60})["\']'  
+            for src in all_scripts[:15]:
+                try:
+                    r_js = scraper.get(f"{self._base_url}{src}", timeout=15, proxies=proxies,
+                                       headers={"User-Agent": ua})
+                    for m in _re.finditer(broad_pat, r_js.text or ""):
+                        p = m.group(1)
+                        if p not in all_apis:
+                            all_apis.append(p)
+                except Exception:
+                    continue
+            logger.info(f"自动登录: JS bundle 所有 /api/ 路径={all_apis}")
             logger.info(f"自动登录: JS bundle 发现的 API 路径={found_apis}")
             login_payloads = [
                 {'username': username, 'password': password},
