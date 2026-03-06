@@ -1665,6 +1665,25 @@ class HdhiveSign(_PluginBase):
                 except Exception:
                     continue
             logger.info(f"自动登录: JS bundle 所有 /api/ 路径={all_apis}")
+            # 专门深挖登录表单所在的 JS 文件
+            login_js_candidates = [s for s in all_scripts if any(k in s for k in ["ed18","login","auth","form"])]
+            if not login_js_candidates:
+                login_js_candidates = all_scripts
+            for src in login_js_candidates:
+                try:
+                    r_js3 = scraper.get(f"{self._base_url}{src}", timeout=15,
+                                        proxies=proxies, headers={"User-Agent": ua})
+                    js3 = r_js3.text or ""
+                    # 找所有字符串（引号包裹的路径）周围含 fetch/post/axios 的片段
+                    for m in _re.finditer(r'(?:fetch|axios|post|request)\s*\(["\']([^"\']{4,80})["\']\s*[,)]', js3):
+                        logger.info(f"自动登录: JS({src[-20:]}) fetch/post 调用={m.group(0)[:120]}")
+                    # 找 handleSubmit / onSubmit / mutate 周围的代码
+                    for kw in ["handleSubmit","onSubmit","mutate","mutation","useMutation"]:
+                        idx = js3.find(kw)
+                        if idx != -1:
+                            logger.info(f"自动登录: JS({src[-20:]}) [{kw}]={js3[max(0,idx-60):idx+200]}")
+                except Exception:
+                    continue
             # 在所有 JS bundle 里搜索 checkin/password/login 关键词上下文
             keywords = ["checkin", "password", "signin", "signIn", "用户名", "密码"]
             for src in all_scripts:
