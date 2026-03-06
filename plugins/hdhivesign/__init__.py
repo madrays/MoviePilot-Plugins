@@ -1665,14 +1665,20 @@ class HdhiveSign(_PluginBase):
                 except Exception:
                     continue
             logger.info(f"自动登录: JS bundle 所有 /api/ 路径={all_apis}")
-            # 打印第一个 JS 文件的前200字符，确认是否成功下载
-            if all_scripts:
+            # 在所有 JS bundle 里搜索 checkin/password/login 关键词上下文
+            keywords = ["checkin", "password", "signin", "signIn", "用户名", "密码"]
+            for src in all_scripts:
                 try:
-                    r_test = scraper.get(f"{self._base_url}{all_scripts[0]}", timeout=15,
-                                         proxies=proxies, headers={"User-Agent": ua})
-                    logger.info(f"自动登录: JS[0]状态={r_test.status_code} 长度={len(r_test.text)} 前200={r_test.text[:200]}")
-                except Exception as e:
-                    logger.warning(f"自动登录: JS[0]下载失败 {e}")
+                    r_js2 = scraper.get(f"{self._base_url}{src}", timeout=15,
+                                        proxies=proxies, headers={"User-Agent": ua})
+                    js2 = r_js2.text or ""
+                    for kw in keywords:
+                        idx = js2.find(kw)
+                        if idx != -1:
+                            snippet = js2[max(0,idx-120):idx+120]
+                            logger.info(f"自动登录: JS({src[-20:]}) 关键词[{kw}] 上下文={snippet}")
+                except Exception:
+                    continue
             # 把已知候选路径也加进去，用 curl_cffi 重试（之前失败是因为 cloudscraper 被拦）
             for p in self._login_api_candidates:
                 if p not in found_apis:
