@@ -1595,6 +1595,38 @@ class HdhiveSign(_PluginBase):
             except Exception as e:
                 logger.debug(f"自动登录: JS bundle 搜索失败 {e}")
 
+        # 用从 JS bundle 提取到的 Server Action ID 直接尝试登录
+        hardcoded_sa_ids = [
+            "60a3fc399468c700be8a3ecc69cd86c911899c9c85",
+            "40b483478930efba01f4734184d67a8c34a915dd29",
+        ]
+        for sa_id in hardcoded_sa_ids:
+            if not next_action_token:
+                sa_hdrs = {
+                    "User-Agent": ua,
+                    "Accept": "text/x-component",
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Next-Action": sa_id,
+                    "Next-Router-State-Tree": '%5B%22%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22login%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Flogin%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%2Ctrue%5D',
+                    "Origin": self._base_url,
+                    "Referer": login_url,
+                }
+                for body in [
+                    json.dumps([{"username": username, "password": password}]),
+                    json.dumps([username, password]),
+                    json.dumps({"username": username, "password": password}),
+                ]:
+                    try:
+                        r_sa = scraper.post(login_url, headers=sa_hdrs, data=body, timeout=30, proxies=proxies)
+                        logger.info(f"自动登录: SA({sa_id[:12]}) 状态={r_sa.status_code} 响应={r_sa.text[:200]}")
+                        cd = _extract_cookies(r_sa)
+                        logger.info(f"自动登录: SA Cookie keys={list(cd.keys())}")
+                        if cd.get("token"):
+                            logger.info("自动登录: Server Action 硬编码ID 登录成功")
+                            return _build_cookie_str(cd)
+                    except Exception as e:
+                        logger.debug(f"自动登录: SA({sa_id[:12]}) 失败 {e}")
+
         if next_action_token:
             sa_headers = {
                 'User-Agent': ua,
