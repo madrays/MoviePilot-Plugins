@@ -38,17 +38,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class HdhiveSign(_PluginBase):
     # 插件名称
-    plugin_name = "影巢签到"
+    plugin_name = "影巢签到-改"
     # 插件描述
     plugin_desc = "自动完成影巢(HDHive)每日签到，支持失败重试和历史记录"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     # 插件作者
-    plugin_author = "madrays"
+    plugin_author = "madrays,sakezerto"
     # 作者主页
-    author_url = "https://github.com/madrays"
+    author_url = "https://github.com/sakezerto"
     # 插件配置项ID前缀
     plugin_config_prefix = "hdhivesign_"
     # 加载顺序
