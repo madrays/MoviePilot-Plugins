@@ -1,6 +1,6 @@
 """
 影巢签到插件
-版本: 1.4.0
+版本: 1.3.0
 作者: madrays
 功能:
 - 自动完成影巢(HDHive)每日签到
@@ -1506,6 +1506,7 @@ class HdhiveSign(_PluginBase):
             resp_warm = scraper.get(login_url, timeout=30, proxies=proxies)
             warm_text = getattr(resp_warm, 'text', '') or ''
             logger.info(f"自动登录: 预热状态码 {getattr(resp_warm, 'status_code', '?')}")
+            logger.info(f"自动登录: 预热响应前300字符={warm_text[:300]}")
         except Exception as e:
             logger.warning(f"自动登录: 预热失败 {e}")
 
