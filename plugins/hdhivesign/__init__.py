@@ -1599,6 +1599,23 @@ class HdhiveSign(_PluginBase):
                     launch_args["proxy"] = proxy_cfg
                 browser = pw.chromium.launch(**launch_args)
                 context = browser.new_context(user_agent=ua)
+
+                # 将 cloudscraper 已通过 Cloudflare 验证的 Cookie 注入 Playwright
+                # 这样 Playwright 就不会被当作机器人拦截
+                try:
+                    cf_cookies = scraper.cookies.get_dict() if hasattr(scraper, 'cookies') else {}
+                    if cf_cookies:
+                        pw_cookies = [
+                            {"name": k, "value": v, "domain": domain, "path": "/"}
+                            for k, v in cf_cookies.items()
+                        ]
+                        context.add_cookies(pw_cookies)
+                        logger.info(f"自动登录: 已注入 cloudscraper Cookie，keys={list(cf_cookies.keys())}")
+                    else:
+                        logger.info("自动登录: cloudscraper 无 Cookie 可注入")
+                except Exception as e:
+                    logger.debug(f"自动登录: Cookie 注入失败 {e}")
+
                 page = context.new_page()
 
                 # 拦截网络响应，主动捕获 Set-Cookie
