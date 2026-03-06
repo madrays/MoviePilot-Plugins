@@ -77,6 +77,11 @@ class HdhiveSign(_PluginBase):
     _login_api_candidates = [
         "/api/customer/user/login",
         "/api/customer/auth/login",
+        "/api/customer/user/signin",
+        "/api/customer/auth/signin",
+        "/api/customer/user/token",
+        "/api/auth/login",
+        "/api/user/login",
     ]
     _login_page = "/login"
 
@@ -1668,6 +1673,10 @@ class HdhiveSign(_PluginBase):
                     logger.info(f"自动登录: JS[0]状态={r_test.status_code} 长度={len(r_test.text)} 前200={r_test.text[:200]}")
                 except Exception as e:
                     logger.warning(f"自动登录: JS[0]下载失败 {e}")
+            # 把已知候选路径也加进去，用 curl_cffi 重试（之前失败是因为 cloudscraper 被拦）
+            for p in self._login_api_candidates:
+                if p not in found_apis:
+                    found_apis.append(p)
             logger.info(f"自动登录: JS bundle 发现的 API 路径={found_apis}")
             login_payloads = [
                 {'username': username, 'password': password},
