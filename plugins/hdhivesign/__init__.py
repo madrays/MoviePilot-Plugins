@@ -1620,6 +1620,12 @@ class HdhiveSign(_PluginBase):
 
                 page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
                 logger.info(f"自动登录: Playwright 页面加载完成，当前URL={page.url}")
+                # 等待 React 渲染完成——直到页面出现任意 input 或超时
+                try:
+                    page.wait_for_selector("input", timeout=15000)
+                    logger.info("自动登录: 检测到 input，React 已渲染")
+                except Exception:
+                    logger.warning("自动登录: 等待 input 超时，继续尝试")
 
                 # 列出页面所有 input，帮助诊断选择器
                 try:
