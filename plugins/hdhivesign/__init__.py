@@ -1543,7 +1543,7 @@ class HdhiveSign(_PluginBase):
                         logger.info("自动登录: NextAuth 登录成功")
                         return _build_cookie_str(cd)
         except Exception as e:
-            logger.debug(f"自动登录: NextAuth 失败 {e}")
+            logger.warning(f"自动登录: NextAuth 失败 {type(e).__name__}: {e}")
 
         # ── 策略 2：Next.js Server Action ──────────────────────────────
         # next-action token 藏在 HTML 或 JS bundle 里，需要主动抓取
