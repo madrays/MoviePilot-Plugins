@@ -1642,6 +1642,10 @@ class HdhiveSign(_PluginBase):
                                 found_apis.append(api)
                 except Exception:
                     continue
+            # 打印完整 HTML 的 script 标签，诊断 JS 路径格式
+            all_scripts = _re.findall(r'<script[^>]*src=["\']([^"\']+)["\'][^>]*>', warm_text)
+            logger.info(f"自动登录: 页面所有script src={all_scripts[:10]}")
+            logger.info(f"自动登录: warm_text长度={len(warm_text)}")
             logger.info(f"自动登录: JS bundle 发现的 API 路径={found_apis}")
             login_payloads = [
                 {'username': username, 'password': password},
