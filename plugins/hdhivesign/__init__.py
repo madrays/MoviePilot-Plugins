@@ -1665,43 +1665,26 @@ class HdhiveSign(_PluginBase):
                 except Exception:
                     continue
             logger.info(f"自动登录: JS bundle 所有 /api/ 路径={all_apis}")
-            # 专门深挖登录表单所在的 JS 文件
-            login_js_candidates = [s for s in all_scripts if any(k in s for k in ["ed18","login","auth","form"])]
-            if not login_js_candidates:
-                login_js_candidates = all_scripts
-            for src in login_js_candidates:
+            # 在登录 JS 里找 Server Action ID
+            login_src = next((s for s in all_scripts if "ed18" in s), None)
+            if not login_src:
+                login_src = all_scripts[0] if all_scripts else None
+            if login_src:
                 try:
-                    r_js3 = scraper.get(f"{self._base_url}{src}", timeout=15,
+                    r_ljs = scraper.get(f"{self._base_url}{login_src}", timeout=15,
                                         proxies=proxies, headers={"User-Agent": ua})
-                    js3 = r_js3.text or ""
-                    # 找所有字符串（引号包裹的路径）周围含 fetch/post/axios 的片段
-                    for m in _re.finditer(r'(?:fetch|axios|post|request)\s*\(["\']([^"\']{4,80})["\']\s*[,)]', js3):
-                        logger.info(f"自动登录: JS({src[-20:]}) fetch/post 调用={m.group(0)[:120]}")
-                    # 找 handleSubmit / onSubmit / mutate 周围的代码
-                    for kw in ["handleSubmit","onSubmit","mutate","mutation","useMutation"]:
-                        idx = js3.find(kw)
-                        if idx != -1:
-                            logger.info(f"自动登录: JS({src[-20:]}) [{kw}]={js3[max(0,idx-60):idx+200]}")
-                except Exception:
-                    continue
-            # 在所有 JS bundle 里搜索 checkin/password/login 关键词上下文
-            keywords = ["checkin", "password", "signin", "signIn", "用户名", "密码"]
-            for src in all_scripts:
-                try:
-                    r_js2 = scraper.get(f"{self._base_url}{src}", timeout=15,
-                                        proxies=proxies, headers={"User-Agent": ua})
-                    js2 = r_js2.text or ""
-                    for kw in keywords:
-                        idx = js2.find(kw)
-                        if idx != -1:
-                            snippet = js2[max(0,idx-120):idx+120]
-                            logger.info(f"自动登录: JS({src[-20:]}) 关键词[{kw}] 上下文={snippet}")
-                except Exception:
-                    continue
-            # 把已知候选路径也加进去，用 curl_cffi 重试（之前失败是因为 cloudscraper 被拦）
-            for p in self._login_api_candidates:
-                if p not in found_apis:
-                    found_apis.append(p)
+                    js_full = r_ljs.text or ""
+                    hex_ids = list(set(_re.findall(r'["\']([a-fA-F0-9]{40,64})["\']\s*[,)}\'"]', js_full)))
+                    logger.info(f"自动登录: ed18 JS 长十六进制串={hex_ids[:10]}")
+                    for pat in [
+                        r'createServerReference\s*\(\s*["\']([0-9a-fA-F]{10,})',
+                        r'\$\$id\s*[:=]\s*["\']([0-9a-fA-F]{10,})',
+                        r'action\s*[:=]\s*["\']([0-9a-fA-F]{40,})',
+                    ]:
+                        for m in _re.finditer(pat, js_full):
+                            logger.info(f"自动登录: ServerAction ID候选={m.group(1)[:24]}")
+                except Exception as e:
+                    logger.warning(f"自动登录: 分析登录JS失败 {e}")
             logger.info(f"自动登录: JS bundle 发现的 API 路径={found_apis}")
             login_payloads = [
                 {'username': username, 'password': password},
