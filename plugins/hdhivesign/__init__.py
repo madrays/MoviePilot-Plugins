@@ -736,6 +736,33 @@ class HdhiveSign(_PluginBase):
         signin_days_total = user.get('signin_days_total') if user.get('signin_days_total') is not None else '—'
         created_at = user.get('created_at') or '—'
 
+        # 获取 Cookie 到期信息
+        cookie_expire_info = ""
+        try:
+            token = None
+            for part in (self._cookie or "").split(';'):
+                p = part.strip()
+                if p.startswith('token='):
+                    token = p.split('=', 1)[1]
+                    break
+            if token:
+                decoded = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+                exp_ts = decoded.get('exp')
+                if exp_ts:
+                    import time as _t
+                    remaining_days = (exp_ts - int(_t.time())) / 86400
+                    expire_str = datetime.fromtimestamp(exp_ts).strftime('%Y-%m-%d')
+                    if remaining_days <= 0:
+                        cookie_expire_info = f"🔴 Cookie 已过期！请立即更新"
+                    elif remaining_days <= 2:
+                        hours = int(remaining_days * 24)
+                        cookie_expire_info = f"⚠️ Cookie 剩余约 {hours} 小时（{expire_str} 到期）"
+                    else:
+                        days_left = int(remaining_days)
+                        cookie_expire_info = f"🟢 Cookie 剩余 {days_left} 天（{expire_str} 到期）"
+        except Exception:
+            pass
+
         # 检查奖励信息是否为空
         info_missing = message == "—" and points == "—" and days == "—"
 
@@ -780,6 +807,8 @@ class HdhiveSign(_PluginBase):
                     f"积分：{user_points}\n"
                     f"累计签到天数（站点）：{signin_days_total}\n"
                     f"加入时间：{created_at}\n"
+                    f"━━━━━━━━━━\n"
+                    f"🔑 {cookie_expire_info}\n"
                     f"━━━━━━━━━━"
                 )
         elif "已签到" in status:
@@ -1325,222 +1354,342 @@ class HdhiveSign(_PluginBase):
             if exp_ts and isinstance(exp_ts, (int, float)):
                 import time as _t
                 now_ts = int(_t.time())
-                if exp_ts <= now_ts:
-                    return self._auto_login()
+                remaining_seconds = exp_ts - now_ts
+                remaining_days = remaining_seconds / 86400
+
+                # Cookie 已过期，尝试自动登录
+                if remaining_seconds <= 0:
+                    logger.warning("Cookie 已过期，尝试自动登录刷新")
+                    new_cookie = self._auto_login()
+                    if not new_cookie and self._notify:
+                        expire_time = datetime.fromtimestamp(exp_ts).strftime('%Y-%m-%d %H:%M')
+                        self.post_message(
+                            mtype=NotificationType.SiteMessage,
+                            title="【⚠️ 影巢 Cookie 已过期】",
+                            text=(
+                                f"⚠️ Cookie 已于 {expire_time} 过期，自动登录失败\n"
+                                f"━━━━━━━━━━\n"
+                                f"请前往插件设置手动更新 Cookie：\n"
+                                f"1. 登录 {self._base_url}\n"
+                                f"2. F12 → Application → Cookies\n"
+                                f"3. 复制 token 值填入插件配置"
+                            )
+                        )
+                    return new_cookie
+
+                # Cookie 即将在 2 天内过期，提前预警
+                elif remaining_days <= 2:
+                    expire_time = datetime.fromtimestamp(exp_ts).strftime('%Y-%m-%d %H:%M')
+                    hours_left = int(remaining_seconds / 3600)
+                    logger.warning(f"Cookie 即将过期，剩余约 {hours_left} 小时（{expire_time}）")
+                    if self._notify:
+                        # 避免重复通知：记录上次预警日期
+                        last_warned = self.get_data('cookie_expire_warned_date')
+                        today_str = datetime.now().strftime('%Y-%m-%d')
+                        if last_warned != today_str:
+                            self.save_data('cookie_expire_warned_date', today_str)
+                            self.post_message(
+                                mtype=NotificationType.SiteMessage,
+                                title="【⏰ 影巢 Cookie 即将过期】",
+                                text=(
+                                    f"⏰ Cookie 将于 {expire_time} 过期\n"
+                                    f"剩余约 {hours_left} 小时，请尽快更新！\n"
+                                    f"━━━━━━━━━━\n"
+                                    f"更新步骤：\n"
+                                    f"1. 登录 {self._base_url}\n"
+                                    f"2. F12 → Application → Cookies\n"
+                                    f"3. 复制 token 值填入插件配置"
+                                )
+                            )
+                else:
+                    expire_time = datetime.fromtimestamp(exp_ts).strftime('%Y-%m-%d %H:%M')
+                    days_left = int(remaining_days)
+                    logger.info(f"Cookie 有效，剩余约 {days_left} 天（过期时间：{expire_time}）")
             return None
         except Exception:
             return None
 
     def _auto_login(self) -> Optional[str]:
+        """
+        自动登录获取 Cookie，按优先级依次尝试：
+        1. NextAuth.js 凭证登录（/api/auth/...）
+        2. Next.js Server Action（从 HTML + JS bundle 提取 next-action token）
+        3. Playwright 浏览器自动化兜底
+        """
+        import re as _re
+
+        username = getattr(self, "_username", "")
+        password = getattr(self, "_password", "")
+        if not username or not password:
+            logger.warning("未配置用户名或密码，无法自动登录")
+            return None
+
         try:
-            if not getattr(self, "_username", None) or not getattr(self, "_password", None):
-                logger.warning("未配置用户名或密码，无法自动登录")
-                return None
+            import cloudscraper
+            scraper = cloudscraper.create_scraper()
+            logger.info("自动登录: 使用 cloudscraper")
+        except Exception:
+            scraper = requests
+            logger.info("自动登录: 回退到 requests")
+
+        login_url = f"{self._base_url}{self._login_page}"
+        proxies = settings.PROXY
+        ua = settings.USER_AGENT
+        domain = self._base_url.replace('https://', '').replace('http://', '').split('/')[0]
+
+        def _extract_cookies(resp):
+            """从响应中提取 token 和 csrf_access_token"""
             try:
-                import cloudscraper
-                scraper = cloudscraper.create_scraper()
-                logger.info("自动登录: 使用 cloudscraper")
-            except Exception as e:
-                logger.warning(f"cloudscraper 不可用，将尝试 requests：{e}")
-                scraper = requests
-                logger.info("自动登录: 回退到 requests")
-            # 预热登录页，拿到初始 Cookie
-            login_url = f"{self._base_url}{self._login_page}"
-            try:
-                logger.info(f"自动登录: 预热 {login_url}")
-                resp_warm = scraper.get(login_url, timeout=30, proxies=settings.PROXY)
-                logger.info(f"自动登录: 预热状态码 {getattr(resp_warm, 'status_code', 'unknown')} Content-Type {getattr(resp_warm.headers, 'get', lambda k: '')('Content-Type')}")
+                cd = getattr(resp, 'cookies', None)
+                cd = cd.get_dict() if cd else {}
             except Exception:
-                pass
-            # 尝试 API 登录候选
-            for path in self._login_api_candidates:
-                url = f"{self._base_url}{path}"
-                headers = {
-                    'User-Agent': settings.USER_AGENT,
-                    'Accept': 'application/json, text/plain, */*',
-                    'Origin': self._base_url,
-                    'Referer': login_url,
-                    'Content-Type': 'application/json'
-                }
-                payload = {
-                    'username': getattr(self, "_username", ""),
-                    'password': getattr(self, "_password", "")
-                }
-                try:
-                    logger.info(f"自动登录: 尝试 API 登录 {url}")
-                    resp = scraper.post(url, headers=headers, json=payload, timeout=30, proxies=settings.PROXY)
-                    logger.info(f"自动登录: API 登录状态码 {getattr(resp, 'status_code', 'unknown')} Content-Type {getattr(resp.headers, 'get', lambda k: '')('Content-Type')}")
-                    # 成功条件：响应包含 set-cookie 或 JSON 内含 meta.access_token
-                    cookies_dict = None
+                cd = {}
+            # 也从 Set-Cookie header 里兜底提取
+            if not cd.get('token'):
+                sc = getattr(resp.headers, 'get', lambda k, d=None: d)('set-cookie', '') or ''
+                m = _re.search(r'token=([^;,\s]+)', sc)
+                if m:
+                    cd['token'] = m.group(1)
+                m2 = _re.search(r'csrf_access_token=([^;,\s]+)', sc)
+                if m2:
+                    cd['csrf_access_token'] = m2.group(1)
+            return cd
+
+        def _build_cookie_str(cd):
+            parts = [f"token={cd['token']}"]
+            if cd.get('csrf_access_token'):
+                parts.append(f"csrf_access_token={cd['csrf_access_token']}")
+            return "; ".join(parts)
+
+        # ── 预热：拿到页面 HTML 和初始 Session Cookie ──────────────────
+        warm_text = ""
+        resp_warm = None
+        try:
+            logger.info(f"自动登录: 预热 {login_url}")
+            resp_warm = scraper.get(login_url, timeout=30, proxies=proxies)
+            warm_text = getattr(resp_warm, 'text', '') or ''
+            logger.info(f"自动登录: 预热状态码 {getattr(resp_warm, 'status_code', '?')}")
+        except Exception as e:
+            logger.warning(f"自动登录: 预热失败 {e}")
+
+        # ── 策略 1：NextAuth.js ─────────────────────────────────────────
+        # NextAuth 流程：GET /api/auth/csrf → POST /api/auth/signin/credentials
+        try:
+            csrf_url = f"{self._base_url}/api/auth/csrf"
+            logger.info(f"自动登录: 尝试 NextAuth GET {csrf_url}")
+            r_csrf = scraper.get(csrf_url, timeout=15, proxies=proxies,
+                                 headers={'User-Agent': ua, 'Referer': login_url})
+            if r_csrf.status_code == 200:
+                csrf_token = (r_csrf.json() or {}).get('csrfToken', '')
+                logger.info(f"自动登录: NextAuth csrfToken={'已获取' if csrf_token else '未获取'}")
+                if csrf_token:
+                    signin_url = f"{self._base_url}/api/auth/signin/credentials"
+                    payload = {
+                        'username': username,
+                        'password': password,
+                        'csrfToken': csrf_token,
+                        'callbackUrl': self._base_url,
+                        'json': 'true'
+                    }
+                    r_sign = scraper.post(signin_url, data=payload, timeout=30, proxies=proxies,
+                                          headers={
+                                              'User-Agent': ua,
+                                              'Content-Type': 'application/x-www-form-urlencoded',
+                                              'Referer': login_url,
+                                              'Origin': self._base_url,
+                                          })
+                    logger.info(f"自动登录: NextAuth 登录状态码 {r_sign.status_code}")
+                    cd = _extract_cookies(r_sign)
+                    if cd.get('token'):
+                        logger.info("自动登录: NextAuth 登录成功")
+                        return _build_cookie_str(cd)
+        except Exception as e:
+            logger.debug(f"自动登录: NextAuth 失败 {e}")
+
+        # ── 策略 2：Next.js Server Action ──────────────────────────────
+        # next-action token 藏在 HTML 或 JS bundle 里，需要主动抓取
+        next_action_token = None
+
+        # 2a. 先在 HTML 里找
+        patterns = [
+            r'"next-action"\s*:\s*"([a-fA-F0-9]{40,})"',
+            r'name="next-action"\s+value="([a-fA-F0-9]{40,})"',
+            r'data-action="([a-fA-F0-9]{40,})"',
+            r'"([a-fA-F0-9]{40,})"\s*,\s*\[\s*"username"',
+            r'action["\s:=]+["\']([a-fA-F0-9]{40,})["\']',
+        ]
+        for pat in patterns:
+            m = _re.search(pat, warm_text)
+            if m:
+                next_action_token = m.group(1)
+                logger.info(f"自动登录: 在HTML中找到 next-action={next_action_token[:12]}...")
+                break
+
+        # 2b. HTML 里没有，去 JS bundle 里找
+        if not next_action_token:
+            try:
+                js_srcs = _re.findall(r'src="(/_next/static/chunks/[^"]+\.js)"', warm_text)
+                # 优先搜索可能含登录逻辑的文件名
+                priority = [s for s in js_srcs if any(k in s for k in ['login', 'auth', 'page', 'app'])]
+                others = [s for s in js_srcs if s not in priority]
+                for src in (priority + others)[:10]:  # 最多抓10个JS文件
+                    js_url = f"{self._base_url}{src}"
                     try:
-                        cookies_dict = getattr(resp, 'cookies', None).get_dict() if getattr(resp, 'cookies', None) else {}
+                        r_js = scraper.get(js_url, timeout=15, proxies=proxies, headers={'User-Agent': ua})
+                        js_text = r_js.text or ''
+                        for pat in patterns:
+                            m = _re.search(pat, js_text)
+                            if m:
+                                next_action_token = m.group(1)
+                                logger.info(f"自动登录: 在JS({src[-30:]})中找到 next-action={next_action_token[:12]}...")
+                                break
                     except Exception:
-                        cookies_dict = {}
-                    token_cookie = cookies_dict.get('token')
-                    csrf_cookie = cookies_dict.get('csrf_access_token')
-                    if not token_cookie:
-                        try:
-                            data = resp.json()
-                            logger.info(f"自动登录: API 登录返回JSON keys {list(data.keys()) if isinstance(data, dict) else 'non-dict'}")
-                            meta = (data.get('meta') or {})
-                            acc = meta.get('access_token')
-                            ref = meta.get('refresh_token')
-                            if acc:
-                                # 将 access_token 写入 token Cookie
-                                if hasattr(scraper, 'cookies'):
-                                    try:
-                                        scraper.cookies.set('token', acc, domain=self._base_url.replace('https://','').replace('http://',''))
-                                        token_cookie = acc
-                                    except Exception:
-                                        token_cookie = acc
-                                else:
-                                    token_cookie = acc
-                        except Exception:
-                            pass
-                    if token_cookie:
-                        cookie_items = [f"token={token_cookie}"]
-                        if csrf_cookie:
-                            cookie_items.append(f"csrf_access_token={csrf_cookie}")
-                        cookie_str = "; ".join(cookie_items)
-                        logger.info("API登录成功，已生成Cookie")
-                        return cookie_str
-                except Exception as e:
-                    logger.debug(f"API登录候选失败: {path} -> {e}")
-            # 尝试 Next.js Server Action 登录
-            url = f"{self._base_url}{self._login_page}"
-            headers = {
-                'User-Agent': settings.USER_AGENT,
+                        continue
+                    if next_action_token:
+                        break
+            except Exception as e:
+                logger.debug(f"自动登录: JS bundle 搜索失败 {e}")
+
+        if next_action_token:
+            sa_headers = {
+                'User-Agent': ua,
                 'Accept': 'text/x-component',
+                'Content-Type': 'text/plain;charset=UTF-8',
+                'Next-Action': next_action_token,
+                'Next-Router-State-Tree': '%5B%22%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22login%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Flogin%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%2Ctrue%5D',
                 'Origin': self._base_url,
                 'Referer': login_url,
-                'Content-Type': 'text/plain;charset=UTF-8'
             }
-            # 从预热页面尝试提取 next-action token
-            next_action_token = None
-            try:
-                warm_text = getattr(resp_warm, 'text', '') or ''
-                # 常见形式：next-action":"<token>" 或 name="next-action" value="<token>"
-                import re as _re
-                m = _re.search(r'next-action"\s*:\s*"([a-fA-F0-9]{16,64})"', warm_text)
-                if not m:
-                    m = _re.search(r'name="next-action"\s+value="([a-fA-F0-9]{16,64})"', warm_text)
-                if m:
-                    next_action_token = m.group(1)
-                    headers['next-action'] = next_action_token
-                    # 参考样例的最小 router state（静态值）
-                    headers['next-router-state-tree'] = '%5B%22%22%2C%7B%22children%22%3A%5B%22(auth)%22%2C%7B%22children%22%3A%5B%22login%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2C%22%2Flogin%22%2C%22refresh%22%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%2Ctrue%5D'
-                    logger.info(f"自动登录: 提取 next-action={next_action_token}")
-                else:
-                    logger.info("自动登录: 未在页面提取到 next-action token")
-            except Exception as e:
-                logger.debug(f"自动登录: 提取 next-action 失败: {e}")
-            body = json.dumps([{'username': getattr(self, "_username", ""), 'password': getattr(self, "_password", "")}])
-            try:
-                logger.info(f"自动登录: 尝试 Server Action 登录 {url}")
-                resp = scraper.post(url, headers=headers, data=body, timeout=30, proxies=settings.PROXY)
-                logger.info(f"自动登录: SA 登录状态码 {getattr(resp, 'status_code', 'unknown')} Content-Type {getattr(resp.headers, 'get', lambda k: '')('Content-Type')}")
-                cookies_dict = None
+            # 尝试多种 payload 格式
+            payloads = [
+                json.dumps([{'username': username, 'password': password}]),
+                json.dumps([username, password]),
+                json.dumps({'username': username, 'password': password}),
+            ]
+            for body in payloads:
                 try:
-                    cookies_dict = getattr(resp, 'cookies', None).get_dict() if getattr(resp, 'cookies', None) else {}
-                except Exception:
-                    cookies_dict = {}
-                token_cookie = cookies_dict.get('token')
-                csrf_cookie = cookies_dict.get('csrf_access_token')
-                if token_cookie:
-                    cookie_items = [f"token={token_cookie}"]
-                    if csrf_cookie:
-                        cookie_items.append(f"csrf_access_token={csrf_cookie}")
-                    cookie_str = "; ".join(cookie_items)
-                    logger.info("Server Action 登录成功，已生成Cookie")
-                    return cookie_str
-            except Exception as e:
-                logger.warning(f"Server Action 登录失败: {e}")
-            # 浏览器自动化兜底：使用 Playwright 直接执行页面登录并读取 Cookie
+                    logger.info(f"自动登录: 尝试 Server Action 登录")
+                    r_sa = scraper.post(login_url, headers=sa_headers, data=body, timeout=30, proxies=proxies)
+                    logger.info(f"自动登录: SA 状态码 {r_sa.status_code}")
+                    cd = _extract_cookies(r_sa)
+                    if cd.get('token'):
+                        logger.info("自动登录: Server Action 登录成功")
+                        return _build_cookie_str(cd)
+                except Exception as e:
+                    logger.debug(f"自动登录: SA payload 失败 {e}")
+        else:
+            logger.warning("自动登录: 未找到 next-action token，跳过 Server Action")
+
+        # ── 策略 3：Playwright 浏览器自动化兜底 ───────────────────────
+        try:
+            from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+            logger.info("自动登录: 尝试 Playwright 浏览器自动化")
+            proxy_cfg = None
             try:
-                from playwright.sync_api import sync_playwright
-                logger.info("自动登录: 尝试使用 Playwright 浏览器自动化")
-                proxy = None
-                try:
-                    pxy = settings.PROXY or {}
-                    server = pxy.get('http') or pxy.get('https')
-                    if server:
-                        proxy = {"server": server}
-                except Exception:
-                    proxy = None
-                with sync_playwright() as pw:
-                    browser = pw.chromium.launch(headless=True, proxy=proxy) if proxy else pw.chromium.launch(headless=True)
-                    context = browser.new_context()
-                    page = context.new_page()
-                    page.goto(login_url, wait_until="domcontentloaded")
-                    # 选择器启发式
-                    selectors = [
-                        "input[name='username']",
-                        "input[name='email']",
-                        "input[type='email']",
-                        "input[placeholder*='邮箱']",
-                        "input[placeholder*='email']",
-                        "input[placeholder*='用户名']",
-                    ]
-                    pwd_selectors = [
-                        "input[name='password']",
-                        "input[type='password']",
-                        "input[placeholder*='密码']",
-                    ]
-                    for sel in selectors:
-                        try:
-                            if page.query_selector(sel):
-                                page.fill(sel, getattr(self, "_username", ""))
-                                break
-                        except Exception:
-                            continue
-                    for sel in pwd_selectors:
-                        try:
-                            if page.query_selector(sel):
-                                page.fill(sel, getattr(self, "_password", ""))
-                                break
-                        except Exception:
-                            continue
-                    # 点击提交按钮
+                pxy = settings.PROXY or {}
+                server = pxy.get('https') or pxy.get('http')
+                if server:
+                    proxy_cfg = {"server": server}
+            except Exception:
+                pass
+
+            with sync_playwright() as pw:
+                launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+                if proxy_cfg:
+                    launch_args["proxy"] = proxy_cfg
+                browser = pw.chromium.launch(**launch_args)
+                context = browser.new_context(user_agent=ua)
+                page = context.new_page()
+
+                # 拦截网络响应，主动捕获 Set-Cookie
+                captured_token = {}
+                def on_response(response):
                     try:
-                        btn = page.query_selector("button[type='submit']") or page.query_selector("button:has-text('登录')") or page.query_selector("button:has-text('Login')")
-                        if btn:
-                            btn.click()
-                        else:
-                            page.keyboard.press("Enter")
-                    except Exception:
-                        page.keyboard.press("Enter")
-                    # 等待可能的跳转或网络静止
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
+                        hdrs = response.headers
+                        sc = hdrs.get('set-cookie', '')
+                        if 'token=' in sc:
+                            m = _re.search(r'token=([^;,\s]+)', sc)
+                            if m:
+                                captured_token['token'] = m.group(1)
+                            m2 = _re.search(r'csrf_access_token=([^;,\s]+)', sc)
+                            if m2:
+                                captured_token['csrf_access_token'] = m2.group(1)
                     except Exception:
                         pass
-                    # 读取 Cookie
-                    cookies = context.cookies()
-                    token_cookie = None
-                    csrf_cookie = None
-                    for c in cookies:
+                page.on("response", on_response)
+
+                page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+
+                # 填写用户名
+                for sel in ["input[name='username']", "input[name='email']",
+                            "input[type='email']", "input[placeholder*='邮箱']",
+                            "input[placeholder*='用户名']", "input[placeholder*='email']"]:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            el.fill(username)
+                            break
+                    except Exception:
+                        continue
+
+                # 填写密码
+                for sel in ["input[name='password']", "input[type='password']",
+                            "input[placeholder*='密码']"]:
+                    try:
+                        el = page.query_selector(sel)
+                        if el and el.is_visible():
+                            el.fill(password)
+                            break
+                    except Exception:
+                        continue
+
+                # 点击登录
+                try:
+                    btn = (page.query_selector("button[type='submit']")
+                           or page.query_selector("button:has-text('登录')")
+                           or page.query_selector("button:has-text('Login')"))
+                    if btn:
+                        btn.click()
+                    else:
+                        page.keyboard.press("Enter")
+                except Exception:
+                    page.keyboard.press("Enter")
+
+                # 等待跳转或网络静止
+                try:
+                    page.wait_for_url(lambda url: '/login' not in url, timeout=10000)
+                except PWTimeout:
+                    pass
+                except Exception:
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+
+                # 优先用响应拦截到的 token
+                if not captured_token.get('token'):
+                    for c in context.cookies():
                         if c.get('name') == 'token':
-                            token_cookie = c.get('value')
+                            captured_token['token'] = c.get('value')
                         elif c.get('name') == 'csrf_access_token':
-                            csrf_cookie = c.get('value')
-                    context.close()
-                    browser.close()
-                    if token_cookie:
-                        cookie_items = [f"token={token_cookie}"]
-                        if csrf_cookie:
-                            cookie_items.append(f"csrf_access_token={csrf_cookie}")
-                        cookie_str = "; ".join(cookie_items)
-                        logger.info("Playwright 登录成功，已生成Cookie")
-                        return cookie_str
-                logger.error("自动登录失败，未获取到有效Cookie")
-                return None
-            except Exception as e:
-                logger.error(f"Playwright 自动登录异常: {e}")
-                logger.error("自动登录失败，未获取到有效Cookie")
-                return None
+                            captured_token['csrf_access_token'] = c.get('value')
+
+                context.close()
+                browser.close()
+
+                if captured_token.get('token'):
+                    logger.info("自动登录: Playwright 登录成功")
+                    return _build_cookie_str(captured_token)
+                else:
+                    logger.error("自动登录: Playwright 未获取到 token Cookie")
+
+        except ImportError:
+            logger.warning("自动登录: Playwright 未安装，可执行 'pip install playwright && playwright install chromium'")
         except Exception as e:
-            logger.error(f"自动登录异常: {str(e)}")
-            return None
+            logger.error(f"自动登录: Playwright 异常 {e}")
+
+        logger.error("自动登录失败，所有策略均未获取到有效Cookie")
+        return None
 
     def _get_last_sign_time(self) -> str:
         """
