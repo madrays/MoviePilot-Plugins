@@ -1648,7 +1648,16 @@ class HdhiveSign(_PluginBase):
                     locale="zh-CN",
                     timezone_id="Asia/Shanghai",
                 )
-                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});window.chrome = {runtime: {}};")
+                # 优先使用 playwright-stealth 隐藏自动化特征
+                try:
+                    from playwright_stealth import stealth_sync
+                    page_temp = context.new_page()
+                    stealth_sync(page_temp)
+                    page_temp.close()
+                    logger.info("自动登录: playwright-stealth 已启用")
+                except ImportError:
+                    logger.warning("自动登录: playwright-stealth 未安装，建议 pip install playwright-stealth")
+                    context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});window.chrome = {runtime: {}};")
 
                 # 注入 curl_cffi/scraper 已通过 Cloudflare 验证的 Cookie
                 try:
@@ -1695,6 +1704,12 @@ class HdhiveSign(_PluginBase):
                     logger.warning(f"自动登录: Cookie 注入失败 {e}")
 
                 page = context.new_page()
+                # 对实际页面也应用 stealth
+                try:
+                    from playwright_stealth import stealth_sync
+                    stealth_sync(page)
+                except ImportError:
+                    pass
 
                 # 拦截网络响应，主动捕获 Set-Cookie
                 captured_token = {}
