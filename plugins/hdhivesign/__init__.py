@@ -1424,12 +1424,28 @@ class HdhiveSign(_PluginBase):
             logger.warning("未配置用户名或密码，无法自动登录")
             return None
 
+        # 优先使用 curl_cffi（模拟真实浏览器 TLS 指纹，能绕过新版 Cloudflare）
+        # 其次 cloudscraper，最后 requests
+        scraper = None
+        scraper_type = None
         try:
-            import cloudscraper
-            scraper = cloudscraper.create_scraper()
-            logger.info("自动登录: 使用 cloudscraper")
-        except Exception:
+            from curl_cffi import requests as cffi_requests
+            scraper = cffi_requests.Session(impersonate="chrome120")
+            scraper_type = "curl_cffi"
+            logger.info("自动登录: 使用 curl_cffi (chrome120)")
+        except ImportError:
+            pass
+        if scraper is None:
+            try:
+                import cloudscraper
+                scraper = cloudscraper.create_scraper()
+                scraper_type = "cloudscraper"
+                logger.info("自动登录: 使用 cloudscraper")
+            except ImportError:
+                pass
+        if scraper is None:
             scraper = requests
+            scraper_type = "requests"
             logger.info("自动登录: 回退到 requests")
 
         login_url = f"{self._base_url}{self._login_page}"
@@ -1594,25 +1610,42 @@ class HdhiveSign(_PluginBase):
                 pass
 
             with sync_playwright() as pw:
-                launch_args = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+                stealth_args = [
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ]
+                launch_args = {"headless": True, "args": stealth_args}
                 if proxy_cfg:
                     launch_args["proxy"] = proxy_cfg
                 browser = pw.chromium.launch(**launch_args)
-                context = browser.new_context(user_agent=ua)
+                context = browser.new_context(
+                    user_agent=ua,
+                    viewport={"width": 1920, "height": 1080},
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                )
+                context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN','zh','en']});window.chrome = {runtime: {}};")
 
-                # 将 cloudscraper 已通过 Cloudflare 验证的 Cookie 注入 Playwright
-                # 这样 Playwright 就不会被当作机器人拦截
+                # 注入 scraper 已通过 Cloudflare 验证的 Cookie
                 try:
-                    cf_cookies = scraper.cookies.get_dict() if hasattr(scraper, 'cookies') else {}
+                    cf_cookies = {}
+                    if hasattr(scraper, 'cookies'):
+                        try:
+                            cf_cookies = scraper.cookies.get_dict()
+                        except Exception:
+                            try:
+                                cf_cookies = dict(scraper.cookies)
+                            except Exception:
+                                pass
                     if cf_cookies:
                         pw_cookies = [
                             {"name": k, "value": v, "domain": domain, "path": "/"}
                             for k, v in cf_cookies.items()
                         ]
                         context.add_cookies(pw_cookies)
-                        logger.info(f"自动登录: 已注入 cloudscraper Cookie，keys={list(cf_cookies.keys())}")
+                        logger.info(f"自动登录: 已注入 scraper Cookie，keys={list(cf_cookies.keys())}")
                     else:
-                        logger.info("自动登录: cloudscraper 无 Cookie 可注入")
+                        logger.info("自动登录: scraper 无 Cookie 可注入")
                 except Exception as e:
                     logger.debug(f"自动登录: Cookie 注入失败 {e}")
 
