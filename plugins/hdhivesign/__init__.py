@@ -1660,6 +1660,14 @@ class HdhiveSign(_PluginBase):
                 except Exception:
                     continue
             logger.info(f"自动登录: JS bundle 所有 /api/ 路径={all_apis}")
+            # 打印第一个 JS 文件的前200字符，确认是否成功下载
+            if all_scripts:
+                try:
+                    r_test = scraper.get(f"{self._base_url}{all_scripts[0]}", timeout=15,
+                                         proxies=proxies, headers={"User-Agent": ua})
+                    logger.info(f"自动登录: JS[0]状态={r_test.status_code} 长度={len(r_test.text)} 前200={r_test.text[:200]}")
+                except Exception as e:
+                    logger.warning(f"自动登录: JS[0]下载失败 {e}")
             logger.info(f"自动登录: JS bundle 发现的 API 路径={found_apis}")
             login_payloads = [
                 {'username': username, 'password': password},
