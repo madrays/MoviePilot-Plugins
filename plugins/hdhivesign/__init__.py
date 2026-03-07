@@ -1,8 +1,9 @@
 """
-影巢签到插件-改
-版本: 1.4.0
-作者: madrays,sakezerto
+影巢签到插件
+版本: 1.5.0
+作者: madrays
 功能:
+- 支持自选影巢(HDHive)每日签到或者赌狗签到
 - 自动完成影巢(HDHive)每日签到
 - 支持签到失败重试
 - 保存签到历史记录
@@ -10,7 +11,8 @@
 - 默认使用代理访问
 
 修改记录:
-- v1.4.0: 修正1.3.0无法自动获取cookie
+- v1.5.0: 支持自选影巢(HDHive)每日签到或者赌狗签到
+- v1.4.0: 修复1.3.0无法自动获取cookie
 - v1.1.0: 域名改为可配置，统一API拼接(Referer/Origin/接口)，精简日志
 - v1.0.0: 初始版本，基于影巢网站结构实现自动签到
 """
@@ -38,17 +40,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class HdhiveSign(_PluginBase):
     # 插件名称
-    plugin_name = "影巢签到-改"
+    plugin_name = "影巢签到"
     # 插件描述
     plugin_desc = "自动完成影巢(HDHive)每日签到，支持失败重试和历史记录"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "madrays,sakezerto"
     # 作者主页
-    author_url = "https://github.com/sakezerto"
+    author_url = "https://github.com/sakezerto/MoviePilot-Plugins"
     # 插件配置项ID前缀
     plugin_config_prefix = "hdhivesign_"
     # 加载顺序
@@ -66,6 +68,7 @@ class HdhiveSign(_PluginBase):
     _retry_interval = 30  # 重试间隔(秒)
     _history_days = 30  # 历史保留天数
     _manual_trigger = False
+    _sign_mode = "daily"  # daily=每日签到, gambling=赌狗签到
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
     _current_trigger_type = None  # 保存当前执行的触发类型
@@ -109,6 +112,7 @@ class HdhiveSign(_PluginBase):
                 self._history_days = int(config.get("history_days", 30))
                 self._username = (config.get("username") or "").strip()
                 self._password = (config.get("password") or "").strip()
+                self._sign_mode = config.get("sign_mode") or "daily"
                 logger.info(f"影巢签到插件已加载，配置：enabled={self._enabled}, notify={self._notify}, cron={self._cron}")
             
             # 清理所有可能的延长重试任务
@@ -131,7 +135,8 @@ class HdhiveSign(_PluginBase):
                     "base_url": self._base_url,
                     "max_retries": self._max_retries,
                     "retry_interval": self._retry_interval,
-                    "history_days": self._history_days
+                    "history_days": self._history_days,
+                    "sign_mode": self._sign_mode
                 })
 
                 # 启动任务
@@ -518,6 +523,49 @@ class HdhiveSign(_PluginBase):
             }
             if csrf_token:
                 headers['x-csrf-token'] = csrf_token
+
+            # 根据签到模式选择接口
+            # checkIn Server Action：[false]=每日签到, [true]=赌狗签到
+            checkin_action_id = "409fcfaf6015ab7d6e7fbcaf2f551cbbc4875c691b"
+            is_gambling = getattr(self, "_sign_mode", "daily") == "gambling"
+            sa_headers = {
+                "User-Agent": ua,
+                "Accept": "text/x-component",
+                "Content-Type": "text/plain;charset=UTF-8",
+                "Next-Action": checkin_action_id,
+                "Next-Router-State-Tree": "%5B%22%22%2C%7B%22children%22%3A%5B%22(app)%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%5D%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D",
+                "Origin": self._base_url,
+                "Referer": referer,
+                "Authorization": f"Bearer {token}",
+            }
+            if csrf_token:
+                sa_headers["x-csrf-token"] = csrf_token
+            try:
+                sa_res = requests.post(
+                    url=f"{self._base_url}/",
+                    headers=sa_headers,
+                    cookies=cookies,
+                    data=json.dumps([is_gambling]),
+                    proxies=proxies,
+                    timeout=30,
+                    verify=False
+                )
+                mode_name = "赌狗签到" if is_gambling else "每日签到"
+                logger.info(f"{mode_name} Server Action 响应: {sa_res.status_code} {sa_res.text[:300]}")
+                if sa_res.status_code in (200, 500):
+                    # 从响应里提取消息
+                    msg = mode_name
+                    try:
+                        for line in sa_res.text.splitlines():
+                            if "message" in line or "积分" in line or "success" in line.lower():
+                                msg = line.strip()[:100]
+                                break
+                    except Exception:
+                        pass
+                    return True, msg
+                return False, f"{mode_name}失败: HTTP {sa_res.status_code}"
+            except Exception as e:
+                return False, f"签到异常: {e}"
 
             signin_res = requests.post(
                 url=self._signin_api,
@@ -963,6 +1011,28 @@ class HdhiveSign(_PluginBase):
                         'content': [
                             {
                                 'component': 'VCol',
+                                'props': {'cols': 12, 'md': 6},
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'sign_mode',
+                                            'label': '签到模式',
+                                            'items': [
+                                                {'title': '每日签到（固定积分）', 'value': 'daily'},
+                                                {'title': '赌狗签到（随机积分，最多3倍）', 'value': 'gambling'},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
                                 'props': {
                                     'cols': 12,
                                 },
@@ -1149,7 +1219,8 @@ class HdhiveSign(_PluginBase):
             "retry_interval": 30,
             "history_days": 30,
             "username": "",
-            "password": ""
+            "password": "",
+            "sign_mode": "daily"
         }
 
     def get_page(self) -> List[dict]:
