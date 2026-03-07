@@ -4,7 +4,7 @@
 作者: madrays
 功能:
 - 支持自选影巢(HDHive)每日签到或者赌狗签到
-- 自动完成影巢(HDHive)每日签到
+- 自动完成影巢(HDHive)签到
 - 支持签到失败重试
 - 保存签到历史记录
 - 提供详细的签到通知
@@ -42,7 +42,7 @@ class HdhiveSign(_PluginBase):
     # 插件名称
     plugin_name = "影巢签到"
     # 插件描述
-    plugin_desc = "自动完成影巢(HDHive)每日签到，支持失败重试和历史记录"
+    plugin_desc = "自动完成影巢(HDHive)签到，支持失败重试和历史记录"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
