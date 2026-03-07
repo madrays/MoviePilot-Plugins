@@ -1,14 +1,15 @@
 {
   "HdhiveSign": {
     "name": "影巢签到-改",
-    "description": "自动完成影巢每日签到，支持失败重试和历史记录",
+    "description": "自动完成影巢每日签到，支持失败重试、历史记录和签到模式选择",
     "labels": "签到,影巢",
-    "version": "1.5.0",
+    "version": "1.6.0",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico",
     "author": "madrays,sakezerto",
     "level": 1,
     "v2": true,
     "history": {
+      "v1.6.0": "修复了一些bug",
       "v1.5.0": "支持选择每日签到还是赌狗签到",
       "v1.4.0": "修正1.3.0无法自动登录获取cookie",
       "v1.3.0": "用户信息卡片美化；通知追加用户摘要；重复签到与执行前预拉取用户信息；RSC解析兜底",
