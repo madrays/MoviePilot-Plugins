@@ -1,9 +1,9 @@
 """
 影巢签到插件
-版本: 1.5.0
-作者: madrays
+版本: 1.6.0
+作者: madrays,sakezerto
 功能:
-- 支持自选影巢(HDHive)每日签到或者赌狗签到
+- 支持选择每日签到或者赌狗签到
 - 自动完成影巢(HDHive)签到
 - 支持签到失败重试
 - 保存签到历史记录
@@ -11,6 +11,7 @@
 - 默认使用代理访问
 
 修改记录:
+- v1.6.0: 修复了一些bug
 - v1.5.0: 支持自选影巢(HDHive)每日签到或者赌狗签到
 - v1.4.0: 修复1.3.0无法自动获取cookie
 - v1.1.0: 域名改为可配置，统一API拼接(Referer/Origin/接口)，精简日志
@@ -42,13 +43,13 @@ class HdhiveSign(_PluginBase):
     # 插件名称
     plugin_name = "影巢签到"
     # 插件描述
-    plugin_desc = "自动完成影巢(HDHive)签到，支持失败重试和历史记录"
+    plugin_desc = "自动完成影巢(HDHive)签到，支持失败重试、历史记录和签到模式选择"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     # 插件作者
-    plugin_author = "madrays,sakezerto"
+    plugin_author = "madrays"
     # 作者主页
     author_url = "https://github.com/sakezerto/MoviePilot-Plugins"
     # 插件配置项ID前缀
@@ -551,18 +552,40 @@ class HdhiveSign(_PluginBase):
                     verify=False
                 )
                 mode_name = "赌狗签到" if is_gambling else "每日签到"
-                logger.info(f"{mode_name} Server Action 响应: {sa_res.status_code} {sa_res.text[:300]}")
+                logger.info(f"{mode_name} Server Action 响应: {sa_res.status_code}")
                 if sa_res.status_code in (200, 500):
-                    # 从响应里提取消息
-                    msg = mode_name
+                    # RSC 响应格式: 0:{...} 1:{...}，找第二行解析实际结果
+                    rsc_text = sa_res.text
+                    # 尝试 UTF-8，失败则 latin-1 再手动解码
                     try:
-                        for line in sa_res.text.splitlines():
-                            if "message" in line or "积分" in line or "success" in line.lower():
-                                msg = line.strip()[:100]
-                                break
+                        rsc_text = sa_res.content.decode("utf-8")
                     except Exception:
-                        pass
-                    return True, msg
+                        try:
+                            rsc_text = sa_res.content.decode("latin-1")
+                        except Exception:
+                            pass
+                    result_json = None
+                    for line in rsc_text.splitlines():
+                        if line.startswith("1:"):
+                            try:
+                                result_json = json.loads(line[2:])
+                                break
+                            except Exception:
+                                pass
+                    if result_json:
+                        error = result_json.get("error") or {}
+                        data = result_json.get("data") or result_json
+                        if error:
+                            desc = error.get("description") or error.get("message") or str(error)
+                            logger.info(f"{mode_name} 结果: {desc}")
+                            # 已签到也算成功（不是真正的失败）
+                            if "已经签到" in desc or "已签到" in desc or "明天" in desc:
+                                return True, f"今日{mode_name}：{desc}"
+                            return False, desc
+                        msg = data.get("message") or data.get("description") or mode_name
+                        logger.info(f"{mode_name} 成功: {msg}")
+                        return True, msg
+                    return True, mode_name
                 return False, f"{mode_name}失败: HTTP {sa_res.status_code}"
             except Exception as e:
                 return False, f"签到异常: {e}"
