@@ -1,6 +1,6 @@
 """
 影巢签到插件
-版本: 1.6.0
+版本: 1.6.1
 作者: madrays,sakezerto
 功能:
 - 支持选择每日签到或者赌狗签到
@@ -11,6 +11,7 @@
 - 默认使用代理访问
 
 修改记录:
+- v1.6.1: 更新了通知模板，修复冗余前缀并统一显示签到模式
 - v1.6.0: 修复了一些bug
 - v1.5.0: 支持自选影巢(HDHive)每日签到或者赌狗签到
 - v1.4.0: 修复1.3.0无法自动获取cookie
@@ -47,7 +48,7 @@ class HdhiveSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     # 插件作者
     plugin_author = "madrays,sakezerto"
     # 作者主页
@@ -231,6 +232,7 @@ class HdhiveSign(_PluginBase):
                         text += (
                             f"━━━━━━━━━━\n"
                             f"📊 签到信息\n"
+                            f"📝 签到模式：{'赌狗签到' if self._sign_mode == 'gambling' else '每日签到'}\n"
                             f"💬 消息：{sign_dict.get('message', '—')}\n"
                             f"🎁 奖励：{sign_dict.get('points', '—')}\n"
                             f"📆 天数：{sign_dict.get('days', '—')}\n"
@@ -580,7 +582,7 @@ class HdhiveSign(_PluginBase):
                             logger.info(f"{mode_name} 结果: {desc}")
                             # 已签到也算成功（不是真正的失败）
                             if "已经签到" in desc or "已签到" in desc or "明天" in desc:
-                                return True, f"今日{mode_name}：{desc}"
+                                return True, desc
                             return False, desc
                         msg = data.get("message") or data.get("description") or mode_name
                         logger.info(f"{mode_name} 成功: {msg}")
@@ -875,6 +877,7 @@ class HdhiveSign(_PluginBase):
                     f"✨ 状态：{status}\n"
                     f"━━━━━━━━━━\n"
                     f"📊 签到信息\n"
+                    f"📝 签到模式：{'赌狗签到' if self._sign_mode == 'gambling' else '每日签到'}\n"
                     f"💬 消息：{message}\n"
                     f"🎁 奖励：{points}\n"
                     f"📆 天数：{days}\n"
@@ -918,6 +921,7 @@ class HdhiveSign(_PluginBase):
                     f"ℹ️ 说明：今日已完成签到\n"
                     f"━━━━━━━━━━\n"
                     f"📊 签到信息\n"
+                    f"📝 签到模式：{'赌狗签到' if self._sign_mode == 'gambling' else '每日签到'}\n"
                     f"💬 消息：{message}\n"
                     f"🎁 奖励：{points}\n"
                     f"📆 天数：{days}\n"
