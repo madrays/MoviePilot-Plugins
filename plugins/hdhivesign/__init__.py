@@ -1,6 +1,6 @@
 """
 影巢签到插件
-版本: 1.6.1
+版本: 1.6.2
 作者: madrays,sakezerto
 功能:
 - 支持选择每日签到或者赌狗签到
@@ -11,6 +11,7 @@
 - 默认使用代理访问
 
 修改记录:
+- v1.6.2: 修复插件更新后签到模式、用户名、密码丢失的问题（update_config全量覆盖时字段缺失）
 - v1.6.1: 更新了通知模板，修复冗余前缀并统一显示签到模式
 - v1.6.0: 修复了一些bug
 - v1.5.0: 支持自选影巢(HDHive)每日签到或者赌狗签到
@@ -48,7 +49,7 @@ class HdhiveSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.6.1"
+    plugin_version = "1.6.2"
     # 插件作者
     plugin_author = "madrays,sakezerto"
     # 作者主页
@@ -138,7 +139,9 @@ class HdhiveSign(_PluginBase):
                     "max_retries": self._max_retries,
                     "retry_interval": self._retry_interval,
                     "history_days": self._history_days,
-                    "sign_mode": self._sign_mode
+                    "sign_mode": self._sign_mode,
+                    "username": getattr(self, "_username", ""),
+                    "password": getattr(self, "_password", ""),
                 })
 
                 # 启动任务
@@ -276,6 +279,7 @@ class HdhiveSign(_PluginBase):
                         "history_days": self._history_days,
                         "username": getattr(self, "_username", ""),
                         "password": getattr(self, "_password", ""),
+                        "sign_mode": getattr(self, "_sign_mode", "daily"),
                     })
                     logger.info("已通过自动登录获取新Cookie")
                 else:
@@ -312,6 +316,7 @@ class HdhiveSign(_PluginBase):
                         "history_days": self._history_days,
                         "username": getattr(self, "_username", ""),
                         "password": getattr(self, "_password", ""),
+                        "sign_mode": getattr(self, "_sign_mode", "daily"),
                     })
             except Exception:
                 pass
@@ -397,6 +402,7 @@ class HdhiveSign(_PluginBase):
                             "history_days": self._history_days,
                             "username": getattr(self, "_username", ""),
                             "password": getattr(self, "_password", ""),
+                            "sign_mode": getattr(self, "_sign_mode", "daily"),
                         })
                         logger.info("自动登录成功，使用新Cookie重试签到")
                         state2, message2 = self._signin_base()
