@@ -20,9 +20,8 @@
       "v1.1.0": "域名改为可配置；统一API拼接；精简日志",
       "v1.0": "首次发布"
     }
-  }
-},
-{
+  },
+  {
   "TmdbIdRecognize": {
     "name": "TMDB ID 直通识别",
     "description": "模仿 Emby 刮削策略，从文件名提取 {tmdbid=xxx} 直接查询 TMDB，精准识别媒体。",
@@ -37,3 +36,4 @@
     }
   }
 }
+
