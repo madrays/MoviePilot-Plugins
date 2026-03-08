@@ -21,4 +21,19 @@
       "v1.0": "首次发布"
     }
   }
+},
+{
+  "TmdbIdRecognize": {
+    "name": "TMDB ID 直通识别",
+    "description": "模仿 Emby 刮削策略，从文件名提取 {tmdbid=xxx} 直接查询 TMDB，精准识别媒体。",
+    "labels": "识别",
+    "version": "2.0",
+    "icon": "Themoviedb_A.png",
+    "author": "YourName",
+    "level": 1,
+    "history": {
+      "v2.0": "重写：采用 Emby 策略，tmdbid 直查 TMDB，通过 get_module 劫持 recognize_media + NameRecognize 链式事件双重保障",
+      "v1.0": "初始版本"
+    }
+  }
 }
