@@ -26,7 +26,7 @@
     "description": "模仿 Emby 刮削策略，从文件名提取 {tmdbid=xxx} 直接查询 TMDB，精准识别媒体。",
     "labels": "识别",
     "version": "2.0",
-    "icon": "Themoviedb_A.png",
+    "icon": "https://www.themoviedb.org/assets/2/v4/logos/v2/bl…ca9c88bafe5dcb6f8a62a4c6bc55cd9ba82bb2cd95f6c.svg",
     "author": "sakezerto",
     "level": 1,
     "v2": true,
