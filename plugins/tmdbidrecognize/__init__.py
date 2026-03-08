@@ -1,12 +1,10 @@
 """
 TMDB ID 直通识别插件
 
-模仿 Emby 刮削策略：
-  文件名含 {tmdbid=23155} → 直接查 TMDB API → 拿到标准名称 + 年份 → 返回给 MP
-
-解决命名如：
-  空之境界 第五章 矛盾螺旋 （2008） {tmdbid=23155}
-  进击的巨人 最终季 完结篇（后篇）（2023）{tmdbid=888888}
+核心策略：通过 get_module 劫持 recognize_media，
+在 MP 内置识别器运行之前拦截。
+如果文件名含 {tmdbid=xxx}，直接用 ID 调底层 TMDB 模块查询，
+跳过 MP 的文件名猜测（它会把"空之境界 第五章"错误匹配到 2013 年同名日剧）。
 """
 import re
 from typing import Any, List, Dict, Tuple, Optional
@@ -18,18 +16,16 @@ from app.schemas.types import ChainEventType
 
 
 class TmdbIdRecognize(_PluginBase):
-    # ---- 插件元信息 ----
     plugin_name = "TMDB ID 直通识别"
-    plugin_desc = "模仿 Emby 刮削策略，从文件名提取 {tmdbid=xxx} 直接查询 TMDB，精准识别媒体。"
+    plugin_desc = "模仿 Emby 刮削策略，从文件名提取 {tmdbid=xxx} 直接查询 TMDB，在内置识别之前拦截。"
     plugin_icon = "Themoviedb_A.png"
-    plugin_version = "2.1"
+    plugin_version = "3.0"
     plugin_author = "sakezerto"
     author_url = "https://github.com/sakezerto"
     plugin_config_prefix = "tmdbidrecognize_"
     plugin_order = 0
     auth_level = 1
 
-    # ---- 配置属性 ----
     _enabled = False
 
     def init_plugin(self, config: dict = None):
@@ -87,13 +83,13 @@ class TmdbIdRecognize(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "工作原理（模仿 Emby 刮削策略）：\n"
-                                            "1. 从文件名提取 {tmdbid=xxx}\n"
-                                            "2. 直接调 TMDB API 用 ID 查询精确的影片信息\n"
-                                            "3. 把 TMDB 返回的标准名称+年份告诉 MoviePilot\n"
-                                            "4. MoviePilot 拿着标准名称轻松匹配\n\n"
-                                            "支持格式：{tmdbid=23155}  {tmdb-23155}  [tmdbid:23155]\n"
-                                            "注意：仅在 MoviePilot 内置识别失败时触发。",
+                                            "text": "本插件通过 get_module 劫持 recognize_media，"
+                                            "在内置识别器运行之前拦截。\n\n"
+                                            "当文件名包含 {tmdbid=23155} 时：\n"
+                                            "→ 直接用 tmdbid 调 TMDB 底层模块\n"
+                                            "→ 跳过 MP 的文件名猜测（避免匹配到同名错误作品）\n\n"
+                                            "当文件名不含 tmdbid 时：\n"
+                                            "→ 完全不干涉，走 MP 默认识别流程",
                                         },
                                     }
                                 ],
@@ -107,19 +103,97 @@ class TmdbIdRecognize(_PluginBase):
         }
 
     # ==========================================================
-    #   核心：链式事件 —— 名称识别
-    #   只有 MP 内置识别器搞不定时才会触发
+    #   核心：get_module 劫持 recognize_media
+    #   在 MP 内置识别之前运行！不是事后补救！
+    # ==========================================================
+
+    def get_module(self) -> Dict[str, Any]:
+        """
+        劫持 recognize_media。
+        处理链执行顺序：插件方法 → 系统模块方法
+        - 返回非 None → 使用插件结果，系统模块不再执行
+        - 返回 None → 继续执行系统模块（默认识别流程）
+        """
+        if not self._enabled:
+            return {}
+        return {
+            "recognize_media": self._recognize_media,
+        }
+
+    def _recognize_media(self, meta, mtype=None, tmdbid=None, **kwargs):
+        """
+        劫持入口：
+        1. 已有 tmdbid 参数 → return None（不干涉）
+        2. 文件名无 {tmdbid=xxx} → return None（不干涉）
+        3. 文件名有 {tmdbid=xxx} → 直接调底层 TheMovieDbModule.recognize_media
+           带上 tmdbid 参数，跳过文件名猜测
+
+        注意：直接调底层模块，不经过 chain 层，所以不会递归！
+        """
+        if tmdbid:
+            return None
+
+        org_string = self._get_org_string(meta)
+        if not org_string:
+            return None
+
+        extracted_id = self._extract_tmdbid(org_string)
+        if not extracted_id:
+            return None
+
+        logger.info(
+            f"TMDB直通识别 - 拦截! 文件名含 tmdbid={extracted_id}，"
+            f"跳过内置识别，直接查 TMDB。原始: {org_string}"
+        )
+
+        # ====== 直接调用底层 TMDB 模块（不走 chain，无递归） ======
+        try:
+            from app.modules.themoviedb import TheMovieDbModule
+            tmdb_module = TheMovieDbModule()
+            result = tmdb_module.recognize_media(
+                meta=meta,
+                mtype=mtype,
+                tmdbid=extracted_id,
+                **kwargs
+            )
+            if result:
+                logger.info(
+                    f"TMDB直通识别 - 成功! tmdbid={extracted_id} → "
+                    f"{getattr(result, 'title', '?')} "
+                    f"({getattr(result, 'year', '?')})"
+                )
+                return result
+            else:
+                logger.warning(f"TMDB直通识别 - tmdbid={extracted_id} 底层模块返回空")
+                return None
+        except Exception as e:
+            logger.error(f"TMDB直通识别 - 底层模块调用失败: {e}，尝试备用方案")
+
+        # ====== 备用：通过 ModuleManager 找 TMDB 模块实例 ======
+        try:
+            from app.core.module import ModuleManager
+            for module in ModuleManager().get_modules("recognize_media"):
+                cls_name = module.__class__.__name__
+                if "themoviedb" in cls_name.lower() or "tmdb" in cls_name.lower():
+                    logger.info(f"TMDB直通识别 - 备用方案: 通过 {cls_name} 查询")
+                    result = module.recognize_media(
+                        meta=meta, mtype=mtype, tmdbid=extracted_id, **kwargs
+                    )
+                    if result:
+                        logger.info(f"TMDB直通识别 - 备用方案成功!")
+                        return result
+        except Exception as e2:
+            logger.error(f"TMDB直通识别 - 备用方案也失败: {e2}")
+
+        return None
+
+    # ==========================================================
+    #   兜底：NameRecognize 链式事件
+    #   万一 get_module 不生效（MP版本不支持），识别失败时还能补救
     # ==========================================================
 
     @eventmanager.register(ChainEventType.NameRecognize)
     def name_recognize(self, event: Event):
-        """
-        拦截名称识别链式事件。
-        策略：
-          1. 提取文件名中的 tmdbid
-          2. 用 tmdbid 直接调 TMDB API 拿到标准信息
-          3. 把标准名称+年份写回 event_data
-        """
         if not self._enabled:
             return
 
@@ -131,50 +205,24 @@ class TmdbIdRecognize(_PluginBase):
         if not title:
             return
 
-        # ---- Step 1: 提取 tmdbid ----
         tmdbid = self._extract_tmdbid(title)
         if not tmdbid:
-            # 没有 tmdbid 标签，做个基础全角转半角清洗
-            cleaned = self._normalize_and_clean(title)
-            if cleaned and cleaned != title:
-                name, year = self._split_name_year(cleaned)
-                if name:
-                    event_data["name"] = name
-                if year:
-                    event_data["year"] = year
             return
 
-        logger.info(f"TMDB直通识别 - 从文件名提取到 tmdbid={tmdbid}，原始: {title}")
+        logger.info(f"TMDB直通识别 [兜底事件] - 提取到 tmdbid={tmdbid}")
 
-        # ---- Step 2: 用 tmdbid 查 TMDB ----
-        tmdb_info = self._query_tmdb(tmdbid)
-
+        tmdb_info = self._query_tmdb_raw(tmdbid)
         if not tmdb_info:
-            logger.warning(f"TMDB直通识别 - tmdbid={tmdbid} 查 TMDB 失败，做基础清洗兜底")
-            cleaned = self._normalize_and_clean(title)
-            name, year = self._split_name_year(cleaned)
-            if name:
-                event_data["name"] = name
-            if year:
-                event_data["year"] = year
             return
 
-        # ---- Step 3: 从 TMDB 数据提取标准名称 + 年份 ----
-        tmdb_name = self._pick_best_title(tmdb_info)
-        tmdb_year = self._pick_year(tmdb_info)
+        name = self._pick_title(tmdb_info)
+        year = self._pick_year(tmdb_info)
 
-        logger.info(
-            f"TMDB直通识别 - TMDB 返回: "
-            f"name=「{tmdb_name}」, year={tmdb_year}"
-        )
+        if name:
+            event_data["name"] = name
+        if year:
+            event_data["year"] = year
 
-        # ---- Step 4: 写回 event_data ----
-        if tmdb_name:
-            event_data["name"] = tmdb_name
-        if tmdb_year:
-            event_data["year"] = tmdb_year
-
-        # 季/集信息从文件名提取（TMDB 查的是影片级别信息）
         season, episode = self._extract_season_episode(title)
         if season is not None:
             event_data["season"] = season
@@ -182,45 +230,23 @@ class TmdbIdRecognize(_PluginBase):
             event_data["episode"] = episode
 
     # ==========================================================
-    #   TMDB 查询
-    # ==========================================================
-
-    @staticmethod
-    def _query_tmdb(tmdbid: int) -> Optional[dict]:
-        """
-        通过 tmdbid 查询 TMDB，先查电影再查电视剧。
-        使用 MoviePilot 内置的 TmdbApi，自动走代理和缓存。
-        """
-        try:
-            from app.modules.themoviedb.tmdbapi import TmdbApi
-            tmdb = TmdbApi()
-
-            # 先查电影
-            info = tmdb.movie_detail(tmdbid)
-            if info and info.get("id"):
-                logger.debug(f"TMDB直通识别 - tmdbid={tmdbid} 匹配到电影")
-                return info
-
-            # 再查电视剧
-            info = tmdb.tv_detail(tmdbid)
-            if info and info.get("id"):
-                logger.debug(f"TMDB直通识别 - tmdbid={tmdbid} 匹配到电视剧")
-                return info
-
-            logger.warning(f"TMDB直通识别 - tmdbid={tmdbid} 在 TMDB 中未找到")
-            return None
-
-        except Exception as e:
-            logger.error(f"TMDB直通识别 - 查询 TMDB 异常: {e}")
-            return None
-
-    # ==========================================================
     #   工具函数
     # ==========================================================
 
     @staticmethod
+    def _get_org_string(meta) -> Optional[str]:
+        for attr in ["org_string", "_org_string", "title", "rev_string", "name"]:
+            val = getattr(meta, attr, None)
+            if val and isinstance(val, str) and len(val) > 2:
+                return val
+        try:
+            s = str(meta)
+            return s if s and len(s) > 3 else None
+        except Exception:
+            return None
+
+    @staticmethod
     def _extract_tmdbid(title: str) -> Optional[int]:
-        """从文件名提取 tmdbid"""
         for p in [r'[\{\[\(]tmdbid[=\-:\s]*(\d+)[\}\]\)]',
                    r'[\{\[\(]tmdb[=\-:\s]*(\d+)[\}\]\)]']:
             m = re.search(p, title, re.IGNORECASE)
@@ -229,24 +255,32 @@ class TmdbIdRecognize(_PluginBase):
         return None
 
     @staticmethod
-    def _pick_best_title(info: dict) -> Optional[str]:
-        """从 TMDB 数据中选最佳标题"""
-        return (
-            info.get("title")
-            or info.get("name")
-            or info.get("original_title")
-            or info.get("original_name")
-        )
+    def _query_tmdb_raw(tmdbid: int) -> Optional[dict]:
+        try:
+            from app.modules.themoviedb.tmdbapi import TmdbApi
+            tmdb = TmdbApi()
+            info = tmdb.movie_detail(tmdbid)
+            if info and info.get("id"):
+                return info
+            info = tmdb.tv_detail(tmdbid)
+            if info and info.get("id"):
+                return info
+            return None
+        except Exception as e:
+            logger.error(f"TMDB直通识别 - TmdbApi 异常: {e}")
+            return None
+
+    @staticmethod
+    def _pick_title(info: dict) -> Optional[str]:
+        return info.get("title") or info.get("name") or info.get("original_title") or info.get("original_name")
 
     @staticmethod
     def _pick_year(info: dict) -> Optional[str]:
-        """从 TMDB 数据中提取年份"""
         date = info.get("release_date") or info.get("first_air_date") or ""
         return date[:4] if len(date) >= 4 else None
 
     @staticmethod
     def _extract_season_episode(title: str) -> Tuple[Optional[int], Optional[int]]:
-        """从文件名提取季/集号"""
         season = episode = None
         m = re.search(r'[Ss](\d{1,3})[Ee](\d{1,4})', title)
         if m:
@@ -264,43 +298,3 @@ class TmdbIdRecognize(_PluginBase):
         if m and episode is None:
             episode = int(m.group(1))
         return season, episode
-
-    @staticmethod
-    def _normalize_and_clean(title: str) -> str:
-        """全角转半角 + 移除 tmdbid 标签"""
-        out = []
-        for ch in title:
-            c = ord(ch)
-            if c == 0x3000:
-                out.append(' ')
-            elif ch == '（':
-                out.append('(')
-            elif ch == '）':
-                out.append(')')
-            elif ch == '【':
-                out.append('[')
-            elif ch == '】':
-                out.append(']')
-            elif 0xFF01 <= c <= 0xFF5E:
-                out.append(chr(c - 0xFEE0))
-            else:
-                out.append(ch)
-        text = ''.join(out)
-        text = re.sub(r'[\{\[\(]tmdb(?:id)?[=\-:\s]*\d+[\}\]\)]', '', text, flags=re.IGNORECASE)
-        return re.sub(r'\s+', ' ', text).strip()
-
-    @staticmethod
-    def _split_name_year(title: str) -> Tuple[str, Optional[str]]:
-        """分离名称和年份"""
-        year = None
-        cleaned = title
-        for p in [r'\((\d{4})\)', r'\[(\d{4})\]',
-                   r'[\s._-]+(\d{4})(?=[\s._\-\[\]{}()$]|$)']:
-            m = re.search(p, cleaned)
-            if m:
-                y = int(m.group(1))
-                if 1900 <= y <= 2099:
-                    year = str(y)
-                    cleaned = (cleaned[:m.start()] + cleaned[m.end():]).strip()
-                    break
-        return cleaned, year
