@@ -1,6 +1,6 @@
 """
 影巢签到插件
-版本: 1.6.2
+版本: 1.6.3
 作者: madrays,sakezerto
 功能:
 - 支持选择每日签到或者赌狗签到
@@ -11,6 +11,7 @@
 - 默认使用代理访问
 
 修改记录:
+- v1.6.3: 移除get_state中的info日志，修复框架轮询导致日志刷屏的问题
 - v1.6.2: 修复插件更新后签到模式、用户名、密码丢失的问题（update_config全量覆盖时字段缺失）
 - v1.6.1: 更新了通知模板，修复冗余前缀并统一显示签到模式
 - v1.6.0: 修复了一些bug
@@ -49,7 +50,7 @@ class HdhiveSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.6.2"
+    plugin_version = "1.6.3"
     # 插件作者
     plugin_author = "madrays,sakezerto"
     # 作者主页
@@ -963,7 +964,6 @@ class HdhiveSign(_PluginBase):
         )
 
     def get_state(self) -> bool:
-        logger.info(f"hdhivesign状态: {self._enabled}")
         return self._enabled
 
     def get_service(self) -> List[Dict[str, Any]]:
