@@ -1,5 +1,5 @@
 """
-TMDB ID 直通识别插件 (V2)
+TMDB ID 直通识别插件
 
 模仿 Emby 刮削策略：
   文件名含 {tmdbid=23155} → 直接查 TMDB API → 拿到标准名称 + 年份 → 返回给 MP
@@ -23,10 +23,10 @@ class TmdbIdRecognize(_PluginBase):
     plugin_desc = "模仿 Emby 刮削策略，从文件名提取 {tmdbid=xxx} 直接查询 TMDB，精准识别媒体。"
     plugin_icon = "Themoviedb_A.png"
     plugin_version = "2.1"
-    plugin_author = "YourName"
-    author_url = "https://github.com/YourName"
+    plugin_author = "sakezerto"
+    author_url = "https://github.com/sakezerto"
     plugin_config_prefix = "tmdbidrecognize_"
-    plugin_order = 0       # 越小越先执行，抢在 ChatGPT 识别之前
+    plugin_order = 0
     auth_level = 1
 
     # ---- 配置属性 ----
@@ -91,7 +91,7 @@ class TmdbIdRecognize(_PluginBase):
                                             "1. 从文件名提取 {tmdbid=xxx}\n"
                                             "2. 直接调 TMDB API 用 ID 查询精确的影片信息\n"
                                             "3. 把 TMDB 返回的标准名称+年份告诉 MoviePilot\n"
-                                            "4. MoviePilot 拿着标准名称轻松匹配 ✅\n\n"
+                                            "4. MoviePilot 拿着标准名称轻松匹配\n\n"
                                             "支持格式：{tmdbid=23155}  {tmdb-23155}  [tmdbid:23155]\n"
                                             "注意：仅在 MoviePilot 内置识别失败时触发。",
                                         },
@@ -107,7 +107,7 @@ class TmdbIdRecognize(_PluginBase):
         }
 
     # ==========================================================
-    #   核心：V2 链式事件 —— 名称识别
+    #   核心：链式事件 —— 名称识别
     #   只有 MP 内置识别器搞不定时才会触发
     # ==========================================================
 
@@ -118,7 +118,7 @@ class TmdbIdRecognize(_PluginBase):
         策略：
           1. 提取文件名中的 tmdbid
           2. 用 tmdbid 直接调 TMDB API 拿到标准信息
-          3. 把标准名称+年份写回 event_data，MP 后续用它再走一遍匹配就能命中
+          3. 把标准名称+年份写回 event_data
         """
         if not self._enabled:
             return
@@ -134,7 +134,7 @@ class TmdbIdRecognize(_PluginBase):
         # ---- Step 1: 提取 tmdbid ----
         tmdbid = self._extract_tmdbid(title)
         if not tmdbid:
-            # 没有 tmdbid 标签，做个基础的全角转半角清洗就走
+            # 没有 tmdbid 标签，做个基础全角转半角清洗
             cleaned = self._normalize_and_clean(title)
             if cleaned and cleaned != title:
                 name, year = self._split_name_year(cleaned)
@@ -174,7 +174,7 @@ class TmdbIdRecognize(_PluginBase):
         if tmdb_year:
             event_data["year"] = tmdb_year
 
-        # 补充提取季/集（tmdb 查的是影片级别的信息，季集还是得从文件名来）
+        # 季/集信息从文件名提取（TMDB 查的是影片级别信息）
         season, episode = self._extract_season_episode(title)
         if season is not None:
             event_data["season"] = season
@@ -182,13 +182,13 @@ class TmdbIdRecognize(_PluginBase):
             event_data["episode"] = episode
 
     # ==========================================================
-    #   TMDB 查询 —— 用 MP 内置模块，复用代理/缓存/API Key
+    #   TMDB 查询
     # ==========================================================
 
     @staticmethod
     def _query_tmdb(tmdbid: int) -> Optional[dict]:
         """
-        通过 tmdbid 查询 TMDB，先查电影，再查电视剧。
+        通过 tmdbid 查询 TMDB，先查电影再查电视剧。
         使用 MoviePilot 内置的 TmdbApi，自动走代理和缓存。
         """
         try:
@@ -215,20 +215,14 @@ class TmdbIdRecognize(_PluginBase):
             return None
 
     # ==========================================================
-    #   文件名解析工具
+    #   工具函数
     # ==========================================================
 
     @staticmethod
     def _extract_tmdbid(title: str) -> Optional[int]:
-        """
-        从文件名中提取 tmdbid。
-        支持：{tmdbid=23155}  {tmdb-23155}  [tmdbid:23155]  (tmdbid=23155)
-        """
-        patterns = [
-            r'[\{\[\(]tmdbid[=\-:\s]*(\d+)[\}\]\)]',
-            r'[\{\[\(]tmdb[=\-:\s]*(\d+)[\}\]\)]',
-        ]
-        for p in patterns:
+        """从文件名提取 tmdbid"""
+        for p in [r'[\{\[\(]tmdbid[=\-:\s]*(\d+)[\}\]\)]',
+                   r'[\{\[\(]tmdb[=\-:\s]*(\d+)[\}\]\)]']:
             m = re.search(p, title, re.IGNORECASE)
             if m:
                 return int(m.group(1))
@@ -236,11 +230,7 @@ class TmdbIdRecognize(_PluginBase):
 
     @staticmethod
     def _pick_best_title(info: dict) -> Optional[str]:
-        """
-        从 TMDB 返回数据中选最佳标题。
-        zh-CN 请求返回的 title/name 就是中文（如果有的话）。
-        """
-        # 电影用 title，电视剧用 name
+        """从 TMDB 数据中选最佳标题"""
         return (
             info.get("title")
             or info.get("name")
@@ -250,45 +240,34 @@ class TmdbIdRecognize(_PluginBase):
 
     @staticmethod
     def _pick_year(info: dict) -> Optional[str]:
-        """从 TMDB 返回数据中提取年份"""
+        """从 TMDB 数据中提取年份"""
         date = info.get("release_date") or info.get("first_air_date") or ""
         return date[:4] if len(date) >= 4 else None
 
     @staticmethod
     def _extract_season_episode(title: str) -> Tuple[Optional[int], Optional[int]]:
-        """从文件名中提取季/集号"""
+        """从文件名提取季/集号"""
         season = episode = None
-
-        # S01E02
         m = re.search(r'[Ss](\d{1,3})[Ee](\d{1,4})', title)
         if m:
             return int(m.group(1)), int(m.group(2))
-
-        # 仅 S01
         m = re.search(r'[Ss](\d{1,3})(?!\d)', title)
         if m:
             season = int(m.group(1))
-
-        # 仅 E01 / EP01
         m = re.search(r'[Ee][Pp]?(\d{1,4})(?!\d)', title)
         if m:
             episode = int(m.group(1))
-
-        # 第X季 / 第X集
         m = re.search(r'第\s*(\d+)\s*季', title)
         if m and season is None:
             season = int(m.group(1))
         m = re.search(r'第\s*(\d+)\s*[集话話]', title)
         if m and episode is None:
             episode = int(m.group(1))
-
         return season, episode
 
     @staticmethod
     def _normalize_and_clean(title: str) -> str:
-        """
-        全角转半角 + 移除 {tmdbid=xxx} + 移除编码格式噪音
-        """
+        """全角转半角 + 移除 tmdbid 标签"""
         out = []
         for ch in title:
             c = ord(ch)
@@ -307,22 +286,12 @@ class TmdbIdRecognize(_PluginBase):
             else:
                 out.append(ch)
         text = ''.join(out)
-
-        # 移除 tmdbid 标签
         text = re.sub(r'[\{\[\(]tmdb(?:id)?[=\-:\s]*\d+[\}\]\)]', '', text, flags=re.IGNORECASE)
-        # 移除编码格式噪音
-        text = re.sub(
-            r'(?:1080[pPiI]|720[pPiI]|2160[pPiI]|4[kK]|REMUX|'
-            r'BluRay|BDRip|WEB-?DL|WEBRip|HDRip|HDTV|'
-            r'x26[45]|H\.?26[45]|HEVC|AVC|AAC|FLAC|DTS|AC3|'
-            r'10bit|HDR|Dolby|ATMOS)',
-            ' ', text, flags=re.IGNORECASE
-        )
         return re.sub(r'\s+', ' ', text).strip()
 
     @staticmethod
     def _split_name_year(title: str) -> Tuple[str, Optional[str]]:
-        """从清洗后的标题中分离名称和年份"""
+        """分离名称和年份"""
         year = None
         cleaned = title
         for p in [r'\((\d{4})\)', r'\[(\d{4})\]',
