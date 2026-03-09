@@ -1,11 +1,10 @@
 """
-TMDB ID 直通识别插件 v5.0
+TMDB ID 直通识别插件 v5.1
 
 当文件名包含 {tmdbid=xxx} 等标记时，直接用 ID 分别查询 TMDB 电影和电视剧，
 通过年份和标题消歧，彻底解决系统无法判断类型而放弃识别的问题。
 """
 import contextvars
-import re
 from contextlib import contextmanager
 from typing import Any, Optional, Dict, List, Tuple
 
@@ -20,7 +19,7 @@ class TmdbIdRecognize(_PluginBase):
     plugin_name = "TMDB ID 直通识别"
     plugin_desc = "从文件名提取 {tmdbid=xxx} 直接查询 TMDB，分别尝试电影/电视剧并自动消歧。"
     plugin_icon = "Themoviedb_A.png"
-    plugin_version = "5.0"
+    plugin_version = "5.1"
     plugin_author = "sakezerto"
     author_url = "https://github.com/sakezerto"
     plugin_config_prefix = "tmdbidrecognize_"
@@ -96,7 +95,7 @@ class TmdbIdRecognize(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "TMDB ID 直通识别 v5.0\n\n"
+                                            "text": "TMDB ID 直通识别 v5.1\n\n"
                                             "文件名含 {tmdbid=23155} 等标记时，"
                                             "分别以电影和电视剧类型查询 TMDB，"
                                             "再通过年份和标题自动消歧。\n\n"
@@ -142,12 +141,10 @@ class TmdbIdRecognize(_PluginBase):
         if not self._enabled:
             return None
 
-        # 获取 tmdbid：参数 > meta属性 > 正则提取
+        # 获取 tmdbid：参数 > meta属性
         target_id = tmdbid
         if not target_id and meta and meta.tmdbid:
             target_id = meta.tmdbid
-        if not target_id and meta and meta.title:
-            target_id = self._extract_tmdbid(meta.title)
         if not target_id:
             return None
 
@@ -155,10 +152,6 @@ class TmdbIdRecognize(_PluginBase):
         try:
             target_id = int(target_id)
         except (ValueError, TypeError):
-            return None
-
-        # 如果 mtype 已明确（电影或电视剧），直接让系统处理
-        if mtype and mtype != MediaType.UNKNOWN:
             return None
 
         logger.info(f"TMDB直通识别 - 拦截! tmdbid={target_id}，"
@@ -242,22 +235,3 @@ class TmdbIdRecognize(_PluginBase):
                      f"无法通过年份/标题消歧，默认使用电影")
         return movie_info
 
-    # ==========================================================
-    #   工具函数
-    # ==========================================================
-
-    @staticmethod
-    def _extract_tmdbid(title: str) -> Optional[int]:
-        """从任意字符串提取 tmdbid"""
-        if not title:
-            return None
-        for p in [
-            r'[\{\[\(]tmdbid[=\-:\s]*(\d+)[\}\]\)]',
-            r'[\{\[\(]tmdb[=\-:\s]*(\d+)[\}\]\)]',
-            r'tmdbid[=\-:\s]*(\d+)',
-            r'tmdb[=\-:\s]*(\d+)',
-        ]:
-            m = re.search(p, title, re.IGNORECASE)
-            if m:
-                return int(m.group(1))
-        return None
