@@ -23,14 +23,15 @@
   },
   "TmdbIdRecognize": {
     "name": "TMDB ID 直通识别",
-    "description": "模仿 Emby 刮削策略，从文件名提取 {tmdbid=xxx} 直接查询 TMDB，精准识别媒体。",
+    "description": "从文件名提取 {tmdbid=xxx} 直接查询 TMDB，分别尝试电影/电视剧并自动消歧。",
     "labels": "识别",
-    "version": "4.1",
+    "version": "5.0",
     "icon": "https://www.themoviedb.org/assets/2/v4/logos/v2/bl…ca9c88bafe5dcb6f8a62a4c6bc55cd9ba82bb2cd95f6c.svg",
     "author": "sakezerto",
     "level": 1,
     "v2": true,
     "history": {
+      "v5.0": "完全重写：修复 tmdbid 参数已被系统提取导致插件永不触发的致命问题；分别尝试电影和电视剧类型查询；通过年份和标题自动消歧",
       "v2.0": "重写：采用 Emby 策略，tmdbid 直查 TMDB，通过 get_module 劫持 recognize_media + NameRecognize 链式事件双重保障",
       "v1.0": "初始版本"
     }
