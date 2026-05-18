@@ -49,14 +49,27 @@ class Prescription():
         self._tag(site_name,"can_invite",value)
     def setMTBuyable(self,site_name,value):
         self._tag(site_name,"mt_buyable",value)
+    def setFailed(self,site_name,value):
+        self._tag(site_name,"error",value or "获取失败")
 
     def _export(self):
         med_list = []
+        failed_list = []
         total_remain = 0
         total_can_buy = 0
         
         for k in self._cache:
             site_name = k
+            site_error = self._cache[k].get('error')
+            if site_error:
+                failed_list.append({
+                    "site": site_name,
+                    "remain": 0,
+                    "can_buy": 0,
+                    "error": str(site_error)
+                })
+                continue
+
             site_remain = self._cache[k].get('p', 0) + self._cache[k].get('t', 0)
             # 合并普通可购买和MT可购买的数量
             site_can_buy = 0 
@@ -65,12 +78,12 @@ class Prescription():
             if 'mt_buyable' in self._cache[k]:
                 site_can_buy += self._cache[k].get("mt_buyable", 0)
             
-            if (site_remain + site_can_buy > 0 and 
-                self._cache[k].get('can_invite', False)):
+            if site_remain + site_can_buy > 0:
                 site_content = {
                     "site": site_name,
                     "remain": site_remain,
-                    "can_buy": site_can_buy
+                    "can_buy": site_can_buy,
+                    "error": ""
                 }
                 med_list.append(site_content)
                 total_remain += site_remain
@@ -79,10 +92,24 @@ class Prescription():
         return {
             "total": {
                 "remain": total_remain,
-                "can_buy": total_can_buy
+                "can_buy": total_can_buy,
+                "failed": len(failed_list)
             },
-            "details": sorted(med_list, key=lambda x: (-x['remain'], -x['can_buy'], x['site']))
+            "details": (
+                sorted(med_list, key=lambda x: (-x['remain'], -x['can_buy'], x['site'])) +
+                sorted(failed_list, key=lambda x: x['site'])
+            )
         }
+
+    def getExportText(self):
+        med_data = self._export()
+        med_text = ""
+        for site in med_data["details"]:
+            if site.get("error"):
+                med_text += f"站点[{site['site']}]: 获取失败[{site['error']}]\r\n"
+            else:
+                med_text += f"站点[{site['site']}]: 剩余[{site['remain']}]个. 可购买[{site['can_buy']}]个\r\n"
+        return med_text
     
     def getComponent(self):
         med_data = self._export()
@@ -90,9 +117,7 @@ class Prescription():
             return None
             
         # 生成药单内容字符串 - 保持统一的格式
-        med_text = ""
-        for site in med_data["details"]:
-            med_text += f"站点[{site['site']}]: 剩余[{site['remain']}]个. 可购买[{site['can_buy']}]个\r\n"
+        med_text = self.getExportText()
             
         # 使用 json.dumps 来安全地将 Python 字符串嵌入 JS 字符串
         js_safe_med_text = json.dumps(med_text)
@@ -295,11 +320,11 @@ class Prescription():
                                                                         },
                                                                         {
                                                                             "component": "td",
-                                                                            "text": str(site["remain"])
+                                                                            "text": "获取失败" if site.get("error") else str(site["remain"])
                                                                         },
                                                                         {
                                                                             "component": "td",
-                                                                            "text": str(site["can_buy"])
+                                                                            "text": site.get("error") or str(site["can_buy"])
                                                                         }
                                                                     ]
                                                                 } for site in med_data["details"]
@@ -336,6 +361,38 @@ def get_nested_value(data_dict: dict, key_path: List[str], default: Any = None) 
     return get_nested_value(next_dict, key_path[1:], default)
 
 
+def get_site_error(cache: dict) -> str:
+    """
+    从缓存包装或站点数据中提取刷新失败信息。
+    """
+    if not cache or not isinstance(cache, dict):
+        return ""
+
+    candidates = [cache]
+    data = cache.get("data", {})
+    if isinstance(data, dict):
+        candidates.append(data)
+        nested_data = data.get("data", {})
+        if isinstance(nested_data, dict):
+            candidates.append(nested_data)
+
+    for candidate in candidates:
+        for key in ("error", "fetch_error"):
+            error = candidate.get(key)
+            if error:
+                return str(error)
+
+        if candidate.get("fetch_failed"):
+            invite_status = candidate.get("invite_status", {})
+            if isinstance(invite_status, dict):
+                reason = invite_status.get("reason")
+                if reason:
+                    return str(reason)
+            return "获取失败"
+
+    return ""
+
+
 class nexusinvitee(_PluginBase):
     # 插件名称
     plugin_name = "后宫管理系统"
@@ -344,7 +401,7 @@ class nexusinvitee(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nexusinvitee.png"
     # 插件版本
-    plugin_version = "1.2.6"
+    plugin_version = "1.2.7"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -1110,6 +1167,8 @@ class nexusinvitee(_PluginBase):
         
         
         try:
+            self.presc = Prescription()
+
             # 从data_manager获取站点数据
             cached_data = {}
             site_data = self.data_manager.get_site_data()
@@ -1463,8 +1522,12 @@ class nexusinvitee(_PluginBase):
                 total_perm_invites += invite_status.get("permanent_count", 0)
                 total_temp_invites += invite_status.get("temporary_count", 0)
                 # 向药单打标临药永药
-                self.presc.setP(site_name,invite_status.get("permanent_count", 0))
-                self.presc.setT(site_name,invite_status.get("temporary_count", 0))
+                site_error = get_site_error(cache)
+                if site_error:
+                    self.presc.setFailed(site_name, site_error)
+                else:
+                    self.presc.setP(site_name,invite_status.get("permanent_count", 0))
+                    self.presc.setT(site_name,invite_status.get("temporary_count", 0))
 
 
             # 添加全局统计信息
@@ -2081,7 +2144,7 @@ class nexusinvitee(_PluginBase):
 
                     # 添加错误信息或不可邀请原因的显示部分
                     # 获取错误信息和不可邀请原因
-                    error_message = cache.get("error", "")
+                    error_message = get_site_error(cache)
                     
                     # 使用辅助函数检查不同路径的invite_status
                     invite_status_for_check = invite_status  # 使用上面已获取的invite_status
@@ -3660,6 +3723,19 @@ class nexusinvitee(_PluginBase):
                                    f"临时邀请:{old_status.get('temporary_count', 0)}个")
                     else:
                         logger.info(f"站点 {site_name} 无旧数据可保留")
+
+                    failed_site_data = dict(old_data) if isinstance(old_data, dict) else {}
+                    failed_status = failed_site_data.get("invite_status", {})
+                    failed_status = dict(failed_status) if isinstance(failed_status, dict) else {}
+                    failed_status.update({
+                        "can_invite": False,
+                        "reason": error_msg
+                    })
+                    failed_site_data["invite_status"] = failed_status
+                    failed_site_data.setdefault("invitees", old_data.get("invitees", []) if isinstance(old_data, dict) else [])
+                    failed_site_data["error"] = error_msg
+                    failed_site_data["fetch_failed"] = True
+                    self.data_manager.update_site_data(site_name, failed_site_data)
                 else:
                     # 成功逻辑 (保持不变)
                     invite_status = site_data.get("invite_status", {})
@@ -3907,4 +3983,4 @@ class nexusinvitee(_PluginBase):
 
 
 # 插件类导出
-plugin_class = nexusinvitee 
+plugin_class = nexusinvitee

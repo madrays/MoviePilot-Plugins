@@ -300,7 +300,8 @@ class NexusPhpHandler(_ISiteHandler):
                     send_can_invite = send_page_result["invite_status"].get("can_invite")
                     # (logic to update status based on send_page_result kept exactly as before) ...
                     if send_reason:
-                        if "数量不足" in send_reason:
+                        if ("数量不足" in send_reason or "名额不足" in send_reason or
+                                "没有剩余邀请" in send_reason or "没有足够的邀请" in send_reason):
                             # 特殊处理："数量不足"说明可以发药但当前没有名额
                             result["invite_status"]["can_invite"] = True
                             result["invite_status"]["reason"] = send_reason
@@ -528,9 +529,10 @@ class NexusPhpHandler(_ISiteHandler):
                 # 如果没找到，再检查是否有邀请页面特有的错误信息
                 if not disabled_submit:
                     # 检查是否有"你没有剩余邀请名额"这样的文本
-                    no_invite_text = soup.find(text=lambda t: t and ('没有剩余邀请名额' in t or '邀请数量不足' in t))
+                    no_invite_text = soup.find(string=lambda t: t and ('没有剩余邀请名额' in t or '邀请数量不足' in t))
                     if no_invite_text:
-                        invite_reason = "没有剩余邀请名额"
+                        can_invite = True
+                        invite_reason = "可以发送邀请，但当前邀请数量不足"
                         logger.debug(f"站点 {site_name} 发现不可用邀请原因: {invite_reason}")
             
             # 3. 检查页面中的"对不起"错误提示信息
@@ -655,7 +657,8 @@ class NexusPhpHandler(_ISiteHandler):
                         if ('对不起' in div_text or 'Sorry' in div_text or '只有' in div_text or 
                             '账户上限' in div_text or '上限数已到' in div_text):
                             # 提取完整错误信息
-                            if "数量不足" in div_text or "名额不足" in div_text:
+                            if ("数量不足" in div_text or "名额不足" in div_text or
+                                    "没有剩余邀请" in div_text or "没有足够的邀请" in div_text):
                                 # 特殊处理："邀请数量不足"表示可以发药但当前无名额
                                 can_invite = True 
                                 invite_reason = "可以发送邀请，但当前邀请数量不足"
@@ -1565,4 +1568,4 @@ class NexusPhpHandler(_ISiteHandler):
             return True
         except (ValueError, TypeError):
             # 转换失败时也返回True，避免误判
-            return True 
+            return True
