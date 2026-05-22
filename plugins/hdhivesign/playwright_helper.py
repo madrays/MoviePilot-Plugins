@@ -18,15 +18,19 @@ from urllib.parse import unquote, urlparse
 from httpx import Client
 import orjson
 
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    Response,
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-)
+try:
+    from cloakbrowser import launch_context as cloak_launch_context
+except Exception:
+    cloak_launch_context = None
+
+try:
+    from playwright.sync_api import (
+        TimeoutError as PlaywrightTimeoutError,
+        sync_playwright,
+    )
+except Exception:
+    PlaywrightTimeoutError = TimeoutError
+    sync_playwright = None
 
 from app.core.config import settings
 
@@ -165,11 +169,41 @@ class HDHivePlaywrightClient:
             kwargs["proxy"] = proxy
         return kwargs
 
+    @staticmethod
+    def _cloakbrowser_launch_kwargs(
+        headless: bool, proxy: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {
+            "headless": headless,
+            "user_agent": HDHivePlaywrightClient._build_ua(),
+            "humanize": getattr(settings, "CLOAKBROWSER_HUMANIZE", True),
+            "human_preset": getattr(settings, "CLOAKBROWSER_HUMAN_PRESET", "default"),
+            "viewport": {"width": 1280, "height": 720},
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+        return kwargs
+
+    @staticmethod
+    def _use_cloakbrowser() -> bool:
+        return cloak_launch_context is not None
+
     def _make_context(
         self,
-        pw: Playwright,
+        pw: Any,
         proxy: Optional[Dict[str, str]] = None,
-    ) -> tuple[Browser, BrowserContext]:
+    ) -> tuple[Any, Any]:
+        if HDHivePlaywrightClient._use_cloakbrowser():
+            context = cloak_launch_context(
+                **HDHivePlaywrightClient._cloakbrowser_launch_kwargs(
+                    self._headless, proxy
+                )
+            )
+            return context, context
+
+        if sync_playwright is None:
+            raise HDHiveLoginError("当前环境缺少 CloakBrowser 或 Playwright 依赖")
+
         browser = pw.chromium.launch(
             **HDHivePlaywrightClient._chromium_launch_kwargs(self._headless, proxy),
         )
@@ -195,7 +229,7 @@ class HDHivePlaywrightClient:
             return None
         found_hash: list[str] = []
 
-        def on_response(response: Response) -> None:
+        def on_response(response: Any) -> None:
             if found_hash:
                 return
             url = response.url
@@ -216,21 +250,15 @@ class HDHivePlaywrightClient:
             cookies = HDHivePlaywrightClient._parse_cookie_str(self._cookie_str)
             domain = self.base_url.replace("https://", "").replace("http://", "")
 
-            with sync_playwright() as p:
+            with HDHivePlaywrightClient._browser_runtime() as p:
                 with HDHivePlaywrightClient._socks5_slippers_if_needed() as slip:
                     proxy = (
                         slip
                         if slip is not None
                         else HDHivePlaywrightClient._playwright_proxy_settings()
                     )
-                    kwargs = HDHivePlaywrightClient._chromium_launch_kwargs(
-                        self._headless, proxy
-                    )
-                    browser = p.chromium.launch(**kwargs)
+                    browser, context = self._make_context(p, proxy)
                     try:
-                        context = browser.new_context(
-                            user_agent=HDHivePlaywrightClient._build_ua(),
-                        )
                         for name, value in cookies.items():
                             context.add_cookies(
                                 [
@@ -254,6 +282,7 @@ class HDHivePlaywrightClient:
 
     @staticmethod
     def _checkin_parse_rsc_result(text: str) -> Optional[Dict[str, Any]]:
+        redirected_to_login = False
         for line in text.splitlines():
             m = re.match(r"^\d+:(\{.*\})\s*$", line)
             if not m:
@@ -264,11 +293,25 @@ class HDHivePlaywrightClient:
                 continue
             if not isinstance(obj, dict):
                 continue
-            if set(obj.keys()) <= {"a", "f", "b", "q", "i"}:
+            obj_keys = set(obj.keys())
+            if obj_keys <= {"a", "f", "b", "q", "i", "S"}:
+                if "login" in str(obj):
+                    redirected_to_login = True
+                continue
+            if "f" in obj and not any(
+                key in obj for key in ("error", "response", "success", "message", "description")
+            ):
+                if "login" in str(obj):
+                    redirected_to_login = True
                 continue
             if "error" in obj and isinstance(obj["error"], dict):
                 return obj["error"]
             return obj
+        if redirected_to_login:
+            return {
+                "success": False,
+                "message": "认证失效或 Cookie 无效，签到请求被站点重定向到登录页",
+            }
         return None
 
     @staticmethod
@@ -280,7 +323,7 @@ class HDHivePlaywrightClient:
 
     def _fill_and_submit(
         self,
-        page: Page,
+        page: Any,
         username: str,
         password: str,
     ) -> bool:
@@ -416,7 +459,7 @@ class HDHivePlaywrightClient:
             raise HDHiveLoginError("必须传入用户名和密码")
 
         try:
-            with sync_playwright() as p:
+            with HDHivePlaywrightClient._browser_runtime() as p:
                 with HDHivePlaywrightClient._socks5_slippers_if_needed() as slip:
                     proxy = (
                         slip
@@ -451,3 +494,14 @@ class HDHivePlaywrightClient:
         except Exception as e:
             raise HDHiveLoginError(f"登录失败: {e}") from e
         return None
+
+    @staticmethod
+    @contextmanager
+    def _browser_runtime() -> Iterator[Optional[Any]]:
+        if HDHivePlaywrightClient._use_cloakbrowser():
+            yield None
+            return
+        if sync_playwright is None:
+            raise HDHiveLoginError("当前环境缺少 CloakBrowser 或 Playwright 依赖")
+        with sync_playwright() as p:
+            yield p

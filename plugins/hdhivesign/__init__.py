@@ -1,14 +1,15 @@
 """
 影巢签到插件
-版本: 1.4.0
+版本: 1.5.0
 作者: madrays
 功能:
 - 自动完成影巢(HDHive)每日签到
-- 支持使用用户名密码依托 Playwright 以规避最新的指纹校验
+- 支持使用用户名密码依托 CloakBrowser/Playwright 以规避最新的指纹校验
 - 支持签到失败自动进行环境重制与鉴权
 - 提供详细签到信息和赌狗签到模式
 
 修改记录:
+- v1.5.0: 适配 MoviePilot v2.12.0 CloakBrowser 内核，优先复用新浏览器缓存目录并兼容旧版 Playwright
 - v1.4.0: 全面重构底层签到与接口通讯，采用内置无头浏览器规避 Next.js 站点保护；修复配置项遗失；修正无头像时的缺省展示方案
 - v1.3.0: 优化用户信息抓取机制，修复多项问题
 - v1.1.0: 域名改为可配置，统一API拼接(Referer/Origin/接口)，精简日志
@@ -52,7 +53,7 @@ class HdhiveSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/hdhive.ico"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -383,7 +384,7 @@ class HdhiveSign(_PluginBase):
                 logger.error(f"影巢签到失败: {message}")
 
                 # 检测鉴权失败，尝试自动登录刷新 Cookie 后重试一次
-                if any(k in (message or "") for k in ["未配置Cookie", "缺少'token'", "未授权", "Unauthorized", "token", "csrf", "登录已过期", "过期", "expired"]):
+                if any(k in (message or "") for k in ["未配置Cookie", "缺少'token'", "未授权", "Unauthorized", "token", "csrf", "登录已过期", "过期", "expired", "认证失效", "Cookie 无效", "登录页", "重定向到登录页"]):
                     logger.info("检测到Cookie或鉴权问题，尝试自动登录刷新Cookie后重试一次")
                     new_cookie = self._auto_login()
                     if new_cookie:
@@ -496,7 +497,7 @@ class HdhiveSign(_PluginBase):
                 return False, "未配置Cookie"
             
             if HDHivePlaywrightClient is None:
-                return False, f"底层依赖加载失败，请确保 MoviePilot 环境正常并在后台安装了插件依赖。错误信息: {IMPORT_ERROR}"
+                return False, f"底层浏览器依赖加载失败，请确保 MoviePilot 环境正常并在后台安装了插件依赖。错误信息: {IMPORT_ERROR}"
                 
             client = HDHivePlaywrightClient(base_url=self._base_url, headless=True)
             success, message = client.checkin(cookie_str=self._cookie, gamble=getattr(self, "_gamble", False))
@@ -1151,7 +1152,8 @@ class HdhiveSign(_PluginBase):
 
         history_rows = []
         for history in historys:
-            status = history.get("status", "未知")
+            status = str(history.get("status", "未知"))
+            message = str(history.get('message', '—'))
             if "成功" in status or "已签到" in status:
                 status_color = "success"
             elif "失败" in status:
@@ -1165,13 +1167,46 @@ class HdhiveSign(_PluginBase):
                     {'component': 'td', 'props': {'class': 'text-caption'}, 'text': history.get("date", "")},
                     {
                         'component': 'td',
+                        'props': {
+                            'title': status,
+                            'style': 'width: 220px; max-width: 220px; overflow: hidden;'
+                        },
                         'content': [{
                             'component': 'VChip',
-                            'props': {'color': status_color, 'size': 'small', 'variant': 'outlined'},
-                            'text': status
+                            'props': {
+                                'color': status_color,
+                                'size': 'small',
+                                'variant': 'outlined',
+                                'class': 'text-truncate',
+                                'style': 'max-width: 100%;'
+                            },
+                            'content': [{
+                                'component': 'span',
+                                'props': {
+                                    'class': 'text-truncate d-inline-block',
+                                    'style': 'max-width: 190px;',
+                                    'title': status
+                                },
+                                'text': status
+                            }]
                         }]
                     },
-                    {'component': 'td', 'text': history.get('message', '—')},
+                    {
+                        'component': 'td',
+                        'props': {
+                            'title': message,
+                            'style': 'max-width: 360px; overflow: hidden;'
+                        },
+                        'content': [{
+                            'component': 'span',
+                            'props': {
+                                'class': 'text-truncate d-inline-block',
+                                'style': 'max-width: 340px; vertical-align: middle;',
+                                'title': message
+                            },
+                            'text': message
+                        }]
+                    },
                     {'component': 'td', 'text': str(history.get('points', '—'))},
                     {'component': 'td', 'text': str(history.get('days', '—'))},
                 ]
@@ -1194,8 +1229,8 @@ class HdhiveSign(_PluginBase):
                                     'component': 'tr',
                                     'content': [
                                         {'component': 'th', 'text': '时间'},
-                                        {'component': 'th', 'text': '状态'},
-                                        {'component': 'th', 'text': '详情'},
+                                        {'component': 'th', 'props': {'style': 'width: 220px; max-width: 220px;'}, 'text': '状态'},
+                                        {'component': 'th', 'props': {'style': 'max-width: 360px;'}, 'text': '详情'},
                                         {'component': 'th', 'text': '奖励积分'},
                                         {'component': 'th', 'text': '连续天数'}
                                     ]
@@ -1306,19 +1341,19 @@ class HdhiveSign(_PluginBase):
                 return None
             
             if HDHivePlaywrightClient is None:
-                logger.error(f"无法执行自动登录，缺少 Playwright 依赖或加载失败。内部错误: {IMPORT_ERROR}")
+                logger.error(f"无法执行自动登录，缺少 CloakBrowser/Playwright 依赖或加载失败。内部错误: {IMPORT_ERROR}")
                 return None
                 
-            logger.info("采用 Playwright 执行真实无头浏览器登录...")
+            logger.info("采用 CloakBrowser/Playwright 执行真实无头浏览器登录...")
             try:
                 client = HDHivePlaywrightClient(base_url=self._base_url, headless=True)
                 result = client.login(username=getattr(self, "_username", ""), password=getattr(self, "_password", ""))
                 if result:
                     cookie_str, _ = result
-                    logger.info("Playwright 登录成功，已重新生成 Cookie")
+                    logger.info("CloakBrowser/Playwright 登录成功，已重新生成 Cookie")
                     return cookie_str
             except Exception as e:
-                logger.error(f"Playwright 登录异常: {e}")
+                logger.error(f"CloakBrowser/Playwright 登录异常: {e}")
                 
             logger.error("自动登录失败，未获取到有效Cookie")
             return None
