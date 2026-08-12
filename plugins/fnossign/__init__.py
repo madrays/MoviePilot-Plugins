@@ -1,6 +1,6 @@
 """
 飞牛论坛签到插件
-版本: 2.5.4
+版本: 2.5.7
 作者: madrays
 功能:
 - 自动完成飞牛论坛每日签到
@@ -15,6 +15,7 @@
 import time
 import requests
 import re
+from html import unescape
 from datetime import datetime, timedelta
 
 import pytz
@@ -28,6 +29,13 @@ from app.log import logger
 from app.schemas import NotificationType
 from concurrent.futures import ThreadPoolExecutor
 
+try:
+    # MoviePilot v2.12+ 内置。此处只用于执行 ESA 的普通 JS Challenge，
+    # 不会尝试处理需要人工操作的滑块验证。
+    from cloakbrowser import launch_context as cloak_launch_context
+except Exception:
+    cloak_launch_context = None
+
 
 class fnossign(_PluginBase):
     # 插件名称
@@ -37,7 +45,7 @@ class fnossign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fnos.ico"
     # 插件版本
-    plugin_version = "2.5.4"
+    plugin_version = "2.5.7"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -54,6 +62,7 @@ class fnossign(_PluginBase):
     _cookie = None
     _notify = False
     _onlyonce = False
+    _log_profile_once = False
     _cron = None
     _max_retries = 3  # 最大重试次数
     _retry_interval = 30  # 重试间隔(秒)
@@ -75,6 +84,7 @@ class fnossign(_PluginBase):
                 self._notify = config.get("notify")
                 self._cron = config.get("cron")
                 self._onlyonce = config.get("onlyonce")
+                self._log_profile_once = config.get("log_profile_once", False)
                 self._max_retries = int(config.get("max_retries", 3))
                 self._retry_interval = int(config.get("retry_interval", 30))
                 self._history_days = int(config.get("history_days", 30))
@@ -83,17 +93,32 @@ class fnossign(_PluginBase):
             # 清理所有可能的延长重试任务
             self._clear_extended_retry_tasks()
             
+            if self._onlyonce or self._log_profile_once:
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+
             if self._onlyonce:
                 logger.info("执行一次性签到")
-                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
                 self._manual_trigger = True
                 self._scheduler.add_job(func=self.sign, trigger='date',
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                     name="飞牛论坛签到")
                 self._onlyonce = False
+
+            if self._log_profile_once:
+                logger.info("执行一次性用户信息输出")
+                self._scheduler.add_job(
+                    func=self._log_user_info,
+                    trigger='date',
+                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                    name="飞牛论坛用户信息输出"
+                )
+                self._log_profile_once = False
+
+            if self._scheduler and self._scheduler.get_jobs():
                 self.update_config({
-                    "onlyonce": False,
                     "enabled": self._enabled,
+                    "onlyonce": self._onlyonce,
+                    "log_profile_once": self._log_profile_once,
                     "cookie": self._cookie,
                     "notify": self._notify,
                     "cron": self._cron,
@@ -103,9 +128,8 @@ class fnossign(_PluginBase):
                 })
 
                 # 启动任务
-                if self._scheduler.get_jobs():
-                    self._scheduler.print_jobs()
-                    self._scheduler.start()
+                self._scheduler.print_jobs()
+                self._scheduler.start()
 
         except Exception as e:
             logger.error(f"fnossign初始化错误: {str(e)}", exc_info=True)
@@ -302,22 +326,32 @@ class fnossign(_PluginBase):
             session.mount('http://', adapter)
             session.mount('https://', adapter)
             
-            # 验证Cookie是否有效 - 增加超时保护
-            cookie_valid = False
+            # 验证 Cookie 是否有效；ESA 挑战不能再被误判为 Cookie 失效。
+            cookie_check = "invalid"
             try:
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     # 使用Future和超时机制
                     future = executor.submit(self._check_cookie_valid, session)
                     try:
-                        cookie_valid = future.result(timeout=15)  # 15秒超时
+                        cookie_check = future.result(timeout=15)  # 15秒超时
                     except TimeoutError:
                         logger.error("检查Cookie有效性超时")
-                        cookie_valid = False
+                        cookie_check = "invalid"
             except Exception as e:
                 logger.error(f"检查Cookie时出现异常: {str(e)}")
-                cookie_valid = False
+                cookie_check = "invalid"
             
-            if not cookie_valid:
+            if cookie_check == "js_challenge":
+                browser_result = self._pass_esa_js_challenge(session)
+                if browser_result == "passed":
+                    cookie_check = self._check_cookie_valid(session)
+                else:
+                    cookie_check = browser_result
+
+            if cookie_check != "valid":
+                if cookie_check in ("slider_challenge", "js_challenge", "browser_unavailable", "browser_failed"):
+                    return self._stop_for_forum_verification(cookie_check)
+
                 sign_dict = {
                     "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
                     "status": "签到失败: Cookie无效或已过期",
@@ -539,6 +573,18 @@ class fnossign(_PluginBase):
                     )
                     notification_sent = True
                 return sign_dict
+
+            challenge = self._classify_esa_challenge(html_content)
+            if challenge == "js_challenge":
+                browser_result = self._pass_esa_js_challenge(session)
+                if browser_result == "passed":
+                    response = session.get(sign_page_url, timeout=(3, 10))
+                    html_content = response.text
+                    challenge = self._classify_esa_challenge(html_content)
+                else:
+                    challenge = browser_result
+            if challenge:
+                return self._stop_for_forum_verification(challenge)
             
             # 检查是否已经签到
             if "您今天已经打过卡了" in html_content:
@@ -688,6 +734,18 @@ class fnossign(_PluginBase):
             
             response = session.get(sign_url, timeout=(5, 15))
             html_content = response.text
+
+            challenge = self._classify_esa_challenge(html_content)
+            if challenge == "js_challenge":
+                browser_result = self._pass_esa_js_challenge(session)
+                if browser_result == "passed":
+                    response = session.get(sign_url, timeout=(5, 15))
+                    html_content = response.text
+                    challenge = self._classify_esa_challenge(html_content)
+                else:
+                    challenge = browser_result
+            if challenge:
+                return self._stop_for_forum_verification(challenge)
             
             # 储存响应以便调试
             debug_resp = html_content[:500]
@@ -1060,6 +1118,128 @@ class fnossign(_PluginBase):
             logger.error(f"获取积分信息失败: {str(e)}", exc_info=True)
             return {}  # 返回空字典，表示获取失败
 
+    def _log_user_info(self):
+        """读取账号资料，并将允许的账号找回信息输出到日志。"""
+        logger.info("============= 开始获取飞牛论坛用户信息 =============")
+        if not self._cookie:
+            logger.error("获取用户信息失败：未配置Cookie")
+            return
+
+        session = requests.Session()
+        try:
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9",
+                "Referer": "https://club.fnnas.com/"
+            })
+            session.cookies.update(self._extract_required_cookies(self._cookie))
+
+            profile_response = session.get(
+                "https://club.fnnas.com/home.php?mod=spacecp&ac=profile",
+                timeout=(5, 15)
+            )
+            password_response = session.get(
+                "https://club.fnnas.com/home.php?mod=spacecp&ac=profile&op=password",
+                timeout=(5, 15)
+            )
+            profile_response.raise_for_status()
+            password_response.raise_for_status()
+
+            combined_html = profile_response.text + password_response.text
+            if (
+                "您需要先登录才能继续本操作" in combined_html
+                or "请先登录后才能继续浏览" in combined_html
+            ):
+                logger.error("获取用户信息失败：Cookie无效或已过期")
+                return
+
+            username = (
+                self._extract_input_value(profile_response.text, "username")
+                or self._extract_labeled_value(profile_response.text, "用户名")
+            )
+            uid_match = re.search(
+                r'home\.php\?mod=space(?:&amp;|&)uid=(\d+)',
+                profile_response.text,
+                re.IGNORECASE
+            )
+            if not uid_match:
+                uid_match = re.search(
+                    r"\bdiscuz_uid\s*=\s*['\"](\d+)['\"]",
+                    profile_response.text,
+                    re.IGNORECASE
+            )
+            uid = uid_match.group(1) if uid_match else ""
+
+            email = self._extract_input_value(password_response.text, "emailnew")
+            phone_prefix = self._extract_input_value(
+                password_response.text,
+                "secmobiccnew"
+            )
+            phone = self._extract_input_value(
+                password_response.text,
+                "secmobilenew"
+            )
+
+            display_phone = phone
+            if phone and phone_prefix:
+                display_phone = f"+{phone_prefix} {phone}"
+
+            logger.info("============= 飞牛论坛用户信息 =============")
+            logger.info(f"用户名: {username or '未获取到'}")
+            logger.info(f"用户UID: {uid or '未获取到'}")
+            logger.info(f"邮箱: {email or '未获取到'}")
+            logger.info(f"手机号: {display_phone or '未获取到'}")
+            logger.info("============= 用户信息输出完成 =============")
+        except requests.RequestException as e:
+            logger.error(f"获取用户信息网络错误: {str(e)}")
+        except Exception as e:
+            logger.error(f"获取用户信息失败: {str(e)}", exc_info=True)
+        finally:
+            session.close()
+
+    @staticmethod
+    def _extract_input_value(html_content, field_name):
+        """按明确的字段名读取输入框，避免接触密码等无关字段。"""
+        input_match = re.search(
+            rf'<input\b(?=[^>]*\bname=["\']{re.escape(field_name)}["\'])[^>]*>',
+            html_content,
+            re.IGNORECASE | re.DOTALL
+        )
+        if not input_match:
+            return ""
+        value_match = re.search(
+            r'\bvalue=(["\'])(.*?)\1',
+            input_match.group(0),
+            re.IGNORECASE | re.DOTALL
+        )
+        return unescape(value_match.group(2)).strip() if value_match else ""
+
+    @staticmethod
+    def _extract_labeled_value(html_content, label):
+        """从“表头标签 + 单元格值”的Discuz资料行中读取文本。"""
+        value_match = re.search(
+            rf"<th\b[^>]*>(?:(?!</th>).)*?{re.escape(label)}"
+            rf"(?:(?!</th>).)*?</th>\s*<td\b[^>]*>(.*?)</td>",
+            html_content,
+            re.IGNORECASE | re.DOTALL
+        )
+        if not value_match:
+            return ""
+
+        value_html = re.sub(
+            r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>",
+            "",
+            value_match.group(1),
+            flags=re.IGNORECASE | re.DOTALL
+        )
+        value = unescape(re.sub(r"<[^>]+>", "", value_html))
+        return re.sub(r"\s+", " ", value).strip()
+
     def _save_sign_history(self, sign_data):
         """
         保存签到历史记录
@@ -1232,7 +1412,7 @@ class fnossign(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -1248,7 +1428,7 @@ class fnossign(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -1264,7 +1444,7 @@ class fnossign(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 4
+                                    'md': 3
                                 },
                                 'content': [
                                     {
@@ -1272,6 +1452,22 @@ class fnossign(_PluginBase):
                                         'props': {
                                             'model': 'onlyonce',
                                             'label': '立即运行一次',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'log_profile_once',
+                                            'label': '输出用户信息一次',
                                         }
                                     }
                                 ]
@@ -1388,7 +1584,7 @@ class fnossign(_PluginBase):
                                                                     'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '【使用教程】\n1. 登录飞牛论坛网站，按F12打开开发者工具\n2. 在"网络"或"应用"选项卡中复制Cookie\n3. 粘贴Cookie到上方输入框\n4. 设置签到时间，建议早上8点(0 8 * * *)\n5. 启用插件并保存\n\n开启通知可在签到后收到结果通知，也可随时查看签到历史页面'
+                                            'text': '【使用教程】\n1. 登录飞牛论坛网站，按F12打开开发者工具\n2. 在"网络"或"应用"选项卡中复制Cookie\n3. 粘贴Cookie到上方输入框\n4. 设置签到时间，建议早上8点(0 8 * * *)\n5. 启用插件并保存\n\n开启通知可在签到后收到结果通知，也可随时查看签到历史页面。遇普通 ESA JS 验证会自动调用 MoviePilot 无头浏览器；遇人工滑块时插件不闯关、不过盾，会停止并通知。\n“输出用户信息一次”会把用户名、UID、邮箱和手机号以明文写入日志，保存后自动关闭。'
                                         }
                                     }
                                 ]
@@ -1401,6 +1597,7 @@ class fnossign(_PluginBase):
             "enabled": False,
             "notify": True,
             "onlyonce": False,
+            "log_profile_once": False,
             "cookie": "",
             "cron": "0 8 * * *",
             "max_retries": 3,
@@ -1616,32 +1813,136 @@ class fnossign(_PluginBase):
     def get_api(self) -> List[Dict[str, Any]]:
         return []
 
-    def _check_cookie_valid(self, session):
-        """检查Cookie是否有效"""
+    @staticmethod
+    def _classify_esa_challenge(html_content: str) -> Optional[str]:
+        """识别 ESA 挑战页面，不把它当作 Cookie 过期。"""
+        html = (html_content or "").lower()
+        slider_markers = (
+            "aliyuncaptcha-sliding",
+            "aliyuncaptcha-window-embed",
+            "waf_nc_block",
+            "请按住滑块",
+            "拖动到最右边",
+            "acw_sc__v3",
+        )
+        if any(marker in html for marker in slider_markers):
+            return "slider_challenge"
+
+        js_markers = (
+            "acw_sc__v2",
+            "javascript challenge",
+            "js challenge",
+        )
+        if any(marker in html for marker in js_markers):
+            return "js_challenge"
+        return None
+
+    def _pass_esa_js_challenge(self, session) -> str:
+        """使用 MoviePilot 的 CloakBrowser 完成 ESA 普通 JS Challenge 并同步 Cookie。"""
+        if cloak_launch_context is None:
+            logger.warning("检测到 ESA JS 验证，但当前 MoviePilot 未提供 CloakBrowser")
+            return "browser_unavailable"
+
+        context = None
         try:
-            # 使用更短的超时时间，防止卡住
-            response = session.get("https://club.fnnas.com/", timeout=(3, 10))
-            if "退出" in response.text:
-                # 尝试提取UID
+            logger.info("检测到 ESA JS 验证，使用 MoviePilot 无头浏览器尝试正常访问论坛...")
+            context = cloak_launch_context(
+                headless=True,
+                user_agent=session.headers.get("User-Agent"),
+                humanize=getattr(settings, "CLOAKBROWSER_HUMANIZE", True),
+                human_preset=getattr(settings, "CLOAKBROWSER_HUMAN_PRESET", "default"),
+                viewport={"width": 1280, "height": 720},
+            )
+            context.add_cookies([
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "url": "https://club.fnnas.com/",
+                }
+                for cookie in session.cookies
+            ])
+            page = context.new_page()
+
+            # 普通 JS Challenge 会自行跳转并下发 acw_sc__v2，最多等三次。
+            for _ in range(3):
+                page.goto("https://club.fnnas.com/", wait_until="domcontentloaded", timeout=30000)
+                time.sleep(2)
+                html_content = page.content()
+                challenge = self._classify_esa_challenge(html_content)
+                if challenge == "slider_challenge":
+                    logger.warning("无头浏览器确认论坛要求人工滑块验证")
+                    return challenge
+                if challenge != "js_challenge" and "退出" in html_content:
+                    for cookie in context.cookies("https://club.fnnas.com/"):
+                        session.cookies.set(
+                            cookie["name"],
+                            cookie["value"],
+                            domain=cookie.get("domain") or "club.fnnas.com",
+                            path=cookie.get("path") or "/",
+                        )
+                    logger.info("ESA 普通 JS 验证已通过，继续本次签到")
+                    return "passed"
+
+            logger.warning("无头浏览器未能完成 ESA JS 验证")
+            return "browser_failed"
+        except Exception as e:
+            logger.warning(f"调用 MoviePilot 无头浏览器处理 ESA 验证失败: {str(e)}")
+            return "browser_failed"
+        finally:
+            if context:
                 try:
-                    # 添加超时机制，避免卡在正则匹配上
+                    context.close()
+                except Exception:
+                    pass
+
+    def _stop_for_forum_verification(self, challenge: str) -> Dict[str, str]:
+        """遇到人工验证时停止，不重试，也不将其归因为 Cookie 失效。"""
+        if challenge == "slider_challenge":
+            reason = "论坛要求人工滑块验证"
+            text = "🛡️ 论坛门口来了位滑块小门卫。插件不闯关、不过盾，也不反复敲门；请先在浏览器完成验证后再试。"
+        elif challenge == "browser_unavailable":
+            reason = "论坛 JS 验证需要 MoviePilot 无头浏览器"
+            text = "🛡️ 论坛派出了验证小门卫，但当前 MoviePilot 无头浏览器不可用。插件不闯关、不过盾；请检查 CloakBrowser 后再试。"
+        else:
+            reason = "论坛验证未放行"
+            text = "🛡️ 论坛正在验明正身。插件已经请 MoviePilot 浏览器正常访问，但验证没有放行；插件不闯关、不过盾，也不重试。"
+
+        logger.warning(f"签到暂停: {reason}。插件不会尝试绕过验证。")
+        sign_dict = {
+            "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+            "status": f"签到暂停: {reason}",
+        }
+        self._save_sign_history(sign_dict)
+        if self._notify:
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title="【飞牛论坛签到暂停】",
+                text=text,
+            )
+        return sign_dict
+
+    def _check_cookie_valid(self, session) -> str:
+        """检查 Cookie 是否有效，返回有效性或 ESA 验证状态。"""
+        try:
+            response = session.get("https://club.fnnas.com/", timeout=(3, 10))
+            challenge = self._classify_esa_challenge(response.text)
+            if challenge:
+                logger.info(f"Cookie 检查命中 ESA 验证页面: {challenge}")
+                return challenge
+            if "退出" in response.text:
+                try:
                     uid_match = re.search(r'uid=(\d+)', response.text)
                     if uid_match:
                         self._uid = uid_match.group(1)
-                        return True
                     else:
                         logger.warning("Cookie有效，但未找到UID")
-                        # 虽然没找到UID，但Cookie有效，继续执行
-                        return True
                 except Exception as e:
                     logger.warning(f"提取UID时出错: {str(e)}")
-                    # 即使提取UID失败，也继续尝试签到
-                    return True
-            return False
+                return "valid"
+            return "invalid"
         except Exception as e:
             logger.warning(f"检查Cookie有效性时出错: {str(e)}")
-            # 发生异常时，假设Cookie无效
-            return False
+            return "invalid"
 
     def _extract_required_cookies(self, cookie_str):
         """从Cookie字符串中提取所需的值"""
