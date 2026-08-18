@@ -7,9 +7,12 @@ import calendar
 import uuid
 import math
 import hashlib
+import hmac
 import base64
+import threading
+from secrets import compare_digest
 from datetime import datetime, timedelta, date
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse, urlunparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -21,6 +24,8 @@ from app import schemas
 from typing import Any, List, Dict, Tuple, Optional
 from app.log import logger
 from app.schemas import NotificationType
+from fastapi import Depends, Header, HTTPException, Query, status
+from pydantic import BaseModel, Field
 import requests
 
 
@@ -86,6 +91,28 @@ def _safe_nonnegative_int(value):
         return 0
 
 
+def _safe_positive_int(value):
+    """Strict identifier parsing for webhook account binding."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value if value > 0 else 0
+    if isinstance(value, str) and re.fullmatch(r"[1-9]\d*", value.strip()):
+        try:
+            return int(value.strip())
+        except (TypeError, ValueError, OverflowError):
+            return 0
+    return 0
+
+
+def _safe_uuid4(value):
+    try:
+        parsed = uuid.UUID(str(value or "").strip())
+        return str(parsed) if parsed.version == 4 else ""
+    except (AttributeError, TypeError, ValueError):
+        return ""
+
+
 def _safe_bonus(value):
     """将 MP 魔力值限制为论坛 Decimal(38,4) 可接受的非负有限数。"""
     try:
@@ -97,6 +124,16 @@ def _safe_bonus(value):
         return "0"
 
 
+class FengchaoWebhookPayload(BaseModel):
+    """蜂巢论坛发送的站外通知。"""
+
+    event: str = Field(..., min_length=1, max_length=64)
+    notification: Optional[Dict[str, Any]] = None
+    message: Optional[Dict[str, Any]] = None
+    sender: Optional[Dict[str, Any]] = None
+    recipient: Dict[str, Any] = Field(default_factory=dict)
+
+
 class FengchaoSignin(_PluginBase):
     # 插件名称
     plugin_name = "蜂巢签到"
@@ -105,7 +142,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.1.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -144,6 +181,17 @@ class FengchaoSignin(_PluginBase):
     _timed_update_retry_count = 0
     _timed_update_retry_interval = 0
     _timed_update_current_retry = 0
+    # 论坛通知 webhook 相关
+    _webhook_enabled = False
+    _webhook_system_notification = True
+    _webhook_reply_notification = True
+    _webhook_private_message = True
+    _webhook_public_url = ""
+    _webhook_mp_api_key = ""
+    _webhook_test_now = False
+    _webhook_lock = threading.Lock()
+    _webhook_rate_window_started = 0.0
+    _webhook_rate_count = 0
 
     # 定时器
     _scheduler: Optional[BackgroundScheduler] = None
@@ -170,8 +218,8 @@ class FengchaoSignin(_PluginBase):
             previous_key_prefix = str(self.get_data("api_key_prefix") or "")
             previous_key_fingerprint = str(self.get_data("api_key_fingerprint") or "")
             current_key_fingerprint = hashlib.sha256(self._api_key.encode("utf-8")).hexdigest() if self._api_key else ""
-            configured_instance_id = str(config.get("instance_id") or "").strip()
-            persisted_instance_id = str(self.get_data("instance_id") or "").strip()
+            configured_instance_id = _safe_uuid4(config.get("instance_id"))
+            persisted_instance_id = _safe_uuid4(self.get_data("instance_id"))
             key_changed = bool(
                 current_key_fingerprint and (
                     (previous_key_fingerprint and previous_key_fingerprint != current_key_fingerprint)
@@ -201,6 +249,13 @@ class FengchaoSignin(_PluginBase):
             self._timed_update_cron = _safe_cron(config.get("timed_update_cron", "0 3 * * *"), "0 3 * * *")
             self._timed_update_retry_count = _safe_config_int(config.get("timed_update_retry_count", 1), 1, 0, 10)
             self._timed_update_retry_interval = _safe_config_int(config.get("timed_update_retry_interval", 2), 2, 1, 24)
+            self._webhook_enabled = _safe_config_bool(config.get("webhook_enabled", False), False)
+            self._webhook_system_notification = _safe_config_bool(config.get("webhook_system_notification", True), True)
+            self._webhook_reply_notification = _safe_config_bool(config.get("webhook_reply_notification", True), True)
+            self._webhook_private_message = _safe_config_bool(config.get("webhook_private_message", True), True)
+            self._webhook_public_url = str(config.get("webhook_public_url") or "").strip()
+            self._webhook_mp_api_key = str(config.get("webhook_mp_api_key") or "").strip()
+            self._webhook_test_now = _safe_config_bool(config.get("webhook_test_now", False), False)
             self._last_push_time = self.get_data('last_push_time')
 
         if not self._instance_id:
@@ -292,6 +347,34 @@ class FengchaoSignin(_PluginBase):
             self._onlyonce = False
             self.update_config(self.get_config_dict())
 
+        previously_registered = bool(self.get_data("webhook_registered"))
+        previous_webhook_fingerprint = str(self.get_data("webhook_registration_fingerprint") or "")
+        verified_webhook_fingerprint = str(self.get_data("webhook_verified_fingerprint") or "")
+        try:
+            current_webhook_fingerprint = self._webhook_registration_fingerprint()
+        except Exception:
+            current_webhook_fingerprint = ""
+        webhook_config_changed = self._webhook_enabled and (
+            not previously_registered or current_webhook_fingerprint != previous_webhook_fingerprint
+        )
+        webhook_verification_pending = self._webhook_enabled and (
+            not current_webhook_fingerprint or current_webhook_fingerprint != verified_webhook_fingerprint
+        )
+        webhook_disable_pending = not self._webhook_enabled and previously_registered
+        if webhook_config_changed or webhook_verification_pending or webhook_disable_pending or self._webhook_test_now:
+            self._scheduler.add_job(
+                func=self._sync_notification_webhook,
+                kwargs={"send_test": self._webhook_enabled and (self._webhook_test_now or webhook_verification_pending)},
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=5),
+                name="蜂巢论坛通知配置同步",
+                id="fengchao_notification_webhook_sync",
+                replace_existing=True,
+            )
+            if self._webhook_test_now:
+                self._webhook_test_now = False
+                self.update_config(self.get_config_dict())
+
         if self._scheduler and not self._scheduler.running and self._scheduler.get_jobs():
             self._scheduler.print_jobs()
             self._scheduler.start()
@@ -321,7 +404,14 @@ class FengchaoSignin(_PluginBase):
             "timed_update_enabled": self._timed_update_enabled,
             "timed_update_cron": self._timed_update_cron,
             "timed_update_retry_count": self._timed_update_retry_count,
-            "timed_update_retry_interval": self._timed_update_retry_interval
+            "timed_update_retry_interval": self._timed_update_retry_interval,
+            "webhook_enabled": self._webhook_enabled,
+            "webhook_system_notification": self._webhook_system_notification,
+            "webhook_reply_notification": self._webhook_reply_notification,
+            "webhook_private_message": self._webhook_private_message,
+            "webhook_public_url": self._webhook_public_url,
+            "webhook_mp_api_key": self._webhook_mp_api_key,
+            "webhook_test_now": False,
         }
 
     def _send_notification(self, title, text):
@@ -906,6 +996,350 @@ class FengchaoSignin(_PluginBase):
             logger.warning(f"蜂巢后台要求同步，但快照上传失败: {exc}")
             return status
 
+    def _normalized_webhook_public_url(self):
+        """规范化 MP 公网入口；派生密钥只允许通过 HTTPS 发送。"""
+        candidate = self._webhook_public_url.strip().rstrip("/")
+        parsed = urlparse(candidate)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise RuntimeError("MP 公网地址必须是无账号、参数和片段的 HTTPS 地址")
+        path = parsed.path.rstrip("/")
+        return urlunparse(("https", parsed.netloc, path, "", "", ""))
+
+    def _webhook_token(self):
+        """由 MP APIKEY 派生实例专用密钥，主 APIKEY 不离开 MoviePilot。"""
+        if len(self._webhook_mp_api_key) < 16 or len(self._webhook_mp_api_key) > 512:
+            raise RuntimeError("请填写有效的 MP APIKEY")
+        message = f"fengchao-webhook:{self._instance_id}".encode("utf-8")
+        return hmac.new(self._webhook_mp_api_key.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+    def _build_notification_webhook_url(self):
+        base_url = self._normalized_webhook_public_url()
+        query = urlencode({"instance": self._instance_id})
+        fragment = urlencode({"token": self._webhook_token()})
+        return f"{base_url}/api/v1/plugin/FengchaoSignin/fengchao_webhook?{query}#{fragment}"
+
+    def _webhook_registration_fingerprint(self):
+        """Only synchronize forum settings when the effective callback changes."""
+        config = {
+            "enabled": self._webhook_enabled,
+            "events": {
+                "systemNotification": self._webhook_system_notification,
+                "replyNotification": self._webhook_reply_notification,
+                "privateMessage": self._webhook_private_message,
+            },
+            "url": self._build_notification_webhook_url() if self._webhook_enabled else "",
+        }
+        encoded = json.dumps(config, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _save_webhook_status(self, **values):
+        current = self.get_data("webhook_status") or {}
+        current = current if isinstance(current, dict) else {}
+        current.update(values)
+        current["updatedAt"] = datetime.now(tz=pytz.UTC).isoformat()
+        self.save_data("webhook_status", current)
+
+    def _notify_webhook_configuration_failure(self, reason):
+        """Notify once per distinct failure within six hours without exposing secrets."""
+        safe_reason = self._clean_webhook_text(reason, 500)
+        safe_reason = re.sub(r"(?i)(token=)[a-f0-9]{64}", r"\1[已隐藏]", safe_reason)
+        fingerprint = hashlib.sha256(safe_reason.encode("utf-8")).hexdigest()
+        previous = self.get_data("webhook_failure_notice") or {}
+        previous = previous if isinstance(previous, dict) else {}
+        previous_at = previous.get("at") if isinstance(previous.get("at"), (int, float)) else 0
+        if previous.get("fingerprint") == fingerprint and time.time() - float(previous_at) < 6 * 3600:
+            return
+        self.post_message(
+            mtype=NotificationType.SiteMessage,
+            title="【⚠️ 蜂巢论坛通知连接失败】",
+            text=(
+                f"论坛通知尚未连通：{safe_reason or '未知错误'}\n\n"
+                "请检查 MoviePilot 公网 HTTPS 地址、反向代理路径和 MoviePilot APIKEY。"
+                "修正后保存插件配置，会自动重新注册并测试。"
+            ),
+        )
+        self.save_data("webhook_failure_notice", {"fingerprint": fingerprint, "at": time.time()})
+
+    def _sync_notification_webhook(self, send_test=False):
+        """先验证候选地址，再原子更新当前账号的站外通知设置。"""
+        if not self._api_key:
+            self._save_webhook_status(enabled=False, configured=False, error="请先配置论坛 MP 专用 API Key")
+            logger.warning("蜂巢论坛通知配置失败：未配置论坛 MP 专用 API Key")
+            self._notify_webhook_configuration_failure("请先配置论坛 MP 专用 API Key")
+            return False
+
+        callback_url = ""
+        if self._webhook_enabled:
+            if not any((self._webhook_system_notification, self._webhook_reply_notification, self._webhook_private_message)):
+                self._save_webhook_status(enabled=False, configured=False, error="至少选择一种论坛通知")
+                logger.warning("蜂巢论坛通知配置失败：未选择通知类型")
+                self._notify_webhook_configuration_failure("至少选择一种论坛通知")
+                return False
+            try:
+                callback_url = self._build_notification_webhook_url()
+            except Exception as exc:
+                self._save_webhook_status(enabled=False, configured=False, error=str(exc))
+                logger.warning("蜂巢论坛通知配置失败：%s", exc)
+                self._notify_webhook_configuration_failure(str(exc))
+                return False
+
+        events = {
+            "systemNotification": self._webhook_system_notification,
+            "replyNotification": self._webhook_reply_notification,
+            "privateMessage": self._webhook_private_message,
+        }
+
+        if not self._webhook_enabled:
+            try:
+                result = self.__api_request("PUT", "/api/integrations/moviepilot/v1/notification-webhook", {
+                    "enabled": False,
+                    "url": "",
+                    "events": events,
+                })
+            except Exception as exc:
+                self._save_webhook_status(enabled=False, configured=False, verified=False, error=str(exc))
+                logger.warning("关闭蜂巢论坛通知失败：%s", exc)
+                self._notify_webhook_configuration_failure(str(exc))
+                return False
+
+            self.save_data("webhook_registered", False)
+            self.save_data("webhook_registration_fingerprint", None)
+            self.save_data("webhook_verified_fingerprint", None)
+            self.save_data("webhook_failure_notice", None)
+            self._save_webhook_status(
+                enabled=False,
+                configured=bool(result.get("configured")) if isinstance(result, dict) else False,
+                verified=False,
+                tested=False,
+                testError="",
+                events=events,
+                error="",
+            )
+            logger.info("蜂巢论坛通知已关闭")
+            return True
+
+        previous_registered = bool(self.get_data("webhook_registered"))
+        current_fingerprint = self._webhook_registration_fingerprint()
+        try:
+            identity = self.__api_request("GET", "/api/integrations/moviepilot/v1/me")
+            forum_user_id = _safe_positive_int(identity.get("userId")) if isinstance(identity, dict) else 0
+            if forum_user_id <= 0:
+                identity_status = identity.get("status") if isinstance(identity, dict) and isinstance(identity.get("status"), dict) else {}
+                account = identity_status.get("account") if isinstance(identity_status.get("account"), dict) else {}
+                forum_user_id = _safe_positive_int(account.get("uid"))
+            if forum_user_id <= 0:
+                raise RuntimeError("论坛没有返回当前绑定账号")
+            self.save_data("webhook_forum_user_id", forum_user_id)
+
+            # 候选地址只做一次性投递测试；论坛端不会在这一步保存或启用它。
+            self.__api_request("POST", "/api/integrations/moviepilot/v1/notification-webhook", {
+                "url": callback_url,
+            })
+        except Exception as exc:
+            self._save_webhook_status(
+                enabled=previous_registered,
+                requestedEnabled=True,
+                configured=False,
+                verified=False,
+                tested=False,
+                testError=str(exc),
+                events=events,
+                error="候选地址端到端测试未通过，论坛未启用该地址",
+            )
+            logger.warning("蜂巢论坛通知候选地址测试失败，论坛未启用该地址：%s", exc)
+            self._notify_webhook_configuration_failure(str(exc))
+            return False
+
+        try:
+            result = self.__api_request("PUT", "/api/integrations/moviepilot/v1/notification-webhook", {
+                "enabled": True,
+                "url": callback_url,
+                "events": events,
+            })
+        except Exception as exc:
+            self._save_webhook_status(
+                enabled=previous_registered,
+                requestedEnabled=True,
+                configured=False,
+                verified=False,
+                tested=True,
+                testedAt=datetime.now(tz=pytz.UTC).isoformat(),
+                testError="",
+                events=events,
+                error="候选地址已连通，但论坛保存配置失败",
+            )
+            logger.warning("蜂巢论坛通知候选地址已连通，但保存配置失败：%s", exc)
+            self._notify_webhook_configuration_failure(str(exc))
+            return False
+
+        self.save_data("webhook_registered", True)
+        self.save_data("webhook_registration_fingerprint", current_fingerprint)
+        self.save_data("webhook_verified_fingerprint", current_fingerprint)
+        self.save_data("webhook_failure_notice", None)
+        self._save_webhook_status(
+            enabled=True,
+            requestedEnabled=True,
+            configured=bool(result.get("configured")) if isinstance(result, dict) else True,
+            verified=True,
+            tested=True,
+            testedAt=datetime.now(tz=pytz.UTC).isoformat(),
+            testError="",
+            events=events,
+            error="",
+        )
+        logger.info("蜂巢论坛通知候选地址测试通过并已启用")
+        return True
+
+    def _verify_webhook_access(
+        self,
+        instance: str = Query(..., min_length=36, max_length=36),
+        token: str = Header(..., alias="X-Fengchao-Webhook-Token", min_length=64, max_length=64),
+    ):
+        if not self._webhook_enabled:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="蜂巢论坛通知未启用")
+        try:
+            expected_token = self._webhook_token()
+        except Exception:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="蜂巢论坛通知尚未完成配置")
+        if not compare_digest(instance, self._instance_id) or not compare_digest(token, expected_token):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Webhook 鉴权失败")
+        return instance
+
+    @staticmethod
+    def _clean_webhook_text(value, limit):
+        text = str(value or "")
+        text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
+        return text[:limit]
+
+    @classmethod
+    def _escape_webhook_markdown(cls, value, limit):
+        text = cls._clean_webhook_text(value, limit)
+        for marker in ("\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", ".", "!", "|", ">"):
+            text = text.replace(marker, f"\\{marker}")
+        return text
+
+    @staticmethod
+    def _format_webhook_time(value):
+        text = str(value or "").strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return parsed.astimezone(pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OverflowError):
+            return text[:32] or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _safe_forum_inbox_url(value, fallback_path="/notifications"):
+        fallback = f"{_resolve_api_base()}{fallback_path}"
+        try:
+            target = urlparse(str(value or ""))
+            forum = urlparse(_resolve_api_base())
+            if target.scheme != "https" or target.netloc.lower() != forum.netloc.lower() or target.username or target.password:
+                return fallback
+            return urlunparse((target.scheme, target.netloc, target.path or "/inbox", "", target.query, ""))
+        except Exception:
+            return fallback
+
+    def _render_forum_webhook(self, payload):
+        event = payload.event
+        recipient_id = _safe_positive_int(payload.recipient.get("userId")) if isinstance(payload.recipient, dict) else 0
+        expected_user_id = _safe_positive_int(self.get_data("webhook_forum_user_id"))
+        if expected_user_id <= 0 or recipient_id != expected_user_id:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Webhook 接收账号与论坛绑定不一致")
+
+        if event == "integration.webhook.test":
+            notification = payload.notification if isinstance(payload.notification, dict) else {}
+            event_id = self._clean_webhook_text(notification.get("id"), 128)
+            occurred_at = self._format_webhook_time(notification.get("createdAt"))
+            return event_id, "✅ 蜂巢论坛通知已连通", (
+                "论坛已完成端到端回调测试，当前 MoviePilot 地址和密钥配置有效。\n\n"
+                f"🕒 {occurred_at}"
+            )
+
+        if event == "system.notification.created" and self._webhook_system_notification:
+            notification = payload.notification if isinstance(payload.notification, dict) else {}
+            event_id = self._clean_webhook_text(notification.get("id"), 128)
+            title = self._escape_webhook_markdown(notification.get("title") or "系统通知", 120)
+            content = self._escape_webhook_markdown(notification.get("content") or "你收到一条新的论坛通知。", 1800)
+            occurred_at = self._format_webhook_time(notification.get("createdAt"))
+            inbox_url = self._safe_forum_inbox_url(notification.get("inboxUrl"))
+            return event_id, f"🔔 蜂巢 · {self._clean_webhook_text(notification.get('title') or '系统通知', 80)}", (
+                f"**{title}**\n\n{content}\n\n"
+                f"🕒 {occurred_at}\n\n[打开蜂巢通知中心]({inbox_url})"
+            )
+
+        if event == "reply.notification.created" and self._webhook_reply_notification:
+            notification = payload.notification if isinstance(payload.notification, dict) else {}
+            event_id = self._clean_webhook_text(notification.get("id"), 128)
+            title_raw = notification.get("title") or "你收到一条新回复"
+            title = self._escape_webhook_markdown(title_raw, 120)
+            content = self._escape_webhook_markdown(notification.get("content") or "论坛讨论有了新回复。", 1800)
+            occurred_at = self._format_webhook_time(notification.get("createdAt"))
+            inbox_url = self._safe_forum_inbox_url(notification.get("inboxUrl"))
+            return event_id, f"🗨️ 蜂巢回复 · {self._clean_webhook_text(title_raw, 70)}", (
+                f"**{title}**\n\n{content}\n\n"
+                f"🕒 {occurred_at}\n\n[查看论坛回复]({inbox_url})"
+            )
+
+        if event == "private.message.created" and self._webhook_private_message:
+            message = payload.message if isinstance(payload.message, dict) else {}
+            sender = payload.sender if isinstance(payload.sender, dict) else {}
+            event_id = self._clean_webhook_text(message.get("id"), 128)
+            display_name_raw = sender.get("displayName") or sender.get("username") or "论坛用户"
+            display_name = self._escape_webhook_markdown(display_name_raw, 80)
+            username = self._escape_webhook_markdown(sender.get("username") or "", 80)
+            preview = self._escape_webhook_markdown(message.get("preview") or message.get("content") or "你收到一条新私信。", 1200)
+            occurred_at = self._format_webhook_time(message.get("createdAt"))
+            inbox_url = self._safe_forum_inbox_url(message.get("inboxUrl"), "/inbox")
+            sender_line = f"👤 {display_name}" + (f" · @{username}" if username else "")
+            return event_id, f"💬 蜂巢私信 · {self._clean_webhook_text(display_name_raw, 60)}", (
+                f"{sender_line}\n\n{preview}\n\n"
+                f"🕒 {occurred_at}\n\n[打开蜂巢私信]({inbox_url})"
+            )
+
+        if event not in {"integration.webhook.test", "system.notification.created", "reply.notification.created", "private.message.created"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="不支持的论坛通知类型")
+        return None
+
+    def receive_forum_webhook(
+        self,
+        payload: FengchaoWebhookPayload,
+        idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key", max_length=300),
+    ) -> schemas.Response:
+        """接收论坛 POST JSON，并投递到 MoviePilot 已启用的通知渠道。"""
+        now = time.monotonic()
+        with self._webhook_lock:
+            if now - self._webhook_rate_window_started >= 60:
+                self._webhook_rate_window_started = now
+                self._webhook_rate_count = 0
+            if self._webhook_rate_count >= 120:
+                raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Webhook 请求过于频繁")
+            self._webhook_rate_count += 1
+
+        rendered = self._render_forum_webhook(payload)
+        if rendered is None:
+            return schemas.Response(success=True, message="该通知类型未订阅")
+        event_id, title, text = rendered
+        if not event_id:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="论坛通知缺少事件 ID")
+
+        recipient_id = _safe_positive_int(payload.recipient.get("userId"))
+        delivery_key = hashlib.sha256(f"{payload.event}:{recipient_id}:{event_id}".encode("utf-8")).hexdigest()
+        now = time.time()
+        with self._webhook_lock:
+            recent = self.get_data("webhook_deliveries") or []
+            recent = [
+                item for item in recent
+                if isinstance(item, dict) and isinstance(item.get("at"), (int, float)) and now - float(item["at"]) <= 7 * 86400
+            ]
+            if any(compare_digest(str(item.get("key") or ""), delivery_key) for item in recent):
+                return schemas.Response(success=True, message="通知已处理")
+            self.post_message(mtype=NotificationType.SiteMessage, title=title, text=text)
+            recent.append({"key": delivery_key, "at": now})
+            self.save_data("webhook_deliveries", recent[-200:])
+
+        logger.info("蜂巢论坛通知已提交到 MoviePilot 通知链，事件=%s，幂等键=%s", payload.event, bool(idempotency_key))
+        return schemas.Response(success=True, message="通知已提交")
+
     def _save_history(self, record: Dict[str, Any]):
         """
         保存签到历史记录，确保同一天只有一条记录（以日期为Key）
@@ -985,6 +1419,16 @@ class FengchaoSignin(_PluginBase):
             {"path": "/fengchao_checkin", "endpoint": self.api_checkin, "methods": ["POST"], "summary": "立即蜂巢签到", "description": "调用论坛原生签到 API，并保留通知与历史记录"},
             {"path": "/fengchao_sync", "endpoint": self.api_sync, "methods": ["POST"], "summary": "立即同步 PT 人生", "description": "从 MoviePilot 本地统计模型上传一份幂等快照"},
             {"path": "/fengchao_status", "endpoint": self.api_status, "methods": ["GET"], "summary": "查看蜂巢最近结果", "description": "返回最近同步结果和本地签到历史摘要"},
+            {
+                "path": "/fengchao_webhook",
+                "endpoint": self.receive_forum_webhook,
+                "methods": ["POST"],
+                "allow_anonymous": True,
+                "dependencies": [Depends(self._verify_webhook_access)],
+                "response_model": schemas.Response,
+                "summary": "接收蜂巢论坛通知",
+                "description": "使用实例专用派生密钥接收论坛通知并投递到 MoviePilot 通知渠道",
+            },
         ]
 
     def api_test(self) -> schemas.Response:
@@ -1008,7 +1452,12 @@ class FengchaoSignin(_PluginBase):
             return schemas.Response(success=False, message=str(exc))
 
     def api_status(self) -> schemas.Response:
-        return schemas.Response(success=True, data={"lastSync": self.get_data("last_push_result") or {}, "history": self.get_data("history") or [], "status": self._get_cached_status()})
+        return schemas.Response(success=True, data={
+            "lastSync": self.get_data("last_push_result") or {},
+            "history": self.get_data("history") or [],
+            "status": self._get_cached_status(),
+            "webhook": self.get_data("webhook_status") or {},
+        })
 
     def get_service(self) -> List[Dict[str, Any]]:
         """任务由插件内的单一调度器管理，避免宿主再次注册同一任务。"""
@@ -1173,6 +1622,42 @@ class FengchaoSignin(_PluginBase):
                         )]),
                     ]},
                 ]),
+                section("论坛通知", "mdi-bell-outline", "#14b8a6", [
+                    {"component": "VRow", "content": [
+                        column([switch(
+                            "webhook_enabled", "接收论坛通知", "#14b8a6",
+                            hint="保存后自动在论坛启用或关闭，无需手动填写 Webhook",
+                        )], md=4),
+                        column([switch("webhook_system_notification", "系统通知", "#6366f1")], md=4),
+                        column([switch(
+                            "webhook_reply_notification", "帖子与评论回复", "#f59e0b",
+                            hint="包含帖子回复、评论回复和私密回复，不包含私信",
+                        )], md=4),
+                    ]},
+                    {"component": "VRow", "content": [
+                        column([switch("webhook_private_message", "私信", "#0ea5e9")], md=4),
+                        column([switch(
+                            "webhook_test_now", "发送测试通知", "#f97316",
+                            hint="保存后测试一次并自动复位",
+                        )], md=4),
+                    ]},
+                    {"component": "VRow", "content": [
+                        column([field(
+                            "webhook_public_url", "MoviePilot 公网地址", type="url",
+                            placeholder="https://mp.example.com",
+                            prepend_inner_icon="mdi-web",
+                            hint="填写反向代理后的 HTTPS 地址，可包含固定路径前缀",
+                            persistent_hint=True, clearable=True,
+                        )], md=6),
+                        column([field(
+                            "webhook_mp_api_key", "MoviePilot APIKEY", type="password",
+                            placeholder="填写 MoviePilot 主程序 APIKEY",
+                            prepend_inner_icon="mdi-shield-key-outline",
+                            hint="仅保存在本机，用于派生当前实例的 Webhook 密钥，不会发送给论坛",
+                            persistent_hint=True, autocomplete="off", clearable=True,
+                        )], md=6),
+                    ]},
+                ]),
                 {"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mt-1"}, "content": [
                     panel("定时任务", "mdi-calendar-month-outline", "#f59e0b", "签到与 PT 人生数据的定时同步", [
                         {"component": "VRow", "content": [
@@ -1232,6 +1717,13 @@ class FengchaoSignin(_PluginBase):
             "use_proxy": False, "timed_update_enabled": True,
             "timed_update_cron": "0 3 * * *",
             "timed_update_retry_count": 1, "timed_update_retry_interval": 2,
+            "webhook_enabled": False,
+            "webhook_system_notification": True,
+            "webhook_reply_notification": True,
+            "webhook_private_message": True,
+            "webhook_public_url": "",
+            "webhook_mp_api_key": "",
+            "webhook_test_now": False,
         }
         return form, defaults
 
