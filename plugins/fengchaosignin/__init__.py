@@ -1,9 +1,15 @@
 import json
+import os
 import re
 import time
+import random
 import calendar
-from collections import defaultdict
+import uuid
+import math
+import hashlib
+import base64
 from datetime import datetime, timedelta, date
+from urllib.parse import urlparse
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -11,10 +17,84 @@ from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import settings
 from app.plugins import _PluginBase
+from app import schemas
 from typing import Any, List, Dict, Tuple, Optional
 from app.log import logger
 from app.schemas import NotificationType
-from app.utils.http import RequestUtils
+import requests
+
+
+# 论坛正式 API 地址固定内置；仅部署负责人可通过环境变量覆盖。
+MOVIEPILOT_API_BASE = "https://pting.club"
+MOVIEPILOT_API_BASE_OVERRIDE = os.getenv("FENGCHAO_API_BASE", "").strip()
+
+
+def _resolve_api_base():
+    """允许 HTTPS 或显式配置的 HTTP 端点（仅限临时直连测试）；仍拒绝带账号/路径等可疑地址。"""
+    candidate = (MOVIEPILOT_API_BASE_OVERRIDE or MOVIEPILOT_API_BASE).rstrip("/")
+    parsed = urlparse(candidate)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.fragment or parsed.query or parsed.path not in {"", "/"}:
+        logger.warning("蜂巢 API 地址不是受信任端点，回退到内置地址")
+        return MOVIEPILOT_API_BASE.rstrip("/")
+    if parsed.scheme != "https":
+        logger.warning("蜂巢 API 使用明文 HTTP（IP 直连测试）；正式环境应使用 HTTPS")
+    return candidate
+
+
+def _safe_config_int(value, default, minimum=0, maximum=None):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    if parsed < minimum:
+        return minimum
+    if maximum is not None and parsed > maximum:
+        return maximum
+    return parsed
+
+
+def _safe_config_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _safe_cron(value, default):
+    candidate = str(value or "").strip()
+    try:
+        CronTrigger.from_crontab(candidate)
+        return candidate
+    except (TypeError, ValueError):
+        logger.warning("无效的 cron 配置 %r，回退到 %s", value, default)
+        return default
+
+
+def _safe_nonnegative_int(value):
+    """把 MP 统计模型中的异常数值（NaN/Infinity/负数）安全归一化。"""
+    try:
+        parsed = float(value or 0)
+        if not math.isfinite(parsed):
+            return 0
+        return max(0, int(parsed))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _safe_bonus(value):
+    """将 MP 魔力值限制为论坛 Decimal(38,4) 可接受的非负有限数。"""
+    try:
+        text = str(value or "0").strip()
+        if not re.fullmatch(r"\d{1,34}(\.\d{1,4})?", text):
+            return "0"
+        return text
+    except Exception:
+        return "0"
 
 
 class FengchaoSignin(_PluginBase):
@@ -25,7 +105,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "2.1.0"
+    plugin_version = "3.0.0"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -38,30 +118,29 @@ class FengchaoSignin(_PluginBase):
     auth_level = 2
 
     # 私有属性
-    _enabled = False
+    _enabled = True
     # 任务执行间隔
     _cron = None
-    _cookie = None
+    _api_key = ""
+    _instance_id = ""
     _onlyonce = False
     _update_info_now = False
-    _notify = False
+    _force_refresh = False
+    _notify = True
     _history_days = None
     # 签到重试相关
-    _retry_count = 0  # 最大重试次数
+    _retry_count = 1  # 最大重试次数；默认至少重试一次
     _current_retry = 0  # 当前重试次数
     _retry_interval = 2  # 重试间隔(小时)
     # MoviePilot数据推送相关
-    _mp_push_enabled = False  # 是否启用数据推送
+    _mp_push_enabled = True  # 是否启用数据推送
     _mp_push_interval = 1  # 推送间隔(天)
     _last_push_time = None  # 上次推送时间
     # 代理相关
-    _use_proxy = True  # 是否使用代理，默认启用
-    # 用户名密码
-    _username = None
-    _password = None
-    # 定时更新个人信息相关
-    _timed_update_enabled = False
-    _timed_update_cron = "0 */2 * * *"
+    _use_proxy = False  # Bearer Key 默认直连；仅在用户明确开启时使用代理
+    # 定时 PT 人生快照同步相关
+    _timed_update_enabled = True
+    _timed_update_cron = "0 3 * * *"
     _timed_update_retry_count = 0
     _timed_update_retry_interval = 0
     _timed_update_current_retry = 0
@@ -81,25 +160,57 @@ class FengchaoSignin(_PluginBase):
         """
         # 接收参数
         if config:
-            self._enabled = config.get("enabled", False)
-            self._notify = config.get("notify", False)
-            self._cron = config.get("cron", "30 8 * * *")
-            self._onlyonce = config.get("onlyonce", False)
-            self._update_info_now = config.get("update_info_now", False)
-            self._cookie = config.get("cookie", "")
-            self._history_days = config.get("history_days", 30)
-            self._retry_count = int(config.get("retry_count", 0))
-            self._retry_interval = int(config.get("retry_interval", 2))
-            self._mp_push_enabled = config.get("mp_push_enabled", False)
-            self._mp_push_interval = int(config.get("mp_push_interval", 1))
-            self._use_proxy = config.get("use_proxy", True)
-            self._username = config.get("username", "")
-            self._password = config.get("user_password", "")
-            self._timed_update_enabled = config.get("timed_update_enabled", False)
-            self._timed_update_cron = config.get("timed_update_cron", "0 */2 * * *")
-            self._timed_update_retry_count = int(config.get("timed_update_retry_count", 0))
-            self._timed_update_retry_interval = int(config.get("timed_update_retry_interval", 0))
+            self._enabled = _safe_config_bool(config.get("enabled", True), True)
+            self._notify = _safe_config_bool(config.get("notify", True), True)
+            self._cron = _safe_cron(config.get("cron", "30 8 * * *"), "30 8 * * *")
+            self._onlyonce = _safe_config_bool(config.get("onlyonce", False), False)
+            self._update_info_now = _safe_config_bool(config.get("update_info_now", False), False)
+            self._force_refresh = _safe_config_bool(config.get("force_refresh", False), False)
+            self._api_key = str(config.get("api_key") or "").strip()
+            previous_key_prefix = str(self.get_data("api_key_prefix") or "")
+            previous_key_fingerprint = str(self.get_data("api_key_fingerprint") or "")
+            current_key_fingerprint = hashlib.sha256(self._api_key.encode("utf-8")).hexdigest() if self._api_key else ""
+            configured_instance_id = str(config.get("instance_id") or "").strip()
+            persisted_instance_id = str(self.get_data("instance_id") or "").strip()
+            key_changed = bool(
+                current_key_fingerprint and (
+                    (previous_key_fingerprint and previous_key_fingerprint != current_key_fingerprint)
+                    or (not previous_key_fingerprint and previous_key_prefix and previous_key_prefix != self._api_key[:20])
+                )
+            )
+            if key_changed:
+                # The same MP host may be pointed at another forum account;
+                # never reuse an instance UUID that is already bound there.
+                self._instance_id = str(uuid.uuid4())
+                # The forum key rotation also unbinds the old instance. Drop
+                # owner/status freshness markers so the next scheduled run
+                # performs a new /me bind and cannot reuse the old account's
+                # cached avatar, badges, qualification or snapshot result.
+                for cache_key in ("last_status", "last_push_time", "last_push_result", "last_sync_request"):
+                    self.save_data(cache_key, None)
+            else:
+                self._instance_id = configured_instance_id or persisted_instance_id or str(uuid.uuid4())
+            self._history_days = _safe_config_int(config.get("history_days", 30), 30, 1, 3650)
+            self._retry_count = _safe_config_int(config.get("retry_count", 1), 1, 0, 10)
+            self._retry_interval = _safe_config_int(config.get("retry_interval", 2), 2, 1, 24)
+            self._mp_push_enabled = _safe_config_bool(config.get("mp_push_enabled", True), True)
+            self._mp_push_interval = _safe_config_int(config.get("mp_push_interval", 1), 1, 1, 7)
+            self._use_proxy = _safe_config_bool(config.get("use_proxy", False), False)
+            # PT 人生快照只通过 MP API Key 同步。
+            self._timed_update_enabled = _safe_config_bool(config.get("timed_update_enabled", True), True)
+            self._timed_update_cron = _safe_cron(config.get("timed_update_cron", "0 3 * * *"), "0 3 * * *")
+            self._timed_update_retry_count = _safe_config_int(config.get("timed_update_retry_count", 1), 1, 0, 10)
+            self._timed_update_retry_interval = _safe_config_int(config.get("timed_update_retry_interval", 2), 2, 1, 24)
             self._last_push_time = self.get_data('last_push_time')
+
+        if not self._instance_id:
+            self._instance_id = str(uuid.uuid4())
+        # Keep the local instance UUID stable across MoviePilot restarts even
+        # when the host has not persisted the optional advanced config field.
+        self.save_data("instance_id", self._instance_id)
+        if self._api_key:
+            self.save_data("api_key_fingerprint", hashlib.sha256(self._api_key.encode("utf-8")).hexdigest())
+            self.save_data("api_key_prefix", None)
 
         # 重置即时任务的重试计数
         self._current_retry = 0
@@ -124,7 +235,10 @@ class FengchaoSignin(_PluginBase):
                     func=self.__signin,
                     trigger=CronTrigger.from_crontab(self._cron),
                     name="蜂巢签到",
-                    id=signin_job_id
+                    id=signin_job_id,
+                    # Tens of thousands of installations commonly keep the
+                    # default cron. Spread forum writes over 30 minutes.
+                    jitter=1800,
                 )
                 logger.info(f"已添加新的签到周期任务，周期：{self._cron}")
 
@@ -135,27 +249,39 @@ class FengchaoSignin(_PluginBase):
                 self._timed_update_cron != self._active_timed_update_cron
         )
         if info_update_config_changed:
-            logger.info("检测到个人信息更新任务配置变更，正在更新...")
+            logger.info("检测到 PT 人生同步任务配置变更，正在更新...")
             if self._scheduler.get_job(info_update_job_id):
                 self._scheduler.remove_job(info_update_job_id)
-                logger.info("已移除旧的个人信息更新周期任务。")
+                logger.info("已移除旧的 PT 人生同步周期任务。")
             if self._enabled and self._timed_update_enabled:
-                cron_to_use = self._timed_update_cron if self._timed_update_cron else "0 */2 * * *"
+                cron_to_use = self._timed_update_cron if self._timed_update_cron else "0 3 * * *"
                 self._scheduler.add_job(
-                    func=self.__update_user_info,
+                    func=self.__sync_pt_life,
                     kwargs={'is_scheduled_run': True},
                     trigger=CronTrigger.from_crontab(cron_to_use),
-                    name="蜂巢个人信息定时更新",
-                    id=info_update_job_id
+                    name="蜂巢 PT 人生快照定时同步",
+                    id=info_update_job_id,
+                    # All MoviePilot instances commonly share the same
+                    # default cron. Spread the heavier daily snapshot uploads
+                    # across two hours so the forum never sees a 03:00 spike.
+                    jitter=7200,
                 )
-                logger.info(f"已添加新的个人信息更新周期任务，周期：{cron_to_use}")
+                logger.info(f"已添加新的 PT 人生同步周期任务，周期：{cron_to_use}")
 
         if self._update_info_now:
-            logger.info("蜂巢插件：立即更新个人信息")
-            self._scheduler.add_job(func=self.__update_user_info, trigger='date',
+            logger.info("蜂巢插件：立即同步 PT 人生")
+            self._scheduler.add_job(func=self.__sync_pt_life, trigger='date',
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                    name="蜂巢个人信息更新")
+                                    name="蜂巢 PT 人生快照同步")
             self._update_info_now = False
+            self.update_config(self.get_config_dict())
+
+        if self._force_refresh:
+            logger.info("蜂巢插件：强制刷新论坛信息")
+            self._scheduler.add_job(func=self._force_refresh_info, trigger='date',
+                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                    name="蜂巢论坛信息强制刷新（一次性）")
+            self._force_refresh = False
             self.update_config(self.get_config_dict())
 
         if self._onlyonce:
@@ -182,15 +308,16 @@ class FengchaoSignin(_PluginBase):
             "notify": self._notify,
             "cron": self._cron,
             "onlyonce": self._onlyonce,
-            "update_info_now": self._update_info_now,
+            "update_info_now": False,
+            "force_refresh": False,
             "history_days": self._history_days,
             "retry_count": self._retry_count,
             "retry_interval": self._retry_interval,
             "mp_push_enabled": self._mp_push_enabled,
             "mp_push_interval": self._mp_push_interval,
+            "api_key": self._api_key,
+            "instance_id": self._instance_id,
             "use_proxy": self._use_proxy,
-            "username": self._username,
-            "user_password": self._password,
             "timed_update_enabled": self._timed_update_enabled,
             "timed_update_cron": self._timed_update_cron,
             "timed_update_retry_count": self._timed_update_retry_count,
@@ -223,9 +350,12 @@ class FengchaoSignin(_PluginBase):
         # 安排重试任务
         self._scheduler.add_job(
             func=self.__signin,
+            kwargs={'is_retry': True},
             trigger='date',
             run_date=next_run_time,
-            name=f"蜂巢签到重试 ({self._current_retry}/{self._retry_count})"
+            name=f"蜂巢签到重试 ({self._current_retry}/{self._retry_count})",
+            id="fengchao_signin_retry",
+            replace_existing=True,
         )
 
         logger.info(f"蜂巢签到失败，将在{retry_interval}小时后重试，当前重试次数: {self._current_retry}/{self._retry_count}")
@@ -241,15 +371,14 @@ class FengchaoSignin(_PluginBase):
         :param attempt: 当前尝试次数
         """
         if self._notify:
-            # 检查是否还有后续的定时重试
-            remaining_retries = self._retry_count - self._current_retry
             retry_info = ""
-            if self._retry_count > 0 and remaining_retries > 0:
+            retry_scheduled = bool(self._scheduler and self._scheduler.get_job("fengchao_signin_retry"))
+            if retry_scheduled:
                 next_retry_hours = self._retry_interval
                 retry_info = (
                     f"🔄 重试信息\n"
-                    f"• 将在 {next_retry_hours} 小时后进行下一次定时重试\n"
-                    f"• 剩余定时重试次数: {remaining_retries}\n"
+                    f"• 已安排 {next_retry_hours} 小时后的延迟重试\n"
+                    f"• 重试进度: {attempt}/{self._retry_count}\n"
                     f"━━━━━━━━━━\n"
                 )
 
@@ -259,14 +388,14 @@ class FengchaoSignin(_PluginBase):
                     f"📢 执行结果\n"
                     f"━━━━━━━━━━\n"
                     f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"❌ 状态：签到失败 (已完成 {attempt + 1} 次快速重试)\n"
+                    f"❌ 状态：签到请求失败\n"
                     f"💬 原因：{reason}\n"
                     f"━━━━━━━━━━\n"
                     f"{retry_info}"
                 )
             )
 
-    def _schedule_info_update_retry(self):
+    def _schedule_info_update_retry(self, batch_id: str):
         """
         安排用户信息更新的重试任务
         """
@@ -281,33 +410,35 @@ class FengchaoSignin(_PluginBase):
         next_run_time = datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(hours=retry_interval_hours)
 
         self._scheduler.add_job(
-            func=self.__update_user_info,
-            kwargs={'is_scheduled_run': True},
+            func=self.__sync_pt_life,
+            kwargs={'is_scheduled_run': True, 'is_retry': True, 'retry_batch_id': batch_id},
             trigger='date',
             run_date=next_run_time,
-            name=f"蜂巢信息更新重试 ({self._timed_update_current_retry}/{self._timed_update_retry_count})"
+            name=f"蜂巢信息更新重试 ({self._timed_update_current_retry}/{self._timed_update_retry_count})",
+            id="fengchao_info_update_retry",
+            replace_existing=True,
         )
 
         logger.info(
-            f"蜂巢信息更新失败，将在{retry_interval_hours}小时后重试，当前重试次数: {self._timed_update_current_retry}/{self._timed_update_retry_count}")
+            f"蜂巢PT 人生同步失败，将在{retry_interval_hours}小时后重试，当前重试次数: {self._timed_update_current_retry}/{self._timed_update_retry_count}")
 
         if not self._scheduler.running:
             self._scheduler.start()
 
     def _send_info_update_failure_notification(self, reason: str):
         """
-        发送信息更新失败的通知
+        发送PT 人生同步失败的通知
         :param reason: 失败原因
         """
         if self._notify:
-            remaining_retries = self._timed_update_retry_count - self._timed_update_current_retry
             retry_info = ""
-            if self._timed_update_retry_count > 0 and remaining_retries > 0:
+            retry_scheduled = bool(self._scheduler and self._scheduler.get_job("fengchao_info_update_retry"))
+            if retry_scheduled:
                 next_retry_hours = self._timed_update_retry_interval
                 retry_info = (
                     f"🔄 重试信息\n"
-                    f"• 将在 {next_retry_hours} 小时后进行下一次定时重试\n"
-                    f"• 剩余定时重试次数: {remaining_retries}\n"
+                    f"• 已安排 {next_retry_hours} 小时后的延迟重试\n"
+                    f"• 重试进度: {self._timed_update_current_retry}/{self._timed_update_retry_count}\n"
                     f"━━━━━━━━━━\n"
                 )
 
@@ -317,7 +448,7 @@ class FengchaoSignin(_PluginBase):
                     f"📢 执行结果\n"
                     f"━━━━━━━━━━\n"
                     f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"❌ 状态：信息更新失败\n"
+                    f"❌ 状态：PT 人生同步失败\n"
                     f"💬 原因：{reason}\n"
                     f"━━━━━━━━━━\n"
                     f"{retry_info}"
@@ -335,7 +466,9 @@ class FengchaoSignin(_PluginBase):
         try:
             # 获取系统代理设置
             if hasattr(settings, 'PROXY') and settings.PROXY:
-                logger.info(f"使用系统代理: {settings.PROXY}")
+                # Proxy URLs can contain credentials; never write them to the
+                # MoviePilot log.
+                logger.info("蜂巢 API 已使用 MoviePilot 系统代理")
                 return settings.PROXY
             else:
                 logger.warning("系统代理未配置")
@@ -344,403 +477,434 @@ class FengchaoSignin(_PluginBase):
             logger.error(f"获取代理设置出错: {str(e)}")
             return None
 
-    def __update_user_info(self, is_scheduled_run: bool = False):
-        """
-        仅更新用户信息，不执行签到
-        :param is_scheduled_run: 是否为定时任务调用，用于判断是否启用重试
-        """
-        logger.info("开始执行蜂巢用户信息更新任务...")
+    def __sync_pt_life(self, is_scheduled_run: bool = False, is_retry: bool = False, retry_batch_id: str = None):
+        """手动/定时同步：只通过 MP 本地统计模型上传 PT 人生快照。"""
+        if is_scheduled_run and not is_retry:
+            self._timed_update_current_retry = 0
+        if not self._api_key:
+            reason = "未配置 MP 专用 API Key，请先在论坛“隐秘的角落”生成并粘贴"
+            logger.warning(reason)
+            if is_scheduled_run:
+                self._send_info_update_failure_notification(reason)
+            return False
+        if not self._mp_push_enabled:
+            logger.info("蜂巢 PT 人生同步已关闭，跳过定时快照上传")
+            return False
+        batch_id = retry_batch_id or f"{self._instance_id}-{datetime.now(tz=pytz.UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:12]}"
         try:
-            if not self._username or not self._password:
-                raise Exception("未配置用户名和密码")
-
-            proxies = self._get_proxies()
-            cookie = self._login_and_get_cookie(proxies)
-            if not cookie:
-                raise Exception("登录失败，无法获取Cookie")
-
-            res_main = None
+            # A failed daily write is rescheduled below instead of sleeping in
+            # APScheduler's worker thread. This keeps one bounded request per
+            # attempt and prevents retry storms during a forum outage.
+            result = self.__push_stats_with_retries(retry_count=0, batch_id=batch_id)
             try:
-                res_main = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.club")
-            except Exception as e:
-                logger.error(f"访问主页时发生网络错误: {e}")
-                raise Exception(f"访问主页失败: {e}")
-
-            if not res_main or res_main.status_code != 200:
-                raise Exception(f"访问主页失败，状态码: {res_main.status_code if res_main else 'N/A'}")
-
-            match = re.search(r'"userId":(\d+)', res_main.text)
-            if not match or match.group(1) == "0":
-                raise Exception("无法从主页获取有效的用户ID")
-
-            userId = match.group(1)
-
-            res_api = None
-            api_url = f"https://pting.club/api/users/{userId}"
-
-            logger.info(f"正在使用API URL: {api_url}")
-            try:
-                res_api = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url=api_url)
-            except Exception as e:
-                logger.error(f"请求API时发生网络错误: {e}")
-                raise Exception(f"API请求失败: {e}")
-
-            if not res_api or res_api.status_code != 200:
-                raise Exception(f"API请求失败，状态码: {res_api.status_code if res_api else 'N/A'}")
-
-            user_info = res_api.json()
-            self.save_data("user_info", user_info)
-            self.save_data("user_info_updated_at", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-
-            # --- 同步签到历史记录 START ---
-            try:
-                attrs = user_info.get('data', {}).get('attributes', {})
-                last_checkin_time = attrs.get('lastCheckinTime')
-                if last_checkin_time:
-                    # API返回的时间格式例如 "2025-12-01 07:35:15"
-                    today_str = datetime.now().strftime('%Y-%m-%d')
-                    # 检查是否是今天的签到
-                    if last_checkin_time.startswith(today_str):
-                        # 获取现有历史记录
-                        history = self.get_data('history') or []
-                        record_date = last_checkin_time.split(" ")[0]
-                        skip_update = False
-                        
-                        # 检查今天是否已有“成功”或“已签到”的记录
-                        for item in history:
-                            if item.get("date", "").startswith(record_date):
-                                current_status = item.get("status", "")
-                                # 核心修复：如果已经是“成功”或“已签到”状态，则跳过覆盖，防止丢失详细奖励信息
-                                if "成功" in current_status or "已签到" in current_status:
-                                    skip_update = True
-                                    logger.info(f"今日已存在有效签到记录({current_status})，跳过从用户信息同步签到状态")
-                                break
-                        
-                        if not skip_update:
-                            history_record = {
-                                "date": last_checkin_time,
-                                "status": "已签到",  # 标记为已签到
-                                "money": attrs.get('money', 0),
-                                "totalContinuousCheckIn": attrs.get('totalContinuousCheckIn', 0),
-                                "lastCheckinMoney": attrs.get('lastCheckinMoney', 0),
-                                "failure_count": 0
-                            }
-                            # 保存到历史记录（_save_history 会处理覆盖逻辑）
-                            self._save_history(history_record)
-                            logger.info(f"同步个人信息时检测到今日已签到，已更新本地记录。奖励: {attrs.get('lastCheckinMoney', 0)}")
-            except Exception as e:
-                logger.warning(f"同步签到历史记录失败: {e}")
-            # --- 同步签到历史记录 END ---
-
-            logger.info("成功更新并保存了蜂巢用户信息。")
-
-            try:
-                user_attrs = user_info.get('data', {}).get('attributes', {})
-                unread_notifications = user_attrs.get('unreadNotificationCount', 0)
-                if unread_notifications > 0:
-                    logger.info(f"检测到 {unread_notifications} 条未读消息，发送通知。")
-                    self._send_notification(
-                        title=f"【📢 蜂巢论坛消息提醒】",
-                        text=f"您有 {unread_notifications} 条未读消息待处理，请及时访问蜂巢论坛查看。"
-                    )
-            except Exception as e:
-                logger.warning(f"检查未读消息时发生错误: {e}")
-
-            if is_scheduled_run:
-                self._timed_update_current_retry = 0
-
+                self._notify_status_transition(self._sync_if_requested(self.__api_request("GET", "/api/integrations/moviepilot/v1/status")))
+            except Exception as status_error:
+                logger.warning(f"读取蜂巢 PT 资格状态失败: {status_error}")
+            self._timed_update_current_retry = 0
+            if self._scheduler and self._scheduler.get_job("fengchao_info_update_retry"):
+                self._scheduler.remove_job("fengchao_info_update_retry")
             self._send_notification(
-                title="【✅ 蜂巢信息更新成功】",
-                text=f"已成功获取并刷新您的蜂巢论坛个人信息。\n"
-                     f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                title="【✅ 蜂巢 PT 人生同步成功】",
+                text=f"已上传 {result.get('siteCount', 0)} 个站点的最新快照。",
             )
+            return result
+        except Exception as exc:
+            logger.error(f"蜂巢 PT 人生同步失败: {exc}")
+            if is_scheduled_run and self._timed_update_current_retry < self._timed_update_retry_count:
+                self._timed_update_current_retry += 1
+                try:
+                    self._schedule_info_update_retry(batch_id)
+                except Exception as schedule_error:
+                    self._timed_update_current_retry -= 1
+                    logger.error(f"安排蜂巢 PT 人生延迟重试失败: {schedule_error}")
+            self._send_info_update_failure_notification(str(exc))
+            return False
 
-        except Exception as e:
-            logger.error(f"更新蜂巢用户信息失败: {e}")
-            if is_scheduled_run:
-                self._send_info_update_failure_notification(reason=str(e))
-                if self._timed_update_retry_count > 0 and self._timed_update_current_retry < self._timed_update_retry_count:
-                    self._timed_update_current_retry += 1
-                    self._schedule_info_update_retry()
-                else:
-                    if self._timed_update_retry_count > 0:
-                        logger.info("用户信息更新已达到最大定时重试次数，不再重试")
-                    self._timed_update_current_retry = 0
-            else:
-                self._send_notification(
-                    title="【❌ 蜂巢信息更新失败】",
-                    text=f"在尝试刷新您的蜂巢论坛个人信息时发生错误。\n"
-                         f"💬 原因：{e}\n"
-                         f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-        finally:
-            if not is_scheduled_run:
-                self._update_info_now = False
-                self.update_config(self.get_config_dict())
-
-    def __signin(self, retry_count=0, max_retries=3):
+    def __signin(self, retry_count=0, max_retries=3, is_retry=False):
         """
         蜂巢签到
         """
-        # 增加任务锁，防止重复执行
-        if hasattr(self, '_signing_in') and self._signing_in:
-            logger.info("已有签到任务在执行，跳过当前任务")
-            return
+        if not is_retry:
+            self._current_retry = 0
+        return self.__api_signin()
+    def __api_headers(self):
+        if not self._api_key:
+            raise RuntimeError("未配置 MP 专用 API Key，请在论坛“隐秘的角落”生成并粘贴 API Key")
+        return {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": f"MoviePilot-FengchaoSignin/{self.plugin_version}",
+            "X-MoviePilot-Instance-Id": self._instance_id,
+            "X-MoviePilot-Plugin-Version": self.plugin_version,
+            "X-MoviePilot-Version": str(getattr(settings, "VERSION_FLAG", "")),
+        }
 
-        self._signing_in = True
-        attempt = 0
+    def __api_request(self, method, path, payload=None):
+        base_url = _resolve_api_base()
+        response = requests.request(method, f"{base_url}{path}", headers=self.__api_headers(), json=payload, timeout=(5, 30), proxies=self._get_proxies() if self._use_proxy else None, allow_redirects=False)
         try:
-            # 检查用户名密码是否配置
-            if not self._username or not self._password:
-                logger.error("未配置用户名密码，无法进行签到")
-                if self._notify:
-                    self._send_notification(
-                        title="【❌ 蜂巢签到失败】",
-                        text=(
-                            f"📢 执行结果\n"
-                            f"━━━━━━━━━━\n"
-                            f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"❌ 状态：签到失败，未配置用户名密码\n"
-                            f"━━━━━━━━━━\n"
-                            f"💡 配置方法\n"
-                            f"• 在插件设置中填写蜂巢论坛用户名和密码\n"
-                            f"━━━━━━━━━━"
-                        )
-                    )
-                return False
+            result = response.json() or {}
+        except Exception as exc:
+            raise RuntimeError(f"论坛返回非 JSON 响应（HTTP {response.status_code}）") from exc
+        if response.status_code >= 400 or result.get("code") not in (None, 0):
+            raise RuntimeError(result.get("message") or f"论坛 API 请求失败（HTTP {response.status_code}）")
+        return result.get("data") or {}
 
-            # 使用循环而非递归实现重试
-            for attempt in range(max_retries + 1):
-                if attempt > 0:
-                    logger.info(f"正在进行第 {attempt}/{max_retries} 次重试...")
-                    time.sleep(3)  # 重试前等待3秒
-
-                # 获取代理设置
-                proxies = self._get_proxies()
-
-                # 每次都重新登录获取cookie
-                logger.info(f"开始登录蜂巢论坛获取cookie...")
-                cookie = self._login_and_get_cookie(proxies)
-                if not cookie:
-                    logger.error(f"登录失败，无法获取cookie")
-                    if attempt < max_retries:
-                        continue
-                    raise Exception("登录失败，无法获取cookie")
-
-                logger.info(f"登录成功，成功获取cookie")
-
-                # 使用获取的cookie访问蜂巢
+    def __api_signin(self):
+        if getattr(self, "_signing_in", False):
+            logger.info("已有签到任务在执行，跳过当前任务")
+            return False
+        self._signing_in = True
+        started = datetime.now()
+        self._current_batch_id = f"{self._instance_id}-{started.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:12]}"
+        # Network failures are retried by a dated scheduler job instead of a
+        # long sleep loop. One invocation therefore issues at most one
+        # check-in write; the forum endpoint remains idempotent by user/day.
+        max_attempts = 1
+        last_error = None
+        try:
+            for attempt in range(max_attempts):
                 try:
-                    res = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.club")
-                except Exception as e:
-                    logger.error(f"请求蜂巢出错: {str(e)}")
-                    if attempt < max_retries:
-                        continue
-                    raise Exception("连接站点出错")
-
-                if not res or res.status_code != 200:
-                    logger.error(f"请求蜂巢返回错误状态码: {res.status_code if res else '无响应'}")
-                    if attempt < max_retries:
-                        continue
-                    raise Exception("无法连接到站点")
-
-                pre_money = None
-                pre_days = None
-                try:
-                    pre_money_match = re.search(r'"money":\s*([\d.]+)', res.text)
-                    if pre_money_match:
-                        pre_money = float(pre_money_match.group(1))
-                    pre_days_match = re.search(r'"totalContinuousCheckIn":\s*(\d+)', res.text)
-                    if pre_days_match:
-                        pre_days = int(pre_days_match.group(1))
-                    logger.info(f"签到前状态检查：当前花粉 -> {pre_money}, 签到天数 -> {pre_days}")
-                except Exception as e:
-                    logger.warning(f"签到前解析用户状态失败，将依赖API原始判断: {e}")
-
-                # 获取csrfToken
-                pattern = r'"csrfToken":"(.*?)"'
-                csrfToken = re.findall(pattern, res.text)
-                if not csrfToken:
-                    logger.error("请求csrfToken失败")
-                    if attempt < max_retries:
-                        continue
-                    raise Exception("无法获取CSRF令牌")
-
-                csrfToken = csrfToken[0]
-                logger.info(f"获取csrfToken成功 {csrfToken}")
-
-                # 获取userid
-                pattern = r'"userId":(\d+)'
-                match = re.search(pattern, res.text)
-
-                if match and match.group(1) != "0":
-                    userId = match.group(1)
-                    logger.info(f"获取userid成功 {userId}")
-
-                    # 如果开启了蜂巢论坛PT人生数据更新，尝试更新数据
-                    if self._mp_push_enabled:
-                        self.__push_mp_stats(user_id=userId, csrf_token=csrfToken, cookie=cookie)
-                else:
-                    logger.error("未找到userId")
-                    if attempt < max_retries:
-                        continue
-                    raise Exception("无法获取用户ID")
-
-                # 准备签到请求
-                headers = {
-                    "X-Csrf-Token": csrfToken,
-                    "X-Http-Method-Override": "PATCH",
-                    "Cookie": cookie
-                }
-
-                data = {
-                    "data": {
-                        "type": "users",
-                        "attributes": {
-                            "canCheckin": False,
-                            "totalContinuousCheckIn": 2
-                        },
-                        "id": userId
-                    }
-                }
-
-                # 开始签到
-                try:
-                    res = RequestUtils(headers=headers, proxies=proxies, timeout=30).post_res(
-                        url=f"https://pting.club/api/users/{userId}",
-                        json=data
-                    )
-                except Exception as e:
-                    logger.error(f"签到请求出错: {str(e)}")
-                    if attempt < max_retries:
-                        continue
-                    raise Exception("签到请求异常")
-
-                if not res or res.status_code != 200:
-                    logger.error(f"蜂巢签到失败，状态码: {res.status_code if res else '无响应'}")
-                    if attempt < max_retries:
-                        continue
-                    raise Exception("API请求错误")
-
-                # 签到成功
-                sign_dict = json.loads(res.text)
-
-                # 直接保存签到后的用户信息
-                self.save_data("user_info", sign_dict)
-                self.save_data("user_info_updated_at", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-                logger.info("成功获取并保存用户信息。")
-
-                # 新增：检查未读消息并通知
-                try:
-                    user_attrs_for_msg = sign_dict.get('data', {}).get('attributes', {})
-                    unread_notifications = user_attrs_for_msg.get('unreadNotificationCount', 0)
-                    if unread_notifications > 0:
-                        logger.info(f"检测到 {unread_notifications} 条未读消息，发送通知。")
-                        self._send_notification(
-                            title=f"【📢 蜂巢论坛消息提醒】",
-                            text=f"您有 {unread_notifications} 条未读消息待处理，请及时访问蜂巢论坛查看。"
-                        )
-                except Exception as e:
-                    logger.warning(f"检查未读消息时发生错误: {e}")
-
-                money = sign_dict['data']['attributes']['money']
-                totalContinuousCheckIn = sign_dict['data']['attributes']['totalContinuousCheckIn']
-                lastCheckinMoney = sign_dict['data']['attributes'].get('lastCheckinMoney', 0)
-
-                formatted_money = self._format_pollen(money)
-                formatted_last_checkin_money = self._format_pollen(lastCheckinMoney)
-
-                is_successful_checkin = False
-                if pre_money is not None and pre_days is not None:
-                    if money > pre_money or totalContinuousCheckIn > pre_days:
-                        is_successful_checkin = True
-                else:
-                    can_checkin_before = '"canCheckin":true' in res.text
-                    logger.info(f"回退到API标志位判断: canCheckin -> {can_checkin_before}")
-                    if can_checkin_before:
-                        is_successful_checkin = True
-
-                if is_successful_checkin:
-                    status_text = "签到成功"
-                    reward_text = f"获得{formatted_last_checkin_money}花粉奖励" if lastCheckinMoney > 0 else "获得奖励"
-                    logger.info(
-                        f"蜂巢签到成功，获得{formatted_last_checkin_money}花粉，当前花粉: {formatted_money}，累计签到: {totalContinuousCheckIn}")
-                else:
-                    status_text = "已签到"
-                    reward_text = "今日已领取奖励"
-                    logger.info(f"蜂巢已签到，当前花粉: {formatted_money}，累计签到: {totalContinuousCheckIn}")
-
-                # 发送通知
-                if self._notify:
-                    self._send_notification(
-                        title=f"【✅ 蜂巢{status_text}】",
-                        text=(
-                            f"📢 执行结果\n"
-                            f"━━━━━━━━━━\n"
-                            f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"✨ 状态：{status_text}\n"
-                            f"🎁 奖励：{reward_text}\n"
-                            f"━━━━━━━━━━\n"
-                            f"📊 积分统计\n"
-                            f"🌸 花粉：{formatted_money}\n"
-                            f"📆 签到天数：{totalContinuousCheckIn}\n"
-                            f"━━━━━━━━━━"
-                        )
-                    )
-
-                # 准备历史记录
-                history_record = {
-                    "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "status": status_text,
-                    "money": money,
-                    "totalContinuousCheckIn": totalContinuousCheckIn,
-                    "lastCheckinMoney": lastCheckinMoney if is_successful_checkin else 0,
-                    "failure_count": 0
-                }
-
-                # 保存签到历史
-                self._save_history(history_record)
-
-                # 如果是重试后成功，重置重试计数
-                if self._current_retry > 0:
-                    logger.info(f"蜂巢签到重试成功，重置重试计数")
-                    self._current_retry = 0
-
-                # 签到成功，退出循环
-                return True
-
-        except Exception as e:
-            logger.error(f"签到过程发生异常: {str(e)}")
-            import traceback
-            logger.error(f"错误详情: {traceback.format_exc()}")
-
-            # 保存失败记录
-            failure_history_record = {
-                "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                "status": "签到失败",
-                "reason": str(e),
-                "failure_count": 1  # 初始失败次数为1
-            }
-            self._save_history(failure_history_record)
-
-            # 所有重试失败，发送通知并退出
-            self._send_signin_failure_notification(str(e), attempt)
-
-            # 设置下次定时重试
-            if self._retry_count > 0 and self._current_retry < self._retry_count:
+                    # /me binds the instance and returns the owner card. Once
+                    # that cache is fresh, check-in/snapshot/status are enough;
+                    # revalidate at most once per day to reduce forum load.
+                    if self._identity_refresh_due():
+                        identity = self.__api_request("GET", "/api/integrations/moviepilot/v1/me")
+                        identity_status = identity.get("status") if isinstance(identity, dict) and isinstance(identity.get("status"), dict) else identity
+                        self._notify_status_transition(identity_status)
+                    result = self.__api_request("POST", "/api/integrations/moviepilot/v1/check-in", {})
+                    self._cache_checkin_result(result)
+                    pushed_snapshot = False
+                    snapshot_error = None
+                    if self._mp_push_enabled and (not self._timed_update_enabled or self._snapshot_refresh_due()):
+                        try:
+                            # A snapshot failure must not retry an already
+                            # successful check-in. The daily snapshot job has
+                            # its own bounded retry policy.
+                            snapshot = self.__push_stats_with_retries(retry_count=0)
+                            pushed_snapshot = True
+                        except Exception as exc:
+                            snapshot_error = exc
+                            snapshot = self.get_data("last_push_result") or {}
+                            logger.warning(f"签到成功，但 PT 人生快照同步失败：{exc}")
+                    else:
+                        snapshot = self.get_data("last_push_result") or {}
+                    # Qualification can only change after a snapshot (apart
+                    # from administrative actions). Poll status after a push,
+                    # otherwise at most every 12 hours. The check-in response
+                    # already carried the authoritative streak summary.
+                    if pushed_snapshot or self._status_refresh_due():
+                        try:
+                            self._notify_status_transition(self._sync_if_requested(self.__api_request("GET", "/api/integrations/moviepilot/v1/status")))
+                        except Exception as status_error:
+                            # A successful check-in must never be retried just
+                            # because the optional status refresh failed.
+                            logger.warning(f"蜂巢签到成功，但读取资格状态失败：{status_error}")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if attempt + 1 >= max_attempts:
+                        raise
+                    logger.warning(f"蜂巢 API 签到第 {attempt + 1} 次失败，将重试：{exc}")
+                    backoff_seconds = min(max(1, int(self._retry_interval or 1) * 3600) * (2 ** attempt), 1800)
+                    time.sleep(backoff_seconds + random.uniform(0, min(30, backoff_seconds * 0.1)))
+            already = bool(result.get("alreadyCheckedIn"))
+            status_text = "已签到" if already else "签到成功"
+            reward = result.get("reward", 0)
+            streak = result.get("currentStreak", 0)
+            sync_line = f"📊 PT 站点：{snapshot.get('siteCount', 0)} 个" if not snapshot_error else "📊 PT 同步：本次失败，将由独立同步任务重试"
+            self._send_notification(title=f"【✅ 蜂巢{status_text}】", text=(f"📢 执行结果\n━━━━━━━━━━\n🕐 时间：{started.strftime('%Y-%m-%d %H:%M:%S')}\n✨ 状态：{status_text}\n🎁 奖励：{reward}\n📆 连续签到：{streak}\n{sync_line}\n━━━━━━━━━━"))
+            self._save_history({"date": started.strftime('%Y-%m-%d %H:%M:%S'), "status": status_text, "reward": reward, "currentStreak": streak, "siteCount": snapshot.get("siteCount", 0), "failure_count": 0})
+            self._current_retry = 0
+            if self._scheduler and self._scheduler.get_job("fengchao_signin_retry"):
+                self._scheduler.remove_job("fengchao_signin_retry")
+            return True
+        except Exception as exc:
+            logger.error(f"蜂巢 API Key 签到失败: {exc}")
+            if self._current_retry < self._retry_count:
                 self._current_retry += 1
-                retry_hours = self._retry_interval
-                logger.info(f"安排第{self._current_retry}次定时重试，将在{retry_hours}小时后重试")
-                self._schedule_retry(hours=retry_hours)
-            else:
-                if self._retry_count > 0:
-                    logger.info("已达到最大定时重试次数，不再重试")
-                self._current_retry = 0
-
+                try:
+                    self._schedule_retry()
+                except Exception as schedule_error:
+                    self._current_retry -= 1
+                    logger.error(f"安排蜂巢签到延迟重试失败: {schedule_error}")
+            self._save_history({"date": started.strftime('%Y-%m-%d %H:%M:%S'), "status": "签到失败", "reason": str(last_error or exc), "failure_count": self._current_retry or 1})
+            self._send_signin_failure_notification(str(last_error or exc), self._current_retry)
             return False
         finally:
-            # 释放锁
             self._signing_in = False
+            self._current_batch_id = None
+
+    def __api_push_stats(self):
+        raw = self._get_site_statistics() or {}
+        managed = {}
+        try:
+            from app.helper.sites import SitesHelper
+            managed = {str(item.get("name")): item for item in SitesHelper().get_indexers() if item.get("name")}
+        except Exception:
+            managed = {}
+        normalized = []
+        for site in (raw.get("sites", []) if isinstance(raw, dict) else [])[:200]:
+            if not isinstance(site, dict) or not site.get("name") or site.get("error"):
+                continue
+            config = managed.get(str(site.get("name"))) or {}
+            normalized.append({"name": str(site.get("name")), "domain": str(config.get("url") or ""), "mpSiteId": str(config.get("id") or ""), "username": str(site.get("username") or ""), "userLevel": str(site.get("user_level") or ""), "upload": _safe_nonnegative_int(site.get("upload")), "download": _safe_nonnegative_int(site.get("download")), "bonus": _safe_bonus(site.get("bonus")), "seeding": _safe_nonnegative_int(site.get("seeding")), "seedingSize": _safe_nonnegative_int(site.get("seeding_size"))})
+        now = datetime.now(tz=pytz.UTC).isoformat()
+        result = self.__api_request("PUT", "/api/integrations/moviepilot/v1/pt-life/snapshot", {"schemaVersion": 1, "instanceId": self._instance_id, "pluginVersion": self.plugin_version, "moviePilotVersion": str(getattr(settings, "VERSION_FLAG", "")), "clientBatchId": getattr(self, "_current_batch_id", None) or f"{self._instance_id}-{now[:19]}", "collectedAt": now, "sites": normalized})
+        self._last_push_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.save_data("last_push_time", self._last_push_time)
+        self.save_data("last_push_result", result)
+        return result
+
+    def __push_stats_with_retries(self, retry_count=None, retry_interval=None, batch_id=None):
+        """上传 PT 人生快照，并复用原插件的失败重试设置。"""
+        if getattr(self, "_pushing_stats", False):
+            logger.info("已有 PT 人生同步任务在执行，复用最近结果")
+            cached = self.get_data("last_push_result")
+            if isinstance(cached, dict):
+                return cached
+            raise RuntimeError("已有 PT 人生同步任务正在执行")
+        self._pushing_stats = True
+        owns_batch_id = not bool(getattr(self, "_current_batch_id", None))
+        if owns_batch_id:
+            started = datetime.now(tz=pytz.UTC)
+            self._current_batch_id = batch_id or f"{self._instance_id}-{started.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:12]}"
+        configured_retries = self._retry_count if retry_count is None else retry_count
+        configured_interval = self._retry_interval if retry_interval is None else retry_interval
+        max_attempts = max(1, int(configured_retries or 0) + 1)
+        last_error = None
+        try:
+            for attempt in range(max_attempts):
+                try:
+                    return self.__api_push_stats()
+                except Exception as exc:
+                    last_error = exc
+                    if attempt + 1 >= max_attempts:
+                        raise
+                    # Reuse the same client batch ID for every retry. A lost
+                    # response can therefore never create a second snapshot.
+                    base_delay = min(max(1, int(configured_interval or 1)) * 60, 900)
+                    delay = min(base_delay * (2 ** attempt), 1800)
+                    logger.warning(f"蜂巢 PT 人生同步第 {attempt + 1} 次失败，将重试：{exc}")
+                    time.sleep(delay + random.uniform(0, min(30, delay * 0.1)))
+            raise last_error or RuntimeError("蜂巢 PT 人生同步失败")
+        finally:
+            self._pushing_stats = False
+            if owns_batch_id:
+                self._current_batch_id = None
+
+    def _notify_status_transition(self, status):
+        if not isinstance(status, dict):
+            return
+        previous = self.get_data("last_status") or {}
+        previous_circle = bool(previous.get("ptCircle")) if isinstance(previous, dict) else False
+        current_circle = bool(status.get("ptCircle"))
+        if current_circle and not previous_circle:
+            self._send_notification("【✅ 蜂巢 PT 圈子认证通过】", "你的 PT 人生已满足圈子认证规则，隐藏圈子权限已按后台规则开放。")
+        elif previous_circle and not current_circle:
+            self._send_notification("【⚠️ 蜂巢 PT 圈子资格暂停】", "当前同步结果不再满足圈子条件或已进入宽限期，请查看论坛 PT 人生认证中心。")
+        previous_qualifications = {str(item.get("ruleId")): item.get("state") for item in previous.get("qualifications", []) if isinstance(item, dict)} if isinstance(previous, dict) else {}
+        rule_names = {
+            str(item.get("ruleId")): str(item.get("name") or "圈子认证规则")
+            for item in (status.get("qualificationRules") if isinstance(status.get("qualificationRules"), list) else [])
+            if isinstance(item, dict) and item.get("ruleId")
+        }
+        for item in status.get("qualifications", []) if isinstance(status.get("qualifications"), list) else []:
+            if not isinstance(item, dict) or not item.get("ruleId"):
+                continue
+            state = item.get("state")
+            if state in {"GRACE", "SUSPENDED"} and previous_qualifications.get(str(item["ruleId"])) not in {state, "GRACE", "SUSPENDED"}:
+                state_text = "进入宽限期" if state == "GRACE" else "资格已暂停"
+                self._send_notification("【⚠️ 蜂巢 PT 认证状态变化】", f"{rule_names.get(str(item['ruleId']), '圈子认证')}：{state_text}。请在论坛认证中心查看原因和恢复条件。")
+        # Keep a small owner-only cache for the plugin page.  The cache is
+        # intentionally bounded and contains no site usernames or raw
+        # snapshots, so rendering the original plugin UI never needs another
+        # forum request.
+        qualifications = status.get("qualifications", []) if isinstance(status.get("qualifications"), list) else []
+        compact_qualifications = [item for item in qualifications[:30] if isinstance(item, dict)]
+        account_fresh = isinstance(status.get("account"), dict)
+        account = status.get("account") if account_fresh else (previous.get("account") if isinstance(previous, dict) and isinstance(previous.get("account"), dict) else None)
+        compact_account = None
+        if account:
+            compact_account = {
+                "uid": _safe_nonnegative_int(account.get("uid")),
+                "username": str(account.get("username") or ""),
+                "displayName": str(account.get("displayName") or account.get("username") or ""),
+                "avatarPath": account.get("avatarPath") if isinstance(account.get("avatarPath"), str) else None,
+                "vipLevel": _safe_nonnegative_int(account.get("vipLevel")),
+                "level": _safe_nonnegative_int(account.get("level")),
+                "levelName": str(account.get("levelName") or ""),
+                "levelIcon": str(account.get("levelIcon") or "🌱"),
+                "levelColor": str(account.get("levelColor") or "#64748b"),
+                "points": _safe_nonnegative_int(account.get("points")),
+                "postCount": _safe_nonnegative_int(account.get("postCount")),
+                "commentCount": _safe_nonnegative_int(account.get("commentCount")),
+                "likeReceivedCount": _safe_nonnegative_int(account.get("likeReceivedCount")),
+                "favoriteCount": _safe_nonnegative_int(account.get("favoriteCount")),
+                "followerCount": _safe_nonnegative_int(account.get("followerCount")),
+                "boardCount": _safe_nonnegative_int(account.get("boardCount")),
+                "receivedTipCount": _safe_nonnegative_int(account.get("receivedTipCount")),
+                "acceptedAnswerCount": _safe_nonnegative_int(account.get("acceptedAnswerCount")),
+                "joinedAt": account.get("joinedAt") if isinstance(account.get("joinedAt"), str) else None,
+                "lastLoginAt": account.get("lastLoginAt") if isinstance(account.get("lastLoginAt"), str) else None,
+                "radar": [
+                    {
+                        "key": str(item.get("key") or ""),
+                        "label": str(item.get("label") or ""),
+                        "score": _safe_nonnegative_int(item.get("score")),
+                        "displayScore": _safe_nonnegative_int(item.get("displayScore", item.get("score"))),
+                        "detail": str(item.get("detail") or ""),
+                    }
+                    for item in (account.get("radar") if isinstance(account.get("radar"), list) else [])[:6]
+                    if isinstance(item, dict)
+                ],
+                "badges": [
+                    {
+                        "id": str(item.get("id") or ""),
+                        "code": str(item.get("code") or ""),
+                        "name": str(item.get("name") or "勋章"),
+                        "description": str(item.get("description") or ""),
+                        "iconText": item.get("iconText") if isinstance(item.get("iconText"), str) else None,
+                        "iconPath": item.get("iconPath") if isinstance(item.get("iconPath"), str) else None,
+                        "imageUrl": item.get("imageUrl") if isinstance(item.get("imageUrl"), str) else None,
+                        "color": str(item.get("color") or "primary"),
+                        "category": str(item.get("category") or "社区成就"),
+                        "hidden": bool(item.get("hidden")),
+                        "isDisplayed": bool(item.get("isDisplayed", True)),
+                        "source": str(item.get("source") or ""),
+                        "systemState": item.get("systemState") if isinstance(item.get("systemState"), str) else None,
+                    }
+                    for item in (account.get("badges") if isinstance(account.get("badges"), list) else [])[:60]
+                    if isinstance(item, dict)
+                ],
+                "recentCheckIns": [
+                    {
+                        "date": str(item.get("date") or ""),
+                        "reward": _safe_nonnegative_int(item.get("reward")),
+                        "isMakeUp": bool(item.get("isMakeUp")),
+                    }
+                    for item in (account.get("recentCheckIns") if isinstance(account.get("recentCheckIns"), list) else [])[:31]
+                    if isinstance(item, dict) and item.get("date")
+                ],
+            }
+        self.save_data("last_status", {
+            "ptCircle": current_circle,
+            "qualifications": compact_qualifications,
+            "checkIn": status.get("checkIn") if isinstance(status.get("checkIn"), dict) else (previous.get("checkIn") if isinstance(previous, dict) and isinstance(previous.get("checkIn"), dict) else None),
+            "account": compact_account,
+            "connected": bool(status.get("connected")),
+            "active": bool(status.get("active")),
+            "state": status.get("state"),
+            "lastSeenAt": status.get("lastSeenAt"),
+            "lastSnapshotAt": status.get("lastSnapshotAt"),
+            "cachedAt": datetime.now(tz=pytz.UTC).isoformat(),
+            "identityRefreshedAt": datetime.now(tz=pytz.UTC).isoformat() if account_fresh else (previous.get("identityRefreshedAt") if isinstance(previous, dict) else None),
+        })
+
+    def _get_cached_status(self):
+        status = self.get_data("last_status") or {}
+        return status if isinstance(status, dict) else {}
+
+    def _force_refresh_info(self):
+        """一次性强制刷新：重新拉取身份卡、签到摘要与圈子状态并更新本地缓存。"""
+        try:
+            identity = self.__api_request("GET", "/api/integrations/moviepilot/v1/me")
+            status = identity.get("status") if isinstance(identity, dict) and isinstance(identity.get("status"), dict) else identity
+            if not isinstance(status, dict) or not isinstance(status.get("account"), dict):
+                raise RuntimeError("论坛未返回身份卡数据")
+            self._notify_status_transition(status)
+            try:
+                self._notify_status_transition(self._sync_if_requested(self.__api_request("GET", "/api/integrations/moviepilot/v1/status")))
+            except Exception as status_error:
+                logger.warning(f"蜂巢强制刷新成功，但读取圈子状态失败：{status_error}")
+            self._send_notification("【✅ 蜂巢信息已刷新】", "已强制重新拉取论坛身份卡、签到摘要与圈子状态。")
+        except Exception as exc:
+            logger.error(f"蜂巢强制刷新论坛信息失败: {exc}")
+            self._send_notification("【⚠️ 蜂巢信息刷新失败】", str(exc))
+
+    def _identity_refresh_due(self, max_age_hours: int = 24) -> bool:
+        """Whether the local owner/instance cache needs a heartbeat."""
+        status = self._get_cached_status()
+        refreshed_at = status.get("identityRefreshedAt")
+        if not isinstance(status.get("account"), dict) or not isinstance(refreshed_at, str) or not refreshed_at:
+            return True
+        try:
+            parsed = datetime.fromisoformat(refreshed_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=pytz.UTC)
+            return (datetime.now(tz=pytz.UTC) - parsed).total_seconds() >= max_age_hours * 3600
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    def _status_refresh_due(self, max_age_hours: int = 12) -> bool:
+        """Bound status polling while still seeing admin actions promptly."""
+        cached_at = self._get_cached_status().get("cachedAt")
+        if not isinstance(cached_at, str) or not cached_at:
+            return True
+        try:
+            parsed = datetime.fromisoformat(cached_at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=pytz.UTC)
+            return (datetime.now(tz=pytz.UTC) - parsed).total_seconds() >= max_age_hours * 3600
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    def _cache_checkin_result(self, result):
+        """Merge the check-in write response into the owner-only local cache."""
+        if not isinstance(result, dict):
+            return
+        previous = self._get_cached_status()
+        summary = result.get("checkIn") if isinstance(result.get("checkIn"), dict) else {}
+        if not summary:
+            summary = {
+                "checkedInToday": True,
+                "todayReward": _safe_nonnegative_int(result.get("reward")),
+                "todayIsMakeUp": False,
+                "currentStreak": _safe_nonnegative_int(result.get("currentStreak")),
+                "maxStreak": _safe_nonnegative_int(result.get("maxStreak")),
+                "lastCheckInDate": result.get("date"),
+            }
+        previous["checkIn"] = summary
+        account = previous.get("account") if isinstance(previous.get("account"), dict) else None
+        date_key = str(result.get("date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+        if account and date_key:
+            rows = [item for item in account.get("recentCheckIns", []) if isinstance(item, dict) and str(item.get("date") or "") != date_key]
+            rows.insert(0, {
+                "date": date_key,
+                "reward": _safe_nonnegative_int(result.get("reward")),
+                "isMakeUp": False,
+            })
+            account["recentCheckIns"] = rows[:31]
+            previous["account"] = account
+        self.save_data("last_status", previous)
+
+    def _snapshot_refresh_due(self, max_age_hours: int = 18) -> bool:
+        """Avoid a second full snapshot when the timed job ran recently."""
+        last_push = self.get_data("last_push_time")
+        if not isinstance(last_push, str) or not last_push:
+            return True
+        try:
+            pushed_at = datetime.strptime(last_push, "%Y-%m-%d %H:%M:%S").replace(tzinfo=pytz.UTC)
+            return (datetime.now(tz=pytz.UTC) - pushed_at).total_seconds() >= max_age_hours * 3600
+        except (TypeError, ValueError, OverflowError):
+            return True
+
+    def _sync_if_requested(self, status):
+        """后台要求重新同步时，在下一个插件周期主动上传一次快照。"""
+        if not isinstance(status, dict):
+            return status
+        request = status.get("syncRequest")
+        requested_at = request.get("requestedAt") if isinstance(request, dict) else None
+        if not requested_at or requested_at == self.get_data("last_sync_request"):
+            return status
+        try:
+            self.__push_stats_with_retries(retry_count=0)
+            self.save_data("last_sync_request", requested_at)
+            return self.__api_request("GET", "/api/integrations/moviepilot/v1/status")
+        except Exception as exc:
+            logger.warning(f"蜂巢后台要求同步，但快照上传失败: {exc}")
+            return status
 
     def _save_history(self, record: Dict[str, Any]):
         """
@@ -813,440 +977,266 @@ class FengchaoSignin(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        pass
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        return [
+            {"path": "/fengchao_test", "endpoint": self.api_test, "methods": ["GET"], "summary": "测试蜂巢连接", "description": "使用 MP 专用 API Key 测试论坛连接"},
+            {"path": "/fengchao_checkin", "endpoint": self.api_checkin, "methods": ["POST"], "summary": "立即蜂巢签到", "description": "调用论坛原生签到 API，并保留通知与历史记录"},
+            {"path": "/fengchao_sync", "endpoint": self.api_sync, "methods": ["POST"], "summary": "立即同步 PT 人生", "description": "从 MoviePilot 本地统计模型上传一份幂等快照"},
+            {"path": "/fengchao_status", "endpoint": self.api_status, "methods": ["GET"], "summary": "查看蜂巢最近结果", "description": "返回最近同步结果和本地签到历史摘要"},
+        ]
+
+    def api_test(self) -> schemas.Response:
+        try:
+            payload = self.__api_request("GET", "/api/integrations/moviepilot/v1/me")
+            status = payload.get("status") if isinstance(payload, dict) and isinstance(payload.get("status"), dict) else payload
+            self._notify_status_transition(status)
+            return schemas.Response(success=True, data={"connected": True, "status": status})
+        except Exception as exc:
+            return schemas.Response(success=False, message=str(exc))
+
+    def api_checkin(self) -> schemas.Response:
+        return schemas.Response(success=self.__signin(), data={"history": self.get_data("history") or []})
+
+    def api_sync(self) -> schemas.Response:
+        try:
+            result = self.__push_stats_with_retries(retry_count=0)
+            self._notify_status_transition(self._sync_if_requested(self.__api_request("GET", "/api/integrations/moviepilot/v1/status")))
+            return schemas.Response(success=True, data=result)
+        except Exception as exc:
+            return schemas.Response(success=False, message=str(exc))
+
+    def api_status(self) -> schemas.Response:
+        return schemas.Response(success=True, data={"lastSync": self.get_data("last_push_result") or {}, "history": self.get_data("history") or [], "status": self._get_cached_status()})
 
     def get_service(self) -> List[Dict[str, Any]]:
-        """
-        注册插件公共服务
-        """
-        services = []
-
-        if self._enabled and self._cron:
-            services.append({
-                "id": "FengchaoSignin",
-                "name": "蜂巢签到服务",
-                "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self.__signin,
-                "kwargs": {}
-            })
-
-        if self._enabled and self._mp_push_enabled:
-            services.append({
-                "id": "MoviePilotStatsPush",
-                "name": "蜂巢论坛PT人生数据更新服务",
-                "trigger": "interval",
-                "func": self.__check_and_push_mp_stats,
-                "kwargs": {"hours": 6}
-            })
-
-        return services
+        """任务由插件内的单一调度器管理，避免宿主再次注册同一任务。"""
+        return []
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """
-        拼装插件配置页面
-        """
+        """MoviePilot 原生配置页：真实蜂巢 Logo + 分区卡片，次要设置折叠。"""
         version = getattr(settings, "VERSION_FLAG", "v1")
         cron_field_component = "VCronField" if version == "v2" else "VTextField"
-        return [
-            {
-                'component': 'VForm',
-                'content': [
-                    {
-                        'component': 'VCard',
-                        'props': {
-                            'variant': 'outlined',
-                            'class': 'mt-3'
-                        },
-                        'content': [
-                            {
-                                'component': 'VCardTitle',
-                                'props': {
-                                    'class': 'd-flex align-center'
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VIcon',
-                                        'props': {
-                                            'style': 'color: #1976D2;',
-                                            'class': 'mr-2'
-                                        },
-                                        'text': 'mdi-calendar-check'
-                                    },
-                                    {
-                                        'component': 'span',
-                                        'text': '蜂巢签到设置'
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VDivider'
-                            },
-                            {
-                                'component': 'VCardText',
-                                'content': [
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {'component': 'VSwitch',
-                                                     'props': {'model': 'enabled', 'label': '启用插件', 'color': 'primary'}}
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {'component': 'VSwitch',
-                                                     'props': {'model': 'notify', 'label': '开启通知', 'color': 'info'}}
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'onlyonce',
-                                                            'label': '立即运行一次',
-                                                            'color': 'warning',
-                                                            'hint': '同时执行签到和信息更新任务',
-                                                            'persistent-hint': True
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'use_proxy', 'label': '使用代理',
-                                                            'hint': '与蜂巢论坛通信时使用系统代理',
-                                                            'color': 'primary',
-                                                            'persistent-hint': True
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'update_info_now',
-                                                            'label': '立即更新个人信息',
-                                                            'hint': '不执行签到，仅刷新插件页面显示的用户信息',
-                                                            'color': 'info',
-                                                            'persistent-hint': True
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'username', 'label': '用户名',
-                                                            'placeholder': '蜂巢论坛用户名',
-                                                            'hint': '自动登录获取Cookie',
-                                                            'autocomplete': 'new-username',
-                                                            'clearable': True,
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'user_password', 'label': '密码',
-                                                            'placeholder': '蜂巢论坛密码', 'type': 'password',
-                                                            'hint': '自动登录获取Cookie',
-                                                            'autocomplete': 'new-password',
-                                                            'clearable': True,
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'history_days', 'label': '历史保留天数',
-                                                            'placeholder': '30', 'hint': '历史记录保留天数'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': cron_field_component,
-                                                        'props': {
-                                                            'model': 'cron', 'label': '签到周期',
-                                                            'placeholder': '30 8 * * *',
-                                                            'hint': '五位cron表达式，每天早上8:30执行'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'retry_count', 'label': '失败重试次数',
-                                                            'type': 'number', 'placeholder': '0',
-                                                            'hint': '0表示不重试，大于0则在签到失败后重试'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'retry_interval', 'label': '重试间隔(小时)',
-                                                            'type': 'number', 'placeholder': '2',
-                                                            'hint': '签到失败后多少小时后重试'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {'component': 'VDivider', 'props': {'class': 'my-3'}},
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12},
-                                                'content': [
-                                                    {
-                                                        'component': 'div',
-                                                        'props': {'class': 'd-flex align-center mb-3'},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VIcon',
-                                                                'props': {'style': 'color: #1976D2;',
-                                                                          'class': 'mr-2'},
-                                                                'text': 'mdi-account-clock'
-                                                            },
-                                                            {
-                                                                'component': 'span',
-                                                                'props': {
-                                                                    'style': 'font-size: 1.1rem; font-weight: 500;'},
-                                                                'text': '定时更新个人信息'
-                                                            }
-                                                        ]
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'timed_update_enabled',
-                                                            'label': '启用定时更新个人信息',
-                                                            'hint': '若不启用，个人信息只会在签到时更新',
-                                                            'persistent-hint': True,
-                                                            'color': 'primary'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': cron_field_component,
-                                                        'props': {
-                                                            'model': 'timed_update_cron',
-                                                            'label': '更新周期',
-                                                            'placeholder': '0 */2 * * *',
-                                                            'hint': '默认每2小时更新一次'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'timed_update_retry_count',
-                                                            'label': '失败重试次数',
-                                                            'type': 'number', 'placeholder': '0'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'timed_update_retry_interval',
-                                                            'label': '重试间隔(小时)',
-                                                            'type': 'number', 'placeholder': '0'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {'component': 'VDivider', 'props': {'class': 'my-3'}},
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12},
-                                                'content': [
-                                                    {
-                                                        'component': 'div',
-                                                        'props': {'class': 'd-flex align-center mb-3'},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VIcon',
-                                                                'props': {'style': 'color: #1976D2;',
-                                                                          'class': 'mr-2'},
-                                                                'text': 'mdi-chart-box'
-                                                            },
-                                                            {
-                                                                'component': 'span',
-                                                                'props': {
-                                                                    'style': 'font-size: 1.1rem; font-weight: 500;'},
-                                                                'text': '蜂巢个人主页PT人生卡片数据更新'
-                                                            }
-                                                        ]
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'mp_push_enabled',
-                                                            'label': '启用PT人生数据更新',
-                                                            'hint': '每次签到时都会自动更新PT人生数据',
-                                                            'color': 'primary',
-                                                            'persistent-hint': True
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
+        logo_url = "https://cdn.pting.club/site-logo/site-logo-e4ebd6b95befd416.png"
+        forum_url = _resolve_api_base()
+
+        def rgba(hex_color, alpha):
+            h = hex_color.lstrip("#")
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return f"rgba({r}, {g}, {b}, {alpha})"
+
+        def field(model, label, **props):
+            return {
+                "component": "VTextField",
+                "props": {
+                    "model": model, "label": label, "variant": "outlined", "density": "comfortable",
+                    **{key.replace("_", "-"): value for key, value in props.items()},
+                },
             }
-        ], {
-            "enabled": False, "notify": True, "cron": "30 8 * * *", "onlyonce": False, "update_info_now": False,
-            "cookie": "", "username": "", "user_password": "", "history_days": 30, "retry_count": 0, "retry_interval": 2,
-            "mp_push_enabled": False, "mp_push_interval": 1, "use_proxy": True,
-            "timed_update_enabled": False, "timed_update_cron": "0 */2 * * *",
-            "timed_update_retry_count": 0, "timed_update_retry_interval": 0
+
+        def column(content, cols=12, md=None):
+            props = {"cols": cols}
+            if md:
+                props["md"] = md
+            return {"component": "VCol", "props": props, "content": content}
+
+        def switch(model, label, color, hint=None):
+            props = {"model": model, "label": label, "color": color, "hide-details": True}
+            if hint:
+                props.pop("hide-details")
+                props.update({"hint": hint, "persistent-hint": True})
+            return {"component": "VSwitch", "props": props}
+
+        def info_card(text, icon, color, extra_class=""):
+            return {
+                "component": "div",
+                "props": {"class": f"d-flex align-center ga-3 w-100 {extra_class}".strip(), "style": f"background: {rgba(color, 0.08)}; border: 1px solid {rgba(color, 0.22)}; border-radius: 12px; padding: 12px 16px;"},
+                "content": [
+                    {"component": "VIcon", "props": {"size": 22, "color": color}, "text": icon},
+                    {"component": "div", "props": {"class": "text-body-2 text-medium-emphasis"}, "text": text},
+                ],
+            }
+
+        def info_block(title, text, icon, color):
+            return {
+                "component": "div",
+                "props": {"class": "d-flex align-center ga-3", "style": f"background: {rgba(color, 0.08)}; border: 1px solid {rgba(color, 0.22)}; border-radius: 12px; padding: 14px 16px;"},
+                "content": [
+                    {"component": "div", "props": {"class": "d-flex align-center justify-center", "style": f"width: 40px; height: 40px; border-radius: 12px; background: {rgba(color, 0.16)};"}, "content": [
+                        {"component": "VIcon", "props": {"size": 22, "color": color}, "text": icon},
+                    ]},
+                    {"component": "div", "content": [
+                        {"component": "div", "props": {"class": "text-body-2 font-weight-medium"}, "text": title},
+                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": text},
+                    ]},
+                ],
+            }
+
+        def icon_tile(icon, color, size=36):
+            return {
+                "component": "div",
+                "props": {"class": "d-flex align-center justify-center", "style": f"width: {size}px; height: {size}px; border-radius: 10px; background: {rgba(color, 0.12)};"},
+                "content": [
+                    {"component": "VIcon", "props": {"size": int(size * 0.56), "color": color}, "text": icon},
+                ],
+            }
+
+        def section(title, icon, color, rows):
+            return {
+                "component": "VCard",
+                "props": {
+                    "variant": "flat", "rounded": "xl", "class": "mb-3 overflow-hidden",
+                    "style": "border: 1px solid rgba(128, 128, 128, 0.18);",
+                },
+                "content": [
+                    {"component": "div", "props": {"class": "d-flex align-center ga-3 px-4 pt-4 pb-3"}, "content": [
+                        icon_tile(icon, color),
+                        {"component": "div", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": title},
+                    ]},
+                    {"component": "VDivider"},
+                    {"component": "VCardText", "props": {"class": "px-4 pt-3 pb-4"}, "content": rows},
+                ],
+            }
+
+        def panel(title, icon, color, caption, rows):
+            return {
+                "component": "VExpansionPanel",
+                "content": [
+                    {"component": "VExpansionPanelTitle", "content": [
+                        {"component": "div", "props": {"class": "d-flex align-center ga-3"}, "content": [
+                            icon_tile(icon, color, 30),
+                            {"component": "span", "text": title},
+                            {"component": "span", "props": {"class": "text-caption text-medium-emphasis ml-1"}, "text": caption},
+                        ]},
+                    ]},
+                    {"component": "VExpansionPanelText", "content": rows},
+                ],
+            }
+
+        hero = {
+            "component": "VCard",
+            "props": {
+                "variant": "flat", "rounded": "xl", "class": "mb-4 overflow-hidden",
+                "style": "position: relative; border: 1px solid rgba(128, 128, 128, 0.18);",
+            },
+            "content": [
+                {"component": "div", "props": {"class": "d-none d-sm-flex", "style": "position: absolute; width: 150px; height: 150px; border-radius: 50%; background: rgba(249, 115, 22, 0.08); top: -60px; left: -40px;"}, "content": []},
+                {"component": "div", "props": {"class": "d-none d-sm-flex", "style": "position: absolute; width: 190px; height: 190px; border-radius: 50%; background: rgba(14, 165, 233, 0.07); bottom: -75px; right: -55px;"}, "content": []},
+                {"component": "div", "props": {"class": "d-flex flex-column align-center justify-center pa-5", "style": "position: relative;"}, "content": [
+                    {"component": "VImg", "props": {"src": logo_url, "width": 146, "height": 40, "contain": True}},
+                    {"component": "div", "props": {"class": "d-flex align-center ga-2 mt-3"}, "content": [
+                        {"component": "div", "props": {"style": "width: 4px; height: 4px; border-radius: 50%; background: #f97316;"}, "content": []},
+                        {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": "专注长期讨论与高质量交流"},
+                        {"component": "div", "props": {"style": "width: 4px; height: 4px; border-radius: 50%; background: #0ea5e9;"}, "content": []},
+                    ]},
+                    {"component": "div", "props": {"class": "d-flex align-center justify-center mt-1", "style": "color: rgba(128, 128, 128, 0.78);"}, "content": [
+                        {"component": "span", "props": {"class": "text-caption"}, "text": "蜂巢论坛出品"},
+                        {"component": "span", "props": {"class": "text-caption ml-1", "style": "opacity: 0.5;"}, "text": "· @madrays"},
+                    ]},
+                ]},
+                {"component": "VBtn", "props": {
+                    "href": forum_url, "target": "_blank", "rel": "noopener",
+                    "size": "small", "variant": "tonal", "color": "#f97316",
+                    "prepend-icon": "mdi-open-in-new",
+                    "style": "position: absolute; top: 14px; right: 14px;",
+                }, "text": "前往论坛"},
+            ],
         }
 
-    def _map_fa_to_mdi(self, icon_class: str) -> str:
-        """
-        Maps common Font Awesome icon names to MDI icon names.
-        """
-        if not icon_class or not isinstance(icon_class, str):
-            return 'mdi-account-group'
-        if icon_class.startswith('mdi-'):
-            return icon_class
-
-        mapping = {
-            'fa-user-tie': 'mdi-account-tie', 'fa-crown': 'mdi-crown', 'fa-shield-alt': 'mdi-shield-outline',
-            'fa-user-shield': 'mdi-account-shield', 'fa-user-cog': 'mdi-account-cog',
-            'fa-user-check': 'mdi-account-check', 'fa-fan': 'mdi-fan', 'fa-user': 'mdi-account',
-            'fa-users': 'mdi-account-group', 'fa-cogs': 'mdi-cog', 'fa-cog': 'mdi-cog', 'fa-star': 'mdi-star',
-            'fa-gem': 'mdi-diamond'
+        form = [{
+            "component": "VForm",
+            "content": [
+                hero,
+                section("基础设置", "mdi-tune-variant", "#6366f1", [
+                    {"component": "VRow", "content": [
+                        column([switch("enabled", "启用蜂巢", "#f97316")], md=4),
+                        column([switch("mp_push_enabled", "同步 PT 人生", "#0ea5e9")], md=4),
+                        column([switch("notify", "发送结果通知", "#6366f1")], md=4),
+                    ]},
+                    {"component": "VRow", "content": [
+                        column([switch("onlyonce", "立即签到一次", "#f59e0b")], md=4),
+                        column([switch("update_info_now", "立即同步一次", "#14b8a6")], md=4),
+                    ]},
+                ]),
+                section("API 接入", "mdi-key-variant", "#0ea5e9", [
+                    {"component": "VRow", "content": [
+                        column([info_block("如何获取 API Key", "首次生成：论坛「隐秘的角落」；后续轮换：论坛「PT 人生」。Key 仅用于接口鉴权，不含登录密码，泄露后请及时轮换。", "mdi-key-variant", "#0ea5e9")]),
+                    ]},
+                    {"component": "VRow", "content": [
+                        column([field(
+                            "api_key", "MP 专用 API Key", type="password",
+                            placeholder="粘贴论坛「隐秘的角落」生成的 Key",
+                            prepend_inner_icon="mdi-key-variant",
+                            hint="用于蜂巢接口鉴权", persistent_hint=True,
+                            autocomplete="off", clearable=True,
+                        )]),
+                    ]},
+                ]),
+                {"component": "VExpansionPanels", "props": {"variant": "accordion", "class": "mt-1"}, "content": [
+                    panel("定时任务", "mdi-calendar-month-outline", "#f59e0b", "签到与 PT 人生数据的定时同步", [
+                        {"component": "VRow", "content": [
+                            column([{"component": cron_field_component, "props": {
+                                "model": "cron", "label": "签到时间", "placeholder": "30 8 * * *",
+                                "hint": "默认每日 08:30", "persistent-hint": True,
+                                "variant": "outlined", "density": "comfortable",
+                            }}], md=4),
+                            column([{"component": cron_field_component, "props": {
+                                "model": "timed_update_cron", "label": "PT 人生同步时间", "placeholder": "0 3 * * *",
+                                "hint": "默认每日 03:00", "persistent-hint": True,
+                                "variant": "outlined", "density": "comfortable",
+                            }}], md=4),
+                            column([field("mp_push_interval", "PT 人生推送间隔（天）", type="number", min=1, max=7)], md=4),
+                        ]},
+                        {"component": "VRow", "content": [
+                            column([switch("timed_update_enabled", "独立同步任务", "#f59e0b", hint="关闭后仅在签到时同步")], md=4),
+                            column([info_card("PT 人生数据推送间隔：1-7 天，默认每 1 天推送一次。", "mdi-sync", "#f59e0b", extra_class="h-100")], md=8),
+                        ]},
+                    ]),
+                    panel("重试与记录", "mdi-history", "#a855f7", "失败重试策略与记录留存", [
+                        {"component": "VRow", "content": [
+                            column([field("retry_count", "签到重试次数", type="number", min=0, max=10)], md=6),
+                            column([field("retry_interval", "签到重试间隔（小时）", type="number", min=1, max=24)], md=6),
+                        ]},
+                        {"component": "VRow", "content": [
+                            column([field("timed_update_retry_count", "同步重试次数", type="number", min=0, max=10)], md=4),
+                            column([field("timed_update_retry_interval", "同步重试间隔（小时）", type="number", min=1, max=24)], md=4),
+                            column([field("history_days", "签到记录保留天数", type="number", min=1, max=3650)], md=4),
+                        ]},
+                        {"component": "VRow", "content": [
+                            column([info_card("签到记录会展示在详情页的签到日历与历史列表中；超出保留天数的历史记录会被自动清理。", "mdi-calendar-check-outline", "#a855f7")]),
+                        ]},
+                    ]),
+                    panel("行为", "mdi-toggle-switch-outline", "#14b8a6", "网络代理与一次性刷新", [
+                        {"component": "VRow", "content": [
+                            column([{"component": "VSwitch", "props": {
+                                "model": "use_proxy", "label": "使用系统代理", "color": "#14b8a6",
+                                "hint": "开启后 Bearer Key 会经系统代理转发", "persistent-hint": True,
+                            }}], md=6),
+                            column([{"component": "VSwitch", "props": {
+                                "model": "force_refresh", "label": "强制刷新论坛信息（一次性）", "color": "#f97316",
+                                "hint": "保存后立即重新拉取身份、签到与圈子状态，执行后自动复位",
+                                "persistent-hint": True,
+                            }}], md=6),
+                        ]},
+                    ]),
+                ]},
+            ],
+        }]
+        defaults = {
+            "enabled": True, "notify": True, "cron": "30 8 * * *",
+            "onlyonce": False, "update_info_now": False, "force_refresh": False,
+            "api_key": "", "instance_id": "", "history_days": 30,
+            "retry_count": 1, "retry_interval": 2,
+            "mp_push_enabled": True, "mp_push_interval": 1,
+            "use_proxy": False, "timed_update_enabled": True,
+            "timed_update_cron": "0 3 * * *",
+            "timed_update_retry_count": 1, "timed_update_retry_interval": 2,
         }
-        match = re.search(r'fa-[\w-]+', icon_class)
-        if match:
-            core_icon = match.group(0)
-            return mapping.get(core_icon, 'mdi-account-group')
-        return 'mdi-account-group'
+        return form, defaults
 
-    def _format_pollen(self, value: Any) -> str:
-        """
-        Formats the pollen value.
-        """
+    def _format_reward(self, value: Any) -> str:
+        """格式化论坛签到奖励。"""
         if value is None:
             return '—'
         try:
@@ -1258,665 +1248,421 @@ class FengchaoSignin(_PluginBase):
         except (ValueError, TypeError):
             return str(value)
 
+    @staticmethod
+    def _format_bytes(value: Any) -> str:
+        """Format forum byte counters without losing precision."""
+        try:
+            number = int(str(value))
+        except (TypeError, ValueError):
+            return '—'
+        if number < 0:
+            return '—'
+        units = ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB')
+        amount = float(number)
+        unit = 0
+        while amount >= 1024 and unit < len(units) - 1:
+            amount /= 1024
+            unit += 1
+        return f'{amount:.2f}'.rstrip('0').rstrip('.') + f' {units[unit]}'
+
     def get_page(self) -> List[dict]:
+        """保留原插件的信息密度，以 API Key 缓存渲染档案卡、能力画像、勋章、月历和历史。
+
+        页面只读本地缓存，不因打开页面请求论坛；勋章过多时在固定高度区域内滚动。
         """
-        构建插件详情页面
-        """
-        history = self.get_data('history') or []
-        user_info = self.get_data('user_info')
-        user_info_updated_at = self.get_data('user_info_updated_at')
-        pt_life_updated_at = self.get_data('last_push_time')
-        user_info_card = None
+        history = [item for item in (self.get_data("history") or []) if isinstance(item, dict)]
+        status = self._get_cached_status()
+        account = status.get("account") if isinstance(status.get("account"), dict) else None
+        check_in = status.get("checkIn") if isinstance(status.get("checkIn"), dict) else {}
+        snapshot = self.get_data("last_push_result") or {}
+        if not isinstance(snapshot, dict):
+            snapshot = {}
 
-        frost_style = 'background-color: rgba(var(--v-theme-surface), 0.75); backdrop-filter: blur(5px); -webkit-backdrop-filter: blur(5px); border: 1px solid rgba(var(--v-theme-on-surface), 0.12); border-radius: 8px;'
+        if account:
+            by_day = {str(item.get("date") or "")[:10]: item for item in history if str(item.get("date") or "")[:10]}
+            for item in account.get("recentCheckIns", []) if isinstance(account.get("recentCheckIns"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                day = str(item.get("date") or "")[:10]
+                if not day:
+                    continue
+                by_day[day] = {
+                    **by_day.get(day, {}),
+                    "date": str(by_day.get(day, {}).get("date") or day),
+                    "status": "补签" if item.get("isMakeUp") else "已签到",
+                    "reward": _safe_nonnegative_int(item.get("reward")),
+                    "failure_count": 0,
+                    "forumVerified": True,
+                }
+            history = list(by_day.values())
 
-        if user_info and 'data' in user_info and 'attributes' in user_info['data']:
-            user_attrs = user_info['data']['attributes']
-            username = user_attrs.get('displayName', '未知用户')
-            user_id = user_info.get('data', {}).get('id', '—') # 获取用户ID
-            avatar_url = user_attrs.get('avatarUrl', '')
-            money = self._format_pollen(user_attrs.get('money', 0))
-            discussion_count = user_attrs.get('discussionCount', 0)
-            comment_count = user_attrs.get('commentCount', 0)
-            hive_bank_balance = user_attrs.get('hive_bank_balance', '0.00')
-            best_answer_count = user_attrs.get('bestAnswerCount', 0)
-            last_checkin_time = user_attrs.get('lastCheckinTime', '未知')
-            total_continuous_checkin = user_attrs.get('totalContinuousCheckIn', 0)
-            join_time_str = user_attrs.get('joinTime', '')
-            last_seen_at_str = user_attrs.get('lastSeenAt', '')
-            background_image = user_attrs.get('decorationProfileBackground') or user_attrs.get('cover')
-            unread_notifications = user_attrs.get('unreadNotificationCount', 0)
+        api_base = _resolve_api_base()
 
+        def asset_url(value):
+            if not isinstance(value, str) or not value.strip():
+                return ""
+            value = value.strip()
+            if value.startswith("data:"):
+                return ""
+            if value.startswith(("http://", "https://")):
+                source, target = urlparse(api_base), urlparse(value)
+                if target.scheme not in {"http", "https"} or (source.scheme == "https" and target.scheme != "https"):
+                    return ""
+                return value
+            return f"{api_base}/{value.lstrip('/')}"
+
+        def fmt_iso(value):
+            """ISO 时间转本地展示文本；解析失败时原样截断。"""
+            if not value:
+                return "—"
             try:
-                join_time = datetime.fromisoformat(join_time_str.replace('Z', '+00:00')).strftime('%Y-%m-%d')
-            except:
-                join_time = '未知'
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                if parsed.tzinfo:
+                    parsed = parsed.astimezone(pytz.timezone(settings.TZ))
+                return parsed.strftime("%Y-%m-%d %H:%M")
+            except (TypeError, ValueError):
+                return str(value)[:16]
+
+        surface = "background-color: rgb(var(--v-theme-surface)); color: rgb(var(--v-theme-on-surface)); border: 1px solid rgba(var(--v-theme-on-surface), 0.12); border-radius: 8px;"
+        glass = "background-color: rgba(var(--v-theme-surface), 0.72); color: rgb(var(--v-theme-on-surface)); border: 1px solid rgba(var(--v-theme-on-surface), 0.10); border-radius: 10px;"
+
+        def xml_escape(value):
+            return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&apos;")
+
+        def build_radar_svg(dimensions):
+            """与论坛 UserProfileRadarPanel 完全一致的六维雷达 SVG（论坛浅色主题色值）。"""
+            size = 198
+            center = size / 2.0
+            radius = 56.0
+            label_radius = 62.0
+            total = len(dimensions)
+
+            def radar_point(index, distance):
+                angle = (-math.pi / 2.0) + ((math.pi * 2.0 * index) / total)
+                return angle, center + math.cos(angle) * distance, center + math.sin(angle) * distance
+
+            def to_points(points):
+                return " ".join(f"{x:.2f},{y:.2f}" for _, x, y in points)
+
+            parts = []
+            for level in range(1, 5):
+                ring_radius = radius * (level / 4.0)
+                ring_points = [radar_point(i, ring_radius) for i in range(total)]
+                fill = ' fill="#f5f5f5" fill-opacity="0.35"' if level == 4 else ' fill="none"'
+                parts.append(f'<polygon points="{to_points(ring_points)}" stroke="#e0e0e0" stroke-width="0.9"{fill}/>')
+            for i in range(total):
+                _, x, y = radar_point(i, radius)
+                parts.append(f'<line x1="{center:.2f}" y1="{center:.2f}" x2="{x:.2f}" y2="{y:.2f}" stroke="#e0e0e0" stroke-width="0.9"/>')
+            value_points = []
+            for i, dimension in enumerate(dimensions[:total]):
+                score = min(max(_safe_nonnegative_int(dimension.get("score")), 0), 10)
+                value_points.append(radar_point(i, (score / 10.0) * radius))
+            parts.append(f'<polygon points="{to_points(value_points)}" fill="#141414" fill-opacity="0.08" stroke="#141414" stroke-width="1.5"/>')
+            for _, x, y in value_points:
+                parts.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3" fill="#ffffff" stroke="#141414" stroke-width="1.4"/>')
+            parts.append(f'<circle cx="{center:.2f}" cy="{center:.2f}" r="6" fill="#ffffff" stroke="#e0e0e0" stroke-width="0.9"/>')
+            for i, dimension in enumerate(dimensions[:total]):
+                angle, x, y = radar_point(i, label_radius)
+                anchor = "middle" if abs(math.cos(angle)) < 0.2 else "start" if math.cos(angle) > 0 else "end"
+                vertical_offset = 8 if math.sin(angle) > 0.85 else -3 if math.sin(angle) < -0.85 else 2
+                label = f"{xml_escape(dimension.get('label') or '—')} {_safe_nonnegative_int(dimension.get('displayScore', dimension.get('score')))}"
+                parts.append(f'<text x="{x:.2f}" y="{y + vertical_offset:.2f}" text-anchor="{anchor}" fill="#6b6b6b" font-size="10" font-weight="600">{label}</text>')
+            return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" width="{size}" height="{size}">' + "".join(parts) + "</svg>"
+
+        def stat(icon, label, value, color=None, cols=6, md=None):
+            props = {"cols": cols, "class": "pa-1"}
+            if md is not None:
+                props["md"] = md
+            icon_props = {"size": 15, "class": "flex-shrink-0", "style": f"color: {color};" if color else "color: rgb(var(--v-theme-primary));"}
+            return {"component": "VCol", "props": props, "content": [
+                {"component": "div", "props": {"class": "d-flex flex-column align-center justify-center pa-1", "style": glass}, "content": [
+                    {"component": "div", "props": {"class": "d-flex align-center justify-center ga-1"}, "content": [
+                        {"component": "VIcon", "props": icon_props, "text": icon},
+                        {"component": "span", "props": {"class": "text-subtitle-2 font-weight-bold", "style": "line-height: 1.15;"}, "text": str(value)},
+                    ]},
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1", "style": "line-height: 1.2;"}, "text": label},
+                ]},
+            ]}
+
+        def section_title(icon, text, extra=None):
+            return {"component": "div", "props": {"class": "d-flex align-center mb-2"}, "content": [
+                {"component": "VIcon", "props": {"size": "small", "class": "mr-2", "style": "color: rgb(var(--v-theme-primary));"}, "text": icon},
+                {"component": "span", "props": {"class": "font-weight-bold"}, "text": text},
+                {"component": "VSpacer"},
+                *([extra] if extra else []),
+            ]}
+
+        now = datetime.now()
+        month_key = now.strftime("%Y-%m")
+        signed_days = {}
+        for record in history:
+            date_text = str(record.get("date") or "")
+            if not date_text.startswith(month_key):
+                continue
             try:
-                last_seen_at = datetime.fromisoformat(last_seen_at_str.replace('Z', '+00:00')).strftime(
-                    '%Y-%m-%d %H:%M')
-            except:
-                last_seen_at = '未知'
+                day = int(date_text[:10].split("-")[2])
+            except (ValueError, IndexError):
+                continue
+            raw_status = str(record.get("status") or "")
+            tone = "error" if "失败" in raw_status else "info" if "已签到" in raw_status or "补签" in raw_status else "success"
+            signed_days[day] = {"tone": tone, "reward": self._format_reward(record.get("reward", record.get("lastCheckinMoney", record.get("money", 0))))}
 
-            groups = []
-            if 'included' in user_info:
-                for item in user_info.get('included', []):
-                    if item.get('type') == 'groups':
-                        groups.append({
-                            'name': item.get('attributes', {}).get('nameSingular', ''),
-                            'color': item.get('attributes', {}).get('color', '#888'),
-                            'icon': self._map_fa_to_mdi(item.get('attributes', {}).get('icon', ''))
-                        })
+        calendar_rows = [{"component": "div", "props": {"class": "d-flex justify-space-between mb-1"}, "content": [
+            {"component": "div", "props": {"class": "text-caption text-center text-medium-emphasis", "style": "width: 14.285%;"}, "text": label}
+            for label in ["日", "一", "二", "三", "四", "五", "六"]
+        ]}]
+        for week in calendar.Calendar(firstweekday=6).monthdayscalendar(now.year, now.month):
+            cells = []
+            for day in week:
+                if day == 0:
+                    cells.append({"component": "div", "props": {"style": "width: 14.285%; height: 38px;"}})
+                    continue
+                item = signed_days.get(day)
+                tone = item.get("tone") if item else None
+                day_style = "width: 30px; height: 34px; border-radius: 6px; border: 1px solid rgba(var(--v-theme-on-surface), 0.10);"
+                if tone:
+                    day_style += f" background-color: rgba(var(--v-theme-{tone}), 0.12); color: rgb(var(--v-theme-{tone})); border-color: rgba(var(--v-theme-{tone}), 0.28);"
+                elif day == now.day:
+                    day_style += " border-color: rgb(var(--v-theme-primary));"
+                content = [{"component": "div", "props": {"class": "text-caption", "style": "line-height: 1;"}, "text": str(day)}]
+                reward = item.get("reward") if item else ""
+                if reward and reward not in {"0", "—"}:
+                    content.append({"component": "div", "props": {"class": "font-weight-bold", "style": "font-size: 9px; line-height: 1; white-space: nowrap;"}, "text": f"+{reward}"})
+                cells.append({"component": "div", "props": {"class": "d-flex align-center justify-center", "style": "width: 14.285%; height: 38px;"}, "content": [
+                    {"component": "div", "props": {"class": "d-flex flex-column align-center justify-center", "style": day_style}, "content": content},
+                ]})
+            calendar_rows.append({"component": "div", "props": {"class": "d-flex justify-space-between mb-1"}, "content": cells})
 
-            badges = []
-            # API将badges直接放在了attributes下
-            user_badges_data = user_attrs.get('badges', [])
-            for badge_item in user_badges_data:
-                core_badge_info = badge_item.get('badge', {})
-                if not core_badge_info: continue
-                category_info = core_badge_info.get('category', {})
-                badges.append({
-                    'name': core_badge_info.get('name', '未知徽章'),
-                    'icon': core_badge_info.get('icon', 'fas fa-award'),
-                    'description': core_badge_info.get('description', '无描述'),
-                    'image': core_badge_info.get('image'),
-                    'category': category_info.get('name', '其他')
-                })
-            badge_count = len(badges)
+        update_time = status.get("cachedAt") or self.get_data("last_push_time") or ""
+        calendar_panel = {"component": "div", "props": {"class": "pa-3", "style": f"{surface} height: 100%;"}, "content": [
+            {"component": "div", "props": {"class": "d-flex align-center mb-2"}, "content": [
+                {"component": "VIcon", "props": {"size": "small", "class": "mr-2", "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-calendar-month-outline"},
+                {"component": "span", "props": {"class": "font-weight-bold"}, "text": f"{now.year} 年 {now.month} 月"},
+                {"component": "VSpacer"},
+                {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"{len(signed_days)} 天 · 连签 {check_in.get('currentStreak', 0)}"},
+            ]},
+            {"component": "VDivider", "props": {"class": "mb-2"}},
+            *calendar_rows,
+            {"component": "div", "props": {"class": "d-flex justify-center flex-wrap ga-2 mt-2"}, "content": [
+                {"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "success"}, "text": "成功"},
+                {"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "info"}, "text": "已签 / 补签"},
+                {"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "error"}, "text": "未签"},
+                {"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "default"}, "text": "无数据"},
+            ]},
+            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-2", "style": "text-align: right;"}, "text": f"数据更新：{fmt_iso(update_time)}"},
+        ]}
 
-            categorized_badges = defaultdict(list)
-            for badge in badges:
-                categorized_badges[badge.get('category', '其他')].append(badge)
 
-            badge_category_components = []
-            if categorized_badges:
-                all_category_cards = []
-                for category_name, badge_list in sorted(categorized_badges.items()):
-                    badge_items_with_dividers = []
-                    for i, badge in enumerate(badge_list):
-                        badge_items_with_dividers.append({
-                            'component': 'div',
-                            'props': {
-                                'class': 'ma-1 pa-1 d-flex flex-column align-center',
-                                'style': 'width: 90px; text-align: center;',
-                                'title': f"{badge.get('name', '未知徽章')}\n\n{badge.get('description', '无描述')}"
-                            },
-                            'content': [
-                                {
-                                    'component': 'VImg' if badge.get('image') else 'VIcon',
-                                    'props': ({
-                                                  'src': badge.get('image'), 'height': '48', 'width': '48',
-                                                  'class': 'mb-1'
-                                              } if badge.get('image') else {
-                                        'icon': self._map_fa_to_mdi(badge.get('icon')), 'size': '48', 'class': 'mb-1'
-                                    })
-                                },
-                                {
-                                    'component': 'div',
-                                    'props': {'class': 'text-caption text-truncate',
-                                              'style': 'max-width: 90px; line-height: 20px; font-weight: 500;'},
-                                    'text': badge.get('name', '未知徽章')
-                                }
-                            ]
-                        })
-                        if i < len(badge_list) - 1:
-                            badge_items_with_dividers.append({
-                                'component': 'VDivider',
-                                'props': {'vertical': True, 'class': 'my-2'}
-                            })
+        identity_block = None
+        stat_cards = []
+        radar_items = []
+        radar_img = ""
+        badge_panels = []
+        badge_count = 0
+        account_state = "等待同步"
 
-                    all_category_cards.append({
-                        'component': 'div',
-                        'props': {'class': 'ma-1', 'style': f'{frost_style} border-radius: 12px; padding: 4px;'},
-                        'content': [
-                            {'component': 'div',
-                             'props': {'class': 'text-subtitle-2 grey--text text--darken-1',
-                                       'style': 'text-align: center;'},
-                             'text': category_name},
-                            {'component': 'VDivider', 'props': {'class': 'my-1'}},
-                            {'component': 'div',
-                             'props': {'class': 'd-flex flex-wrap justify-center align-center'},
-                             'content': badge_items_with_dividers}
-                        ]
-                    })
+        if account:
+            display_name = str(account.get("displayName") or account.get("username") or "蜂巢用户")
+            username = str(account.get("username") or "—")
+            avatar = asset_url(account.get("avatarPath"))
+            avatar_content = [{"component": "VImg", "props": {"src": avatar, "alt": display_name, "cover": True}}] if avatar else [{"component": "VIcon", "props": {"size": 46, "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-account"}]
+            account_state = "圈内用户" if status.get("ptCircle") else "MP 已接通" if status.get("active") else "等待同步"
 
-                badge_category_components.append({
-                    'component': 'div',
-                    'props': {'class': 'd-flex flex-wrap', 'style': 'padding-left: 12px; padding-right: 12px;'},
-                    'content': all_category_cards
-                })
+            level = _safe_nonnegative_int(account.get("level"))
+            level_name = str(account.get("levelName") or "")
+            level_icon = str(account.get("levelIcon") or "⭐")
+            vip_level = _safe_nonnegative_int(account.get("vipLevel"))
+            uid = str(account.get("uid") or "") or "—"
+            joined_at = fmt_iso(account.get("joinedAt"))
+            last_login = fmt_iso(account.get("lastLoginAt"))
 
-            # 未读消息提示
-            username_display_content = [
-                {'component': 'div',
-                 'props': {'class': 'text-h6 mb-1 d-inline-block elevation-2', 'style': f'{frost_style} padding: 4px;'},
-                 'text': username}
+            badge_items = [item for item in (account.get("badges") if isinstance(account.get("badges"), list) else []) if isinstance(item, dict)]
+            badge_items = sorted(badge_items, key=lambda b: str(b.get("category") or "").strip() or "社区成就")
+            badge_count = len(badge_items)
+            radar_items = [item for item in (account.get("radar") if isinstance(account.get("radar"), list) else []) if isinstance(item, dict)][:6]
+            if radar_items:
+                radar_img = "data:image/svg+xml;base64," + base64.b64encode(build_radar_svg(radar_items).encode("utf-8")).decode("ascii")
+
+            name_chips = [
+                {"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": "primary", "class": "mr-1 mb-1", "title": "论坛等级"}, "text": f"{level_icon} Lv.{level} {level_name}".strip()},
             ]
-            if unread_notifications > 0:
-                username_display_content.append({
-                    'component': 'VBadge',
-                    'props': {
-                        'color': 'red',
-                        'content': str(unread_notifications),
-                        'inline': True,
-                        'class': 'ml-2'
-                    },
-                    'content': [
-                        {
-                            'component': 'VIcon',
-                            'props': {'color': 'white'},
-                            'text': 'mdi-bell'
-                        }
-                    ]
-                })
+            if vip_level > 0:
+                name_chips.append({"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": "purple", "class": "mr-1 mb-1", "title": "VIP 等级"}, "content": [
+                    {"component": "VIcon", "props": {"size": 14, "class": "mr-1"}, "text": "mdi-crown"},
+                    {"component": "span", "text": f"VIP {vip_level}"},
+                ]})
+            name_chips.append({"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": "primary", "class": "mr-1 mb-1"}, "text": account_state})
 
-            # 页脚信息（Flex布局，不换行）
-            footer_items = []
-            if last_checkin_time:
-                footer_items.append({
-                    'component': 'div',
-                    'props': {'class': 'mr-3 mb-1 text-caption font-weight-medium', 'style': 'white-space: nowrap;'},
-                    'content': [{'component': 'span', 'text': f'最后签到: {last_checkin_time}'}]
-                })
-            if user_info_updated_at:
-                footer_items.append({
-                    'component': 'div',
-                    'props': {'class': 'mr-3 mb-1 text-caption font-weight-medium', 'style': 'white-space: nowrap;'},
-                    'content': [{'component': 'span', 'text': f'数据更新: {user_info_updated_at}'}]
-                })
-            if pt_life_updated_at:
-                footer_items.append({
-                    'component': 'div',
-                    'props': {'class': 'mb-1 text-caption font-weight-medium', 'style': 'white-space: nowrap;'},
-                    'content': [{'component': 'span', 'text': f'PT人生更新: {pt_life_updated_at}'}]
-                })
+            def info_chip(icon, color, text, title):
+                return {"component": "VChip", "props": {"size": "small", "variant": "outlined", "class": "mr-1 mb-1", "title": title, "color": color}, "content": [
+                    {"component": "VIcon", "props": {"size": 14, "class": "mr-1", "style": f"color: {color};"}, "text": icon},
+                    {"component": "span", "props": {"class": "text-caption"}, "text": text},
+                ]}
 
-            # --- 日历数据准备 ---
-            now = datetime.now()
-            year = now.year
-            month = now.month
-            # 修复：设置周日为一周的开始，以匹配下方的表头 ['日', '一', ...]
-            cal = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
-            today_day = now.day
-            
-            # 提取本月签到记录 (包含奖励信息)
-            current_month_str = now.strftime('%Y-%m')
-            signed_days = {} # {day_int: {'reward': str, 'status': str}}
-            
-            for record in history:
-                rec_date_str = record.get('date', '')
-                if rec_date_str.startswith(current_month_str):
-                    status = record.get("status", "")
-                    if "成功" in status or "已签到" in status or "失败" in status:
-                        try:
-                            # 提取日期
-                            day_part = int(rec_date_str.split(' ')[0].split('-')[2])
-                            
-                            # 确定显示状态
-                            display_status = "success"
-                            if "失败" in status:
-                                display_status = "failure"
-                            elif "已签到" in status:
-                                display_status = "checked"
-                            else:
-                                display_status = "success"
-                            
-                            # 提取奖励
-                            last_checkin_money = record.get('lastCheckinMoney', 0)
-                            formatted_reward = None
-                            if last_checkin_money > 0:
-                                formatted_reward = self._format_pollen(last_checkin_money)
-                                
-                            signed_days[day_part] = {
-                                'reward': formatted_reward,
-                                'status': display_status
-                            }
-                        except:
-                            pass
+            info_chips = [
+                info_chip("mdi-identifier", "#7c3aed", f"UID {uid}", "用户 UID"),
+                info_chip("mdi-calendar-account", "#16a34a", f"注册 {joined_at}", "注册时间"),
+                info_chip("mdi-clock-outline", "#2563eb", f"最后访问 {last_login}", "最后访问"),
+                info_chip("mdi-medal-outline", "#ea580c", f"勋章 {badge_count}", "勋章总数"),
+            ]
 
-            week_headers = ['日', '一', '二', '三', '四', '五', '六']
-            calendar_rows = []
-            
-            # 日历表头
-            header_cells = []
-            for day_name in week_headers:
-                header_cells.append({
-                    'component': 'div',
-                    'props': {'class': 'text-caption font-weight-bold text-center', 'style': 'width: 14.28%; color: rgba(var(--v-theme-on-surface), 0.6);'},
-                    'text': day_name
-                })
-            calendar_rows.append({'component': 'div', 'props': {'class': 'd-flex justify-space-between mb-1'}, 'content': header_cells})
-
-            # 日历主体
-            for week in cal:
-                week_cells = []
-                for day in week:
-                    if day == 0:
-                        week_cells.append({'component': 'div', 'props': {'style': 'width: 14.28%; height: 32px;'}})
-                    else:
-                        is_today = (day == today_day)
-                        day_data = signed_days.get(day)
-                        
-                        # 样式逻辑
-                        bg_style = ''
-                        border = ''
-                        text_color = ''
-                        
-                        if day_data:
-                            status = day_data.get('status')
-                            if status == "success": # 签到成功 - 绿色
-                                bg_style = 'background-color: rgba(76, 175, 80, 0.15);' 
-                                text_color = 'color: #2E7D32;'
-                            elif status == "checked": # 已签到 - 蓝色
-                                bg_style = 'background-color: rgba(33, 150, 243, 0.15);'
-                                text_color = 'color: #1565C0;'
-                            elif status == "failure": # 失败 - 红色
-                                bg_style = 'background-color: rgba(244, 67, 54, 0.15);'
-                                text_color = 'color: #C62828;'
-                        
-                        if is_today and not day_data:
-                             # 今天但未签到，显示边框
-                            border = 'border: 1px solid #FFC107;'
-                        
-                        cell_inner_content = [
-                            {'component': 'div', 'props': {'class': 'text-caption', 'style': 'line-height: 1; font-size: 0.65rem; opacity: 0.7;'}, 'text': str(day)}
-                        ]
-                        
-                        if day_data and day_data.get('reward'):
-                            reward_val = day_data.get('reward')
-                            reward_str = f"+{int(float(reward_val)) if float(reward_val).is_integer() else reward_val}"
-                            cell_inner_content.append({
-                                'component': 'div',
-                                'props': {'class': 'font-weight-black', 'style': 'font-size: 10px; line-height: 1; margin-top: -2px; color: #2E7D32; white-space: nowrap; transform: scale(0.9); transform-origin: center top;'},
-                                'text': reward_str
-                            })
-
-                        week_cells.append({
-                            'component': 'div',
-                            'props': {
-                                'class': 'd-flex justify-center align-center',
-                                'style': f'width: 14.28%; height: 32px;'
-                            },
-                            'content': [
-                                {
-                                    'component': 'div',
-                                    'props': {
-                                        'class': 'd-flex flex-column justify-center align-center text-caption',
-                                        'style': f'width: 28px; height: 28px; border-radius: 6px; {bg_style} {border} {text_color}'
-                                    },
-                                    'content': cell_inner_content
-                                }
-                            ]
-                        })
-                calendar_rows.append({'component': 'div', 'props': {'class': 'd-flex justify-space-between mb-1'}, 'content': week_cells})
-            
-            # 日历说明（图例）
-            calendar_rows.append({
-                'component': 'div', 
-                'props': {'class': 'd-flex justify-center mt-2 flex-wrap gap-2', 'style': 'font-size: 0.7rem; gap: 8px;'}, 
-                'content': [
-                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #4CAF50; margin-right: 4px;'}},
-                        {'component': 'span', 'text': '成功'}
-                    ]},
-                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #2196F3; margin-right: 4px;'}},
-                        {'component': 'span', 'text': '已签'}
-                    ]},
-                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #F44336; margin-right: 4px;'}},
-                        {'component': 'span', 'text': '未签'}
-                    ]},
-                    {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                        {'component': 'div', 'props': {'style': 'width: 8px; height: 8px; border-radius: 50%; background-color: #E0E0E0; margin-right: 4px;'}},
-                        {'component': 'span', 'text': '无数据'}
-                    ]}
-                ]
-            })
-            # --- 日历组件构建结束 ---
-
-            user_info_card = {
-                'component': 'VCard',
-                'props': {'variant': 'outlined', 'class': 'mb-4',
-                          'style': f"background-image: url('{background_image}'); background-size: cover; background-position: center;" if background_image else ''},
-                'content': [
-                    {'component': 'VDivider'},
-                    {'component': 'VCardText', 'content': [
-                        {'component': 'VRow', 'props': {'class': 'ma-1'}, 'content': [
-                            # 左侧：个人信息 (md=4) - 左右排布 + 头像放大
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
-                                {'component': 'div', 'props': {'class': 'd-flex flex-row align-center'}, 'content': [
-                                    # 头像容器 (放大)
-                                    {'component': 'div',
-                                     'props': {'class': 'mr-4 flex-shrink-0',
-                                               'style': 'position: relative; width: 140px; height: 140px;'},
-                                     'content': [
-                                         {'component': 'VAvatar', 'props': {'size': 100, 'rounded': 'circle',
-                                                                            'style': 'position: absolute; top: 20px; left: 20px; z-index: 1;'},
-                                          'content': [
-                                              {'component': 'VImg', 'props': {'src': avatar_url, 'alt': username}}]},
-                                         {'component': 'div', 'props': {
-                                             'style': f"position: absolute; top: 0; left: 0; width: 140px; height: 140px; background-image: url('{user_attrs.get('decorationAvatarFrame', '')}'); background-size: contain; background-repeat: no-repeat; background-position: center; z-index: 2;"}} if user_attrs.get(
-                                             'decorationAvatarFrame') else {}
-                                     ]},
-                                     # 用户名和用户组 (右侧)
-                                     {'component': 'div', 'props': {'class': 'd-flex flex-column align-start'}, 'content': [
-                                         {'component': 'div', 'props': {'class': 'mb-1'}, 'content': username_display_content},
-                                         {'component': 'div', 'props': {'class': 'd-flex flex-wrap'},
-                                         'content': [
-                                             {'component': 'VChip', 'props': {
-                                                 'style': f"background-color: {group.get('color', '#6B7CA8')}; color: white;",
-                                                 'size': 'small', 'class': 'mr-1 mb-1', 'variant': 'elevated'},
-                                              'content': [
-                                                  {'component': 'VIcon',
-                                                   'props': {'start': True, 'size': 'small'},
-                                                   'text': group.get('icon')},
-                                                  {'component': 'span', 'text': group.get('name')}
-                                              ]} for group in groups
-                                         ]}
-                                     ]}
-                                ]},
-                                # 注册时间等信息 (下方左对齐，动态宽度)
-                                {'component': 'div', 'props': {'class': 'mt-3 w-100'}, 'content': [
-                                    # 新增用户ID
-                                    {'component': 'div',
-                                     'props': {'class': 'pa-1 elevation-2 mb-1',
-                                               'style': f'{frost_style} width: fit-content;'},
-                                     'content': [
-                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
-                                          'content': [
-                                              {'component': 'VIcon',
-                                               'props': {'style': 'color: #607D8B;', 'size': 'x-small', # Blue Grey
-                                                         'class': 'mr-2'}, 'text': 'mdi-identifier'},
-                                              {'component': 'span', 'text': f'UID: {user_id}'}
-                                          ]}]},
-                                    {'component': 'div',
-                                     'props': {'class': 'pa-1 elevation-2 mb-1',
-                                               'style': f'{frost_style} width: fit-content;'},
-                                     'content': [
-                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
-                                          'content': [
-                                              {'component': 'VIcon',
-                                               'props': {'style': 'color: #4CAF50;', 'size': 'x-small',
-                                                         'class': 'mr-2'}, 'text': 'mdi-calendar'},
-                                              {'component': 'span', 'text': f'注册时间: {join_time}'}
-                                          ]}]},
-                                    {'component': 'div',
-                                     'props': {'class': 'pa-1 elevation-2 mb-1',
-                                               'style': f'{frost_style} width: fit-content;'},
-                                     'content': [
-                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
-                                          'content': [
-                                              {'component': 'VIcon',
-                                               'props': {'style': 'color: #2196F3;', 'size': 'x-small',
-                                                         'class': 'mr-2'}, 'text': 'mdi-clock-outline'},
-                                              {'component': 'span', 'text': f'最后访问: {last_seen_at}'}
-                                          ]}]},
-                                    {'component': 'div',
-                                     'props': {'class': 'pa-1 elevation-2',
-                                               'style': f'{frost_style} width: fit-content;'},
-                                     'content': [
-                                         {'component': 'div', 'props': {'class': 'd-flex align-center justify-start pl-1', 'style': 'font-size: 0.85rem;'},
-                                          'content': [
-                                              {'component': 'VIcon',
-                                               'props': {'style': 'color: #E64A19;', 'size': 'x-small',
-                                                         'class': 'mr-2'}, 'text': 'mdi-medal-outline'},
-                                              {'component': 'span', 'text': f'徽章数量: {badge_count}'}
-                                          ]}]}
-                                ]}
-                            ]},
-                            # 中间：统计数据 (md=5)
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 5}, 'content': [
-                                {'component': 'VRow', 'props': {'dense': True}, 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
-                                        {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
-                                         'content': [
-                                             {'component': 'div',
-                                              'props': {'class': 'd-flex justify-center align-center'}, 'content': [
-                                                 {'component': 'VIcon',
-                                                  'props': {'style': 'color: #FFC107;', 'class': 'mr-2'},
-                                                  'text': 'mdi-flower'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
-                                                  'text': str(money)}
-                                             ]},
-                                             {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '花粉'}
-                                         ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
-                                        {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
-                                         'content': [
-                                             {'component': 'div',
-                                              'props': {'class': 'd-flex justify-center align-center'}, 'content': [
-                                                 {'component': 'VIcon',
-                                                  'props': {'style': 'color: #3F51B5;', 'class': 'mr-2'},
-                                                  'text': 'mdi-forum'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
-                                                  'text': str(discussion_count)}
-                                             ]},
-                                             {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '主题'}
-                                         ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
-                                        {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
-                                         'content': [
-                                             {'component': 'div',
-                                              'props': {'class': 'd-flex justify-center align-center'}, 'content': [
-                                                 {'component': 'VIcon',
-                                                  'props': {'style': 'color: #00BCD4;', 'class': 'mr-2'},
-                                                  'text': 'mdi-comment-text-multiple'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
-                                                  'text': str(comment_count)}
-                                             ]},
-                                             {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '评论'}
-                                         ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
-                                        {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
-                                         'content': [
-                                             {'component': 'div',
-                                              'props': {'class': 'd-flex justify-center align-center'}, 'content': [
-                                                 {'component': 'VIcon',
-                                                  'props': {'style': 'color: #673AB7;', 'class': 'mr-2'},
-                                                  'text': 'mdi-bank'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
-                                                  'text': str(hive_bank_balance)}
-                                             ]},
-                                             {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '银行'}
-                                         ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
-                                        {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
-                                         'content': [
-                                             {'component': 'div',
-                                              'props': {'class': 'd-flex justify-center align-center'}, 'content': [
-                                                 {'component': 'VIcon',
-                                                  'props': {'style': 'color: #03A9F4;', 'class': 'mr-2'},
-                                                  'text': 'mdi-hand-heart'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
-                                                  'text': str(best_answer_count)}
-                                             ]},
-                                             {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '助人'}
-                                         ]}]},
-                                    {'component': 'VCol', 'props': {'cols': 6}, 'content': [
-                                        {'component': 'div',
-                                         'props': {'class': 'text-center elevation-2 pa-2', 'style': f'{frost_style}'},
-                                         'content': [
-                                             {'component': 'div',
-                                              'props': {'class': 'd-flex justify-center align-center'}, 'content': [
-                                                 {'component': 'VIcon',
-                                                  'props': {'style': 'color: #009688;', 'class': 'mr-2'},
-                                                  'text': 'mdi-calendar-check'},
-                                                 {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'},
-                                                  'text': str(total_continuous_checkin)}
-                                             ]},
-                                             {'component': 'div', 'props': {'class': 'text-caption mt-1'},
-                                              'text': '连签'}
-                                         ]}]}
-                                ]}
-                            ]},
-                            # 右侧：签到日历 (md=3) - 收窄
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 3}, 'content': [
-                                {'component': 'div', 
-                                 'props': {'class': 'pa-2 elevation-2', 'style': f'{frost_style} height: 100%;'},
-                                 'content': [
-                                     # 日历标题：使用 relative + absolute icon 实现完美居中
-                                     {'component': 'div', 'props': {'class': 'd-flex align-center justify-center mb-2 w-100', 'style': 'position: relative;'}, 'content': [
-                                         {'component': 'VIcon', 'props': {'icon': 'mdi-calendar-month', 'size': 'small', 'color': 'primary', 'style': 'position: absolute; left: 0;'}},
-                                         {'component': 'span', 'props': {'class': 'font-weight-bold'}, 'text': f"{year}年{month}月"}
-                                     ]},
-                                     {'component': 'VDivider', 'props': {'class': 'mb-2'}},
-                                     *calendar_rows
-                                 ]}
-                            ]}
+            identity_block = [
+                {"component": "div", "props": {"class": "d-flex flex-column pa-3", "style": f"{glass} height: 100%;"}, "content": [
+                    {"component": "div", "props": {"class": "d-flex align-center ga-4"}, "content": [
+                        {"component": "VAvatar", "props": {"size": 84, "color": "surface-variant", "class": "flex-shrink-0"}, "content": avatar_content},
+                        {"component": "div", "props": {"class": "min-w-0"}, "content": [
+                            {"component": "div", "props": {"class": "text-h5 font-weight-bold", "style": "overflow-wrap: anywhere;"}, "text": display_name},
+                            {"component": "div", "props": {"class": "text-caption text-medium-emphasis mt-1"}, "text": f"@{username}"},
+                            {"component": "div", "props": {"class": "d-flex flex-wrap align-center mt-2"}, "content": name_chips},
                         ]},
-                        *badge_category_components,
-                        {'component': 'div', 'props': {
-                            'class': 'mt-2 text-caption px-2 py-0.5 elevation-1 d-inline-block float-right d-flex flex-wrap justify-end',
-                            'style': f'{frost_style} border-radius: 8px 8px 0 0; margin-right: 16px;'}, 
-                            'content': footer_items}
+                    ]},
+                    {"component": "div", "props": {"class": "d-flex flex-wrap mt-auto pt-3"}, "content": info_chips},
+                ]},
+            ]
+
+            stat_cards = [
+                stat("mdi-coins", "积分", account.get("points", "—"), "#0d9488"),
+                stat("mdi-file-document-outline", "主题", account.get("postCount", "—"), "#4f46e5"),
+                stat("mdi-message-reply-outline", "回复", account.get("commentCount", "—"), "#0891b2"),
+                stat("mdi-star-outline", "收藏", account.get("favoriteCount", "—"), "#9333ea"),
+                stat("mdi-thumb-up-outline", "获赞", account.get("likeReceivedCount", "—"), "#db2777"),
+                stat("mdi-account-heart-outline", "粉丝", account.get("followerCount", "—"), "#14b8a6"),
+            ]
+
+            grouped = {}
+            for badge in badge_items:
+                cat = str(badge.get("category") or "").strip() or "社区成就"
+                grouped.setdefault(cat, []).append(badge)
+            if grouped:
+                columns = [[] for _ in range(3)]
+                col_heights = [0.0] * 3
+                for cat, items in grouped.items():
+                    badge_cells = []
+                    for badge in items:
+                        icon_path = asset_url(badge.get("imageUrl")) or asset_url(badge.get("iconPath"))
+                        if icon_path:
+                            icon = {"component": "VImg", "props": {"src": icon_path, "alt": str(badge.get("name") or "勋章"), "width": 40, "height": 40, "contain": True}}
+                        elif badge.get("iconText"):
+                            icon_text = str(badge.get("iconText"))
+                            if icon_text.startswith(("http://", "https://", "//")):
+                                icon = {"component": "VIcon", "props": {"size": 32, "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-medal-outline"}
+                            else:
+                                icon = {"component": "span", "props": {"style": "font-size: 26px; line-height: 1;"}, "text": icon_text}
+                        else:
+                            icon = {"component": "VIcon", "props": {"size": 32, "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-medal-outline"}
+                        badge_cells.append({"component": "div", "props": {"class": "d-flex flex-column align-center justify-start", "style": "box-sizing: border-box; padding: 6px 4px; border-radius: 8px; border: 1px solid rgba(var(--v-theme-on-surface), 0.10); overflow: hidden; flex: 1 1 76px; min-width: 76px;", "title": str(badge.get("description") or badge.get("name") or "勋章")}, "content": [
+                            {"component": "div", "props": {"class": "d-flex align-center justify-center flex-shrink-0", "style": "width: 40px; height: 40px;"}, "content": [icon]},
+                            {"component": "div", "props": {"class": "text-center", "style": "font-size: 11px; line-height: 1.25; margin-top: 3px; max-width: 100%; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-all;"}, "text": str(badge.get("name") or "勋章")},
+                        ]})
+                    card = {"component": "div", "props": {"style": f"{glass} padding: 10px;", "title": cat}, "content": [
+                        {"component": "div", "props": {"class": "text-caption text-medium-emphasis mb-1"}, "text": f"{cat} · {len(items)}"},
+                        {"component": "div", "props": {"class": "d-flex flex-wrap ga-2"}, "content": badge_cells},
                     ]}
-                ]
-            }
+                    idx = min(range(3), key=lambda i: col_heights[i])
+                    columns[idx].append(card)
+                    col_heights[idx] += 26 + 20 + 12 + ((len(items) + 1) // 2) * 78 + ((len(items) + 1) // 2 - 1) * 8
+                badge_panels = [{"component": "div", "props": {"class": "d-flex flex-column", "style": "flex: 1 1 240px; min-width: 240px; gap: 12px;"}, "content": col} for col in columns]
+        else:
+            identity_block = [
+                {"component": "div", "props": {"class": "d-flex align-center ga-3 pa-3", "style": f"{glass} height: 100%;"}, "content": [
+                    {"component": "VAvatar", "props": {"size": 64, "color": "surface-variant"}, "content": [{"component": "VIcon", "props": {"size": 34, "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-hexagon-multiple-outline"}]},
+                    {"component": "div", "content": [{"component": "div", "props": {"class": "text-h6 font-weight-bold"}, "text": "蜂巢"}, {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "等待 MP 专用 Key 完成首次连接"}]},
+                ]},
+            ]
+
+        radar_panel = {"component": "div", "props": {"style": f"{glass} position: absolute; top: 4px; right: 4px; bottom: 4px; left: 4px; overflow: hidden;"}, "content": [
+            {"component": "div", "props": {"class": "d-flex align-center", "style": "position: absolute; top: 8px; left: 10px; z-index: 1; padding: 2px 8px; border-radius: 99px; background-color: rgba(var(--v-theme-surface), 0.78); border: 1px solid rgba(var(--v-theme-on-surface), 0.10);"}, "content": [
+                {"component": "VIcon", "props": {"size": "small", "class": "mr-1", "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-radar"},
+                {"component": "span", "props": {"class": "font-weight-bold", "style": "font-size: 12px;"}, "text": "能力画像"},
+            ]},
+            {"component": "div", "props": {"class": "d-flex justify-center align-center", "style": "height: 100%; min-height: 0;"}, "content": [
+                {"component": "VImg", "props": {"src": radar_img, "alt": "能力画像", "width": "100%", "height": "100%", "contain": True, "max-width": "100%", "max-height": "100%"}} if radar_img else {"component": "div", "props": {"class": "text-caption text-medium-emphasis text-center"}, "text": "完成首次连接后展示六维画像"},
+            ]},
+        ]}
+
+        # 第一行：身份区 + 能力画像（雷达） + 论坛数据（紧凑统计卡）
+        main_content = [{"component": "VRow", "props": {"class": "ma-0"}, "content": [
+            {"component": "VCol", "props": {"cols": 12, "md": 4, "class": "pa-3"}, "content": identity_block},
+            {"component": "VCol", "props": {"cols": 12, "md": 4, "class": "pa-3", "style": "position: relative;"}, "content": [radar_panel]},
+            {"component": "VCol", "props": {"cols": 12, "md": 4, "class": "pa-3"}, "content": [
+                {"component": "div", "props": {"class": "d-flex flex-column pa-3", "style": f"{glass} height: 100%;"}, "content": [
+                    section_title("mdi-chart-box-outline", "论坛数据"),
+                    {"component": "div", "props": {"class": "d-flex flex-grow-1 flex-column justify-center"}, "content": [
+                        {"component": "VRow", "props": {"dense": True, "class": "mx-n1"}, "content": stat_cards},
+                    ]},
+                ]},
+            ]},
+        ]}]
+
+        # 第二行：勋章（左，可能很多，限高滚动，占更宽） + 签到日历（右，与雷达同宽）
+        main_content.append({"component": "VRow", "props": {"class": "ma-0"}, "content": [
+            {"component": "VCol", "props": {"cols": 12, "md": 8, "class": "pa-3"}, "content": [
+                section_title("mdi-medal-outline", "我的勋章", {"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "primary"}, "text": f"{badge_count} 枚"}),
+                {"component": "div", "props": {"class": "d-flex flex-wrap align-start", "style": "gap: 12px; max-height: 340px; overflow-y: auto; scrollbar-width: thin; padding-right: 4px;"}, "content": badge_panels or [
+                    {"component": "div", "props": {"class": "text-caption text-medium-emphasis"}, "text": "完成首次连接后展示论坛勋章"},
+                ]},
+            ]},
+            {"component": "VCol", "props": {"cols": 12, "md": 4, "class": "pa-3"}, "content": [calendar_panel]},
+        ]})
+
+        if snapshot:
+            main_content.extend([
+                {"component": "VDivider"},
+                {"component": "div", "props": {"class": "pa-3"}, "content": [
+                    {"component": "div", "props": {"class": "d-flex align-center flex-wrap ga-2 mb-2"}, "content": [
+                        {"component": "VIcon", "props": {"size": "small", "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-chart-box-outline"},
+                        {"component": "span", "props": {"class": "font-weight-bold"}, "text": "PT 人生"},
+                        {"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "primary"}, "text": f"{snapshot.get('siteCount', 0)} 个站点"},
+                        {"component": "VSpacer"},
+                        {"component": "span", "props": {"class": "text-caption text-medium-emphasis"}, "text": f"同步于 {self.get_data('last_push_time') or '—'}"},
+                    ]},
+                    {"component": "VRow", "props": {"dense": True, "class": "mx-n1"}, "content": [
+                        stat("mdi-upload", "上传", self._format_bytes(snapshot.get("totalUpload", "0")), "#10b981", md=3),
+                        stat("mdi-download", "下载", self._format_bytes(snapshot.get("totalDownload", "0")), "#3b82f6", md=3),
+                        stat("mdi-swap-vertical-bold", "分享率", snapshot.get("ratio", "—"), "#f59e0b", md=2),
+                        stat("mdi-seed-outline", "做种", snapshot.get("totalSeeding", 0), "#14b8a6", md=2),
+                        stat("mdi-database-outline", "做种体积", self._format_bytes(snapshot.get("totalSeedingSize", "0")), "#8b5cf6", md=2),
+                    ]},
+                ]},
+            ])
+
+        components = [
+            {
+                "component": "VCard",
+                "props": {"variant": "outlined", "class": "mb-4", "style": surface},
+                "content": [
+                    {"component": "VCardText", "props": {"class": "pa-0"}, "content": main_content},
+                ],
+            },
+        ]
 
         if not history:
-            components = []
-            if user_info_card:
-                components.append(user_info_card)
-            components.extend([
-                {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal',
-                                                  'text': '暂无签到记录，请先配置用户名和密码并启用插件',
-                                                  'class': 'mb-2', 'prepend-icon': 'mdi-information'}},
-                {'component': 'VCard', 'props': {'variant': 'outlined', 'class': 'mb-4'}, 'content': [
-                    {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                        {'component': 'VIcon', 'props': {'color': 'amber-darken-2', 'class': 'mr-2'},
-                         'text': 'mdi-flower'},
-                        {'component': 'span', 'props': {'class': 'text-h6'}, 'text': '签到奖励说明'}
-                    ]},
-                    {'component': 'VDivider'},
-                    {'component': 'VCardText', 'props': {'class': 'pa-3'}, 'content': [
-                        {'component': 'div', 'props': {'class': 'd-flex align-center mb-2'}, 'content': [
-                            {'component': 'VIcon',
-                             'props': {'style': 'color: #FF8F00;', 'size': 'small', 'class': 'mr-2'},
-                             'text': 'mdi-check-circle'},
-                            {'component': 'span', 'text': '每日签到可获得随机花粉奖励'}
-                        ]},
-                        {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                            {'component': 'VIcon',
-                             'props': {'style': 'color: #1976D2;', 'size': 'small', 'class': 'mr-2'},
-                             'text': 'mdi-calendar-check'},
-                            {'component': 'span', 'text': '连续签到可累积天数，提升论坛等级'}
-                        ]}
-                    ]}
-                ]}
-            ])
+            components.append({"component": "VAlert", "props": {"type": "info", "variant": "tonal", "density": "compact", "text": "暂无签到记录", "prepend-icon": "mdi-information-outline"}})
             return components
 
-        history = sorted(history, key=lambda x: x.get("date", ""), reverse=True)
-        history_rows = []
-        status_colors = {"签到成功": "#4CAF50", "已签到": "#2196F3", "签到失败": "#F44336"}
-        status_icons = {"签到成功": "mdi-check-circle", "已签到": "mdi-information-outline",
-                        "签到失败": "mdi-close-circle"}
-
-        for record in history:
-            status_text = record.get("status", "未知")
-            status_color = status_colors.get(status_text, "#9E9E9E")
-            status_icon = status_icons.get(status_text, "mdi-help-circle")
-            money_text = self._format_pollen(record.get('money'))
-            failure_count = record.get('failure_count', 0)
-            failure_count_text = str(failure_count) if failure_count > 0 else '—'
-
-            history_rows.append({
-                'component': 'tr',
-                'content': [
-                    {'component': 'td', 'props': {'class': 'text-caption'}, 'text': record.get("date", "")},
-                    {'component': 'td', 'content': [
-                        {'component': 'VChip',
-                         'props': {'style': f'background-color: {status_color}; color: white;', 'size': 'small',
-                                   'variant': 'elevated'}, 'content': [
-                            {'component': 'VIcon',
-                             'props': {'start': True, 'style': 'color: white;', 'size': 'small'},
-                             'text': status_icon},
-                            {'component': 'span', 'text': status_text}
-                        ]},
-                        {'component': 'div', 'props': {'class': 'mt-1 text-caption grey--text'},
-                         'text': f"将在{record.get('retry', {}).get('interval', self._retry_interval)}小时后重试 ({record.get('retry', {}).get('current', 0)}/{record.get('retry', {}).get('max', self._retry_count)})" if status_text == "签到失败" and record.get(
-                             'retry', {}).get('enabled', False) and record.get('retry', {}).get('current',
-                                                                                                0) > 0 else ""}
-                    ]},
-                    {'component': 'td', 'text': failure_count_text},
-                    {'component': 'td', 'content': [
-                        {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                            {'component': 'VIcon', 'props': {'style': 'color: #FFC107;', 'class': 'mr-1'},
-                             'text': 'mdi-flower'},
-                            {'component': 'span', 'text': money_text}
-                        ]}]},
-                    {'component': 'td', 'content': [
-                        {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                            {'component': 'VIcon', 'props': {'style': 'color: #1976D2;', 'class': 'mr-1'},
-                             'text': 'mdi-calendar-check'},
-                            {'component': 'span', 'text': record.get('totalContinuousCheckIn', '—')}
-                        ]}]},
-                    {'component': 'td', 'content': [
-                        {'component': 'div', 'props': {'class': 'd-flex align-center'}, 'content': [
-                            {'component': 'VIcon', 'props': {'style': 'color: #FF8F00;', 'class': 'mr-1'},
-                             'text': 'mdi-gift'},
-                            {'component': 'span',
-                             # 修改处：增加 "已签到" 的判断条件
-                             'text': f"{self._format_pollen(record.get('lastCheckinMoney', 0))}花粉" if (
-                                         ("签到成功" in status_text or "已签到" in status_text) and record.get('lastCheckinMoney', 0) > 0) else '—'}
-                        ]}]}
-                ]
-            })
-
-        components = []
-        if user_info_card:
-            components.append(user_info_card)
-        components.append({
-            'component': 'VCard', 'props': {'variant': 'outlined', 'class': 'mb-4'}, 'content': [
-                {'component': 'VCardTitle', 'props': {'class': 'd-flex align-center'}, 'content': [
-                    {'component': 'VIcon', 'props': {'style': 'color: #9C27B0;', 'class': 'mr-2'},
-                     'text': 'mdi-history'},
-                    {'component': 'span', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '蜂巢签到历史'},
-                    {'component': 'VSpacer'},
-                    {'component': 'VChip',
-                     'props': {'style': 'background-color: #FF9800; color: white;', 'size': 'small',
-                               'variant': 'elevated'},
-                     'content': [
-                         {'component': 'VIcon',
-                          'props': {'start': True, 'style': 'color: white;', 'size': 'small'},
-                          'text': 'mdi-flower'},
-                         {'component': 'span', 'text': '每日可得花粉奖励'}
-                     ]}
-                ]},
-                {'component': 'VDivider'},
-                {'component': 'VCardText', 'props': {'class': 'pa-0 pa-md-2'}, 'content': [
-                    {'component': 'VResponsive', 'content': [
-                        {'component': 'VTable', 'props': {'hover': True, 'density': 'comfortable'}, 'content': [
-                            {'component': 'thead', 'content': [{'component': 'tr', 'content': [
-                                {'component': 'th', 'text': '时间'}, {'component': 'th', 'text': '状态'},
-                                {'component': 'th', 'text': '失败次数'},
-                                {'component': 'th', 'text': '花粉'}, {'component': 'th', 'text': '签到天数'},
-                                {'component': 'th', 'text': '奖励'}
-                            ]}]},
-                            {'component': 'tbody', 'content': history_rows}
-                        ]}
-                    ]}
-                ]}
-            ]
-        })
-        components.append({
-            'component': 'style',
-            'text': """
-                .v-table { border-radius: 8px; overflow: hidden; }
-                .v-table th { background-color: rgba(var(--v-theme-primary), 0.05); color: rgb(var(--v-theme-primary)); font-weight: 600; }
-                """
-        })
+        history = sorted(history, key=lambda item: str(item.get("date") or ""), reverse=True)
+        total = len(history)
+        rows = []
+        for record in history[:90]:
+            state = str(record.get("status") or "未知")
+            tone = "error" if "失败" in state else "info" if "已签到" in state or "补签" in state else "success"
+            rows.append({"component": "tr", "content": [
+                {"component": "td", "props": {"style": "white-space: nowrap;"}, "text": str(record.get("date") or "")},
+                {"component": "td", "content": [{"component": "VChip", "props": {"size": "small", "variant": "tonal", "color": tone}, "text": state}]},
+                {"component": "td", "props": {"style": "white-space: nowrap;"}, "text": self._format_reward(record.get("reward", record.get("lastCheckinMoney", record.get("money", 0))))},
+                {"component": "td", "content": [{"component": "VChip", "props": {"size": "x-small", "variant": "tonal", "color": "success" if record.get("forumVerified") else "secondary"}, "text": "论坛记录" if record.get("forumVerified") else "插件记录"}]},
+                {"component": "td", "props": {"style": "white-space: nowrap;"}, "text": str(record.get("siteCount", "—"))},
+            ]})
+        components.append({"component": "VCard", "props": {"variant": "outlined", "class": "mb-4"}, "content": [
+            {"component": "VCardTitle", "props": {"class": "d-flex align-center py-3"}, "content": [{"component": "VIcon", "props": {"size": "small", "class": "mr-2", "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-history"}, {"component": "span", "props": {"class": "text-subtitle-1 font-weight-bold"}, "text": "签到记录"}, {"component": "VSpacer"}, {"component": "VChip", "props": {"size": "x-small", "variant": "tonal"}, "text": f"最近 {len(rows)} / 共 {total}"}]},
+            {"component": "VDivider"},
+            {"component": "div", "props": {"style": "max-height: 520px; overflow: auto; scrollbar-width: thin;"}, "content": [{"component": "VTable", "props": {"hover": True, "density": "comfortable", "fixed-header": True, "style": "min-width: 680px;"}, "content": [
+                {"component": "thead", "content": [{"component": "tr", "content": [{"component": "th", "text": "时间"}, {"component": "th", "text": "状态"}, {"component": "th", "text": "奖励"}, {"component": "th", "text": "来源"}, {"component": "th", "text": "同步站点"}]}]},
+                {"component": "tbody", "content": rows},
+            ]}]},
+        ]})
         return components
+
 
     def stop_service(self):
         """
@@ -1931,199 +1677,47 @@ class FengchaoSignin(_PluginBase):
         except Exception as e:
             logger.error("退出插件失败：%s" % str(e))
 
-    def __check_and_push_mp_stats(self):
-        """检查是否需要更新蜂巢论坛PT人生数据"""
-        if hasattr(self, '_pushing_stats') and self._pushing_stats:
-            logger.info("已有更新PT人生数据任务在执行，跳过当前任务")
-            return
-        self._pushing_stats = True
+    def __check_and_push_mp_stats(self, hours=None, jitter=None):
+        if not self._enabled or not self._mp_push_enabled or not self._api_key:
+            return None
+        # MoviePilot's interval service can start every installed plugin at
+        # the same instant. Apply a bounded one-time offset per process so
+        # the forum sees a naturally distributed request pattern.
+        if jitter and not getattr(self, "_service_jitter_applied", False):
+            self._service_jitter_applied = True
+            delay = random.uniform(0, min(60, max(0, float(jitter))))
+            if delay:
+                time.sleep(delay)
+        now = datetime.now()
+        if self._last_push_time and self._mp_push_interval:
+            try:
+                last_push = datetime.strptime(self._last_push_time, "%Y-%m-%d %H:%M:%S")
+                if (now - last_push).total_seconds() < int(self._mp_push_interval) * 86400:
+                    # Keep the administrator resync path responsive even
+                    # when the normal daily snapshot interval has not elapsed,
+                    # but do not turn a short host interval into repeated forum
+                    # polling. A 12-hour heartbeat is enough for admin actions.
+                    if self._status_refresh_due():
+                        try:
+                            status = self._sync_if_requested(self.__api_request("GET", "/api/integrations/moviepilot/v1/status"))
+                            self._notify_status_transition(status)
+                        except Exception as status_error:
+                            logger.debug(f"读取蜂巢同步请求失败：{status_error}")
+                    return None
+            except (TypeError, ValueError):
+                pass
         try:
-            if not self._mp_push_enabled: return
-            if not self._username or not self._password:
-                logger.error("未配置用户名密码，无法更新PT人生数据")
-                return
-            proxies = self._get_proxies()
-            now = datetime.now()
-            if self._last_push_time:
-                last_push = datetime.strptime(self._last_push_time, '%Y-%m-%d %H:%M:%S')
-                if (now - last_push).days < self._mp_push_interval:
-                    logger.info(f"距离上次更新PT人生数据时间不足{self._mp_push_interval}天，跳过更新")
-                    return
-            logger.info(f"开始更新蜂巢论坛PT人生数据...")
-            cookie = self._login_and_get_cookie(proxies)
-            if not cookie:
-                logger.error("登录失败，无法获取cookie进行PT人生数据更新")
-                return
+            result = self.__push_stats_with_retries(retry_count=0)
             try:
-                res = RequestUtils(cookies=cookie, proxies=proxies, timeout=30).get_res(url="https://pting.club")
-            except Exception as e:
-                logger.error(f"请求蜂巢出错: {str(e)}")
-                return
-            if not res or res.status_code != 200:
-                logger.error(f"请求蜂巢返回错误状态码: {res.status_code if res else '无响应'}")
-                return
-            csrf_matches = re.findall(r'"csrfToken":"(.*?)"', res.text)
-            if not csrf_matches:
-                logger.error("获取CSRF令牌失败，无法进行PT人生数据更新")
-                return
-            csrf_token = csrf_matches[0]
-            user_matches = re.search(r'"userId":(\d+)', res.text)
-            if not user_matches:
-                logger.error("获取用户ID失败，无法进行PT人生数据更新")
-                return
-            user_id = user_matches.group(1)
-            self.__push_mp_stats(user_id=user_id, csrf_token=csrf_token, cookie=cookie)
-        finally:
-            self._pushing_stats = False
-
-    def __push_mp_stats(self, user_id=None, csrf_token=None, cookie=None, retry_count=0, max_retries=3):
-        """更新蜂巢论坛PT人生数据"""
-        if not self._mp_push_enabled: return
-        if not all([user_id, csrf_token, cookie]):
-            logger.error("用户ID、CSRF令牌或Cookie为空，无法更新PT人生数据")
-            return
-        for attempt in range(retry_count, max_retries + 1):
-            if attempt > retry_count:
-                logger.info(f"更新失败，正在进行第 {attempt - retry_count}/{max_retries - retry_count} 次重试...")
-                time.sleep(3)
-            try:
-                now = datetime.now()
-                logger.info(f"开始获取站点统计数据以更新蜂巢论坛PT人生数据 (用户ID: {user_id})")
-                if not hasattr(self, '_cached_stats_data') or not self._cached_stats_data or not hasattr(self,
-                                                                                                        '_cached_stats_time') or (
-                        now - self._cached_stats_time).total_seconds() > 3600:
-                    self._cached_stats_data = self._get_site_statistics()
-                    self._cached_stats_time = now
-                    logger.info("获取最新站点统计数据")
-                else:
-                    logger.info(f"使用缓存的站点统计数据（缓存时间：{self._cached_stats_time.strftime('%Y-%m-%d %H:%M:%S')}）")
-                stats_data = self._cached_stats_data
-                if not stats_data:
-                    logger.error("获取站点统计数据失败，无法更新PT人生数据")
-                    if attempt < max_retries: continue
-                    return
-                if not hasattr(self, '_cached_formatted_stats') or not self._cached_formatted_stats or not hasattr(
-                        self,
-                        '_cached_stats_time') or (
-                        now - self._cached_stats_time).total_seconds() > 3600:
-                    self._cached_formatted_stats = self._format_stats_data(stats_data)
-                    logger.info("格式化最新站点统计数据")
-                else:
-                    logger.info("使用缓存的已格式化站点统计数据")
-                formatted_stats = self._cached_formatted_stats
-                if not formatted_stats:
-                    logger.error("格式化站点统计数据失败，无法更新PT人生数据")
-                    if attempt < max_retries: continue
-                    return
-                
-                # 记录第一个站点的数据以便确认所有字段是否都被正确传递
-                if formatted_stats.get("sites") and len(formatted_stats.get("sites")) > 0:
-                    first_site = formatted_stats.get("sites")[0]
-                    logger.info(f"推送数据示例：站点={first_site.get('name')}, 用户名={first_site.get('username')}, 等级={first_site.get('user_level')}, "
-                                f"上传={first_site.get('upload')}, 下载={first_site.get('download')}, 分享率={first_site.get('ratio')}, "
-                                f"魔力值={first_site.get('bonus')}, 做种数={first_site.get('seeding')}, 做种体积={first_site.get('seeding_size')}")
-
-                sites = formatted_stats.get("sites", [])
-                if len(sites) > 300:
-                    logger.warning(f"站点数据过多({len(sites)}个)，将只推送做种数最多的前300个站点")
-                    sites.sort(key=lambda x: x.get("seeding", 0), reverse=True)
-                    formatted_stats["sites"] = sites[:300]
-                headers = {"X-Csrf-Token": csrf_token, "X-Http-Method-Override": "PATCH",
-                           "Content-Type": "application/json", "Cookie": cookie}
-                data = {"data": {"type": "users", "attributes": {
-                    "mpStatsSummary": json.dumps(formatted_stats.get("summary", {})),
-                    "mpStatsSites": json.dumps(formatted_stats.get("sites", []))}, "id": user_id}}
-                
-                # 输出JSON数据片段以便确认
-                json_data = json.dumps(formatted_stats.get("sites", []))
-                if len(json_data) > 500:
-                    logger.info(f"推送的JSON数据片段: {json_data[:500]}...")
-                    logger.info(f"推送数据大小约为: {len(json_data)/1024:.2f} KB")
-                else:
-                    logger.info(f"推送的JSON数据: {json_data}")
-                    logger.info(f"推送数据大小约为: {len(json_data)/1024:.2f} KB")
-
-                proxies = self._get_proxies()
-                url = f"https://pting.club/api/users/{user_id}"
-                logger.info(f"准备更新蜂巢论坛PT人生数据: {len(formatted_stats.get('sites', []))} 个站点")
-                try:
-                    res = RequestUtils(headers=headers, proxies=proxies, timeout=60).post_res(url=url, json=data)
-                except Exception as e:
-                    logger.error(f"更新请求出错: {str(e)}")
-                    if attempt < max_retries: continue
-                    logger.error("所有重试都失败，放弃更新")
-                    return
-                if res and res.status_code == 200:
-                    logger.info(
-                        f"成功更新蜂巢论坛PT人生数据: 总上传 {round(formatted_stats['summary']['total_upload'] / (1024 ** 3), 2)} GB, 总下载 {round(formatted_stats['summary']['total_download'] / (1024 ** 3), 2)} GB")
-                    self._last_push_time = now.strftime('%Y-%m-%d %H:%M:%S')
-                    self.save_data('last_push_time', self._last_push_time)
-                    if hasattr(self, '_cached_stats_data'): self._cached_stats_data = None
-                    if hasattr(self, '_cached_formatted_stats'): self._cached_formatted_stats = None
-                    if hasattr(self, '_cached_stats_time'): delattr(self, '_cached_stats_time')
-                    logger.info("已清除站点数据缓存，下次将获取最新数据")
-                    if self._notify:
-                        self._send_notification(
-                            title="【✅ 蜂巢论坛PT人生数据更新成功】",
-                            text=(
-                                f"📢 执行结果\n"
-                                f"━━━━━━━━━━\n"
-                                f"🕐 时间：{now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                                f"✨ 状态：成功更新蜂巢论坛PT人生数据\n"
-                                f"📊 站点数：{len(formatted_stats.get('sites', []))} 个\n"
-                                f"━━━━━━━━━━"
-                            )
-                        )
-                    return True
-                else:
-                    logger.error(f"更新蜂巢论坛PT人生数据失败：{res.status_code if res else '请求失败'}, 响应: {res.text[:100] if res and hasattr(res, 'text') else '无响应内容'}")
-                    if attempt < max_retries:
-                        continue
-
-                    # 所有重试都失败，发送通知
-                    if self._notify:
-                        self._send_notification(
-                            title="【❌ 蜂巢论坛PT人生数据更新失败】",
-                            text=(
-                                f"📢 执行结果\n"
-                                f"━━━━━━━━━━\n"
-                                f"🕐 时间：{now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                                f"❌ 状态：更新蜂巢论坛PT人生数据失败（已重试{attempt - retry_count}次）\n"
-                                f"━━━━━━━━━━\n"
-                                f"💡 可能的解决方法\n"
-                                f"• 检查Cookie是否有效\n"
-                                f"• 确认站点是否可访问\n"
-                                f"• 尝试手动登录网站\n"
-                                f"━━━━━━━━━━"
-                            )
-                        )
-                    return False
-            except Exception as e:
-                logger.error(f"更新过程发生异常: {str(e)}")
-                import traceback
-                logger.error(f"错误详情: {traceback.format_exc()}")
-
-                if attempt < max_retries:
-                    continue
-
-                # 所有重试都失败
-                if self._notify:
-                    self._send_notification(
-                        title="【❌ 蜂巢论坛PT人生数据更新失败】",
-                        text=(
-                            f"📢 执行结果\n"
-                            f"━━━━━━━━━━\n"
-                            f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"❌ 状态：更新蜂巢论坛PT人生数据失败（已重试{attempt - retry_count}次）\n"
-                            f"━━━━━━━━━━\n"
-                            f"💡 可能的解决方法\n"
-                            f"• 检查系统网络连接\n"
-                            f"• 确认站点是否可访问\n"
-                            f"• 检查代码是否有错误\n"
-                            f"━━━━━━━━━━"
-                        )
-                    )
-
+                self._notify_status_transition(self._sync_if_requested(self.__api_request("GET", "/api/integrations/moviepilot/v1/status")))
+            except Exception as status_error:
+                logger.warning(f"读取蜂巢 PT 资格状态失败: {status_error}")
+            return result
+        except Exception as exc:
+            logger.error(f"蜂巢 PT 人生定时同步失败: {exc}")
+            if self._notify:
+                self._send_notification("【❌ 蜂巢 PT 人生同步失败】", f"同步失败：{exc}")
+            return None
     def _get_site_statistics(self):
         """获取站点统计数据（参考站点统计插件实现）"""
         try:
@@ -2152,147 +1746,5 @@ class FengchaoSignin(_PluginBase):
                 sites.append(site_dict)
             return {"sites": sites}
         except Exception as e:
-            logger.error(f"获取站点统计数据出错: {str(e)}")
-            return self._get_site_statistics_via_api()
-
-    def _get_site_statistics_via_api(self):
-        """通过API获取站点统计数据（备用）"""
-        try:
-            from app.helper.sites import SitesHelper
-            sites_helper = SitesHelper()
-            managed_sites = sites_helper.get_indexers()
-            managed_site_names = [s.get("name") for s in managed_sites if s.get("name")]
-            api_url = f"{settings.HOST}/api/v1/site/statistics"
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {settings.API_TOKEN}"}
-            res = RequestUtils(headers=headers).get_res(url=api_url)
-            if res and res.status_code == 200:
-                data = res.json()
-                all_sites = data.get("sites", [])
-                sites = [s for s in all_sites if s.get("name") in managed_site_names]
-                data["sites"] = sites
-                return data
-            else:
-                logger.error(f"获取站点统计数据失败: {res.status_code if res else '连接失败'}")
-                return None
-        except Exception as e:
-            logger.error(f"获取站点统计数据出错: {str(e)}")
+            logger.error(f"获取 MoviePilot 本地站点统计数据出错: {str(e)}")
             return None
-
-    def _format_stats_data(self, stats_data):
-        """格式化站点统计数据"""
-        try:
-            if not stats_data or not stats_data.get("sites"): return None
-            sites = stats_data.get("sites", [])
-            summary = {"total_upload": 0, "total_download": 0, "total_seed": 0, "total_seed_size": 0}
-            site_details = []
-            for site in sites:
-                if not site.get("name") or site.get("error"): continue
-                upload = float(site.get("upload", 0))
-                download = float(site.get("download", 0))
-                summary["total_upload"] += upload
-                summary["total_download"] += download
-                summary["total_seed"] += int(site.get("seeding", 0))
-                summary["total_seed_size"] += float(site.get("seeding_size", 0))
-                site_details.append({
-                    "name": site.get("name"), "username": site.get("username", ""),
-                    "user_level": site.get("user_level", ""),
-                    "upload": upload, "download": download,
-                    "ratio": round(upload / download, 2) if download > 0 else float('inf'),
-                    "bonus": site.get("bonus", 0), "seeding": site.get("seeding", 0),
-                    "seeding_size": site.get("seeding_size", 0)
-                })
-            summary["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            return {"summary": summary, "sites": site_details}
-        except Exception as e:
-            logger.error(f"格式化站点统计数据出错: {str(e)}")
-            return None
-
-    def _login_and_get_cookie(self, proxies=None):
-        """使用用户名密码登录获取cookie"""
-        try:
-            logger.info(f"开始使用用户名'{self._username}'登录蜂巢论坛...")
-            return self._login_postman_method(proxies=proxies)
-        except Exception as e:
-            logger.error(f"登录过程出错: {str(e)}")
-            import traceback
-            logger.error(f"详细错误: {traceback.format_exc()}")
-            return None
-
-    def _login_postman_method(self, proxies=None):
-        """使用Postman方式登录"""
-        try:
-            req = RequestUtils(proxies=proxies, timeout=30)
-            proxy_info = "代理" if proxies else "直接连接"
-            logger.info(f"使用Postman方式登录 (使用{proxy_info})...")
-            headers = {"Accept": "*/*",
-                       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                       "Cache-Control": "no-cache"}
-            try:
-                res = req.get_res("https://pting.club", headers=headers)
-                if not res or res.status_code != 200:
-                    logger.error(f"GET请求失败，状态码: {res.status_code if res else '无响应'} (使用{proxy_info})")
-                    return None
-            except Exception as e:
-                logger.error(f"GET请求异常 (使用{proxy_info}): {str(e)}")
-                return None
-            csrf_token = res.headers.get('x-csrf-token') or (re.findall(r'"csrfToken":"(.*?)"', res.text) or [None])[
-                0]
-            if not csrf_token:
-                logger.error(f"无法获取CSRF令牌 (使用{proxy_info})")
-                return None
-            set_cookie_header = res.headers.get('set-cookie')
-            if not set_cookie_header or not (
-                    session_match := re.search(r'flarum_session=([^;]+)', set_cookie_header)):
-                logger.error(f"无法从set-cookie中提取session cookie (使用{proxy_info})")
-                return None
-            session_cookie = session_match.group(1)
-            login_data = {"identification": self._username, "password": self._password, "remember": True}
-            login_headers = {"Content-Type": "application/json", "X-CSRF-Token": csrf_token,
-                             "Cookie": f"flarum_session={session_cookie}", **headers}
-            try:
-                login_res = req.post_res(url="https://pting.club/login", json=login_data, headers=login_headers)
-                if not login_res or login_res.status_code != 200:
-                    logger.error(
-                        f"登录请求失败，状态码: {login_res.status_code if login_res else '无响应'} (使用{proxy_info})")
-                    return None
-            except Exception as e:
-                logger.error(f"登录请求异常 (使用{proxy_info}): {str(e)}")
-                return None
-            cookie_dict = {}
-            if set_cookie_header := login_res.headers.get('set-cookie'):
-                if session_match := re.search(r'flarum_session=([^;]+)', set_cookie_header):
-                    cookie_dict['flarum_session'] = session_match.group(1)
-                if remember_match := re.search(r'flarum_remember=([^;]+)', set_cookie_header):
-                    cookie_dict['flarum_remember'] = remember_match.group(1)
-            if 'flarum_session' not in cookie_dict: cookie_dict['flarum_session'] = session_cookie
-            cookie_str = "; ".join([f"{k}={v}" for k, v in cookie_dict.items()])
-            return self._verify_cookie(req, cookie_str, proxy_info)
-        except Exception as e:
-            logger.error(f"Postman方式登录失败 (使用{proxy_info if proxies else '直接连接'}): {str(e)}")
-            import traceback
-            logger.error(f"详细错误: {traceback.format_exc()}")
-            return None
-
-    def _verify_cookie(self, req, cookie_str, proxy_info):
-        """验证cookie是否有效"""
-        if not cookie_str: return None
-        logger.info(f"验证cookie有效性 (使用{proxy_info})...")
-        headers = {"Cookie": cookie_str,
-                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-                   "Accept": "*/*", "Cache-Control": "no-cache"}
-        for attempt in range(3):
-            try:
-                if attempt > 0:
-                    logger.info(f"验证Cookie重试 {attempt}/2...")
-                    time.sleep(2)
-                verify_res = req.get_res("https://pting.club", headers=headers)
-                if verify_res and verify_res.status_code == 200:
-                    if user_matches := re.search(r'"userId":(\d+)', verify_res.text):
-                        if (user_id := user_matches.group(1)) != "0":
-                            logger.info(f"登录成功！获取到有效cookie，用户ID: {user_id} (使用{proxy_info})")
-                            return cookie_str
-                logger.warning(f"第{attempt + 1}次验证cookie失败 (使用{proxy_info})")
-            except Exception as e:
-                logger.warning(f"第{attempt + 1}次验证cookie请求异常 (使用{proxy_info}): {str(e)}")
-        logger.error("所有 3 次cookie验证尝试均失败。")
-        return None
