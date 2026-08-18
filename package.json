@@ -86,12 +86,13 @@
     "name": "蜂巢论坛签到",
     "description": "通过 MP 专用 API Key 完成蜂巢签到、PT 人生同步，并自动接收论坛通知",
     "labels": "签到,蜂巢,论坛,PT人生,MoviePilot,通知",
-    "version": "3.1.0",
+    "version": "3.1.1",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
     "author": "madrays",
     "level": 2,
     "v2": true,
     "history": {
+      "v3.1.1": "优化论坛通知展示，使用蜂巢横版 Logo、卡片跳转和纯文本分段排版，改善不同 MoviePilot 通知渠道中的阅读体验。",
       "v3.1.0": "新增论坛通知自动接入，可按系统通知、帖子与评论回复、私信三类订阅，并使用实例专用派生密钥安全投递到 MoviePilot 通知渠道。",
       "v3.0.0": "正式接入蜂巢论坛专用 API，支持安全签到、PT 人生同步、圈子资格状态、个人资料、签到日历、能力画像与勋章展示，并完成主题、响应式、重试和隐私边界优化。"
     }

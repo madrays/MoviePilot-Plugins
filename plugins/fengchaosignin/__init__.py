@@ -32,6 +32,7 @@ import requests
 # 论坛正式 API 地址固定内置；仅部署负责人可通过环境变量覆盖。
 MOVIEPILOT_API_BASE = "https://pting.club"
 MOVIEPILOT_API_BASE_OVERRIDE = os.getenv("FENGCHAO_API_BASE", "").strip()
+FORUM_NOTIFICATION_CARD_IMAGE = "https://cdn.pting.club/site-logo/site-logo-7d1d31b822cddca4.jpg"
 
 
 def _resolve_api_base():
@@ -142,7 +143,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.0"
+    plugin_version = "3.1.1"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -1211,13 +1212,6 @@ class FengchaoSignin(_PluginBase):
         text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
         return text[:limit]
 
-    @classmethod
-    def _escape_webhook_markdown(cls, value, limit):
-        text = cls._clean_webhook_text(value, limit)
-        for marker in ("\\", "`", "*", "_", "{", "}", "[", "]", "(", ")", "#", "+", "-", ".", "!", "|", ">"):
-            text = text.replace(marker, f"\\{marker}")
-        return text
-
     @staticmethod
     def _format_webhook_time(value):
         text = str(value or "").strip()
@@ -1251,50 +1245,58 @@ class FengchaoSignin(_PluginBase):
             event_id = self._clean_webhook_text(notification.get("id"), 128)
             occurred_at = self._format_webhook_time(notification.get("createdAt"))
             return event_id, "✅ 蜂巢论坛通知已连通", (
-                "论坛已完成端到端回调测试，当前 MoviePilot 地址和密钥配置有效。\n\n"
-                f"🕒 {occurred_at}"
-            )
+                "🔔 论坛通知接入成功\n\n"
+                "当前 MoviePilot 公网地址与实例密钥均已通过端到端验证。\n\n"
+                f"🕒 验证时间：{occurred_at}\n"
+                "👉 点击卡片可前往蜂巢论坛"
+            ), _resolve_api_base()
 
         if event == "system.notification.created" and self._webhook_system_notification:
             notification = payload.notification if isinstance(payload.notification, dict) else {}
             event_id = self._clean_webhook_text(notification.get("id"), 128)
-            title = self._escape_webhook_markdown(notification.get("title") or "系统通知", 120)
-            content = self._escape_webhook_markdown(notification.get("content") or "你收到一条新的论坛通知。", 1800)
+            title = self._clean_webhook_text(notification.get("title") or "系统通知", 120)
+            content = self._clean_webhook_text(notification.get("content") or "你收到一条新的论坛通知。", 1800)
             occurred_at = self._format_webhook_time(notification.get("createdAt"))
             inbox_url = self._safe_forum_inbox_url(notification.get("inboxUrl"))
-            return event_id, f"🔔 蜂巢 · {self._clean_webhook_text(notification.get('title') or '系统通知', 80)}", (
-                f"**{title}**\n\n{content}\n\n"
-                f"🕒 {occurred_at}\n\n[打开蜂巢通知中心]({inbox_url})"
-            )
+            return event_id, "🔔 蜂巢论坛 · 系统通知", (
+                f"📌 {title}\n\n"
+                f"{content}\n\n"
+                f"🕒 通知时间：{occurred_at}\n"
+                "👉 点击卡片查看通知详情"
+            ), inbox_url
 
         if event == "reply.notification.created" and self._webhook_reply_notification:
             notification = payload.notification if isinstance(payload.notification, dict) else {}
             event_id = self._clean_webhook_text(notification.get("id"), 128)
             title_raw = notification.get("title") or "你收到一条新回复"
-            title = self._escape_webhook_markdown(title_raw, 120)
-            content = self._escape_webhook_markdown(notification.get("content") or "论坛讨论有了新回复。", 1800)
+            title = self._clean_webhook_text(title_raw, 120)
+            content = self._clean_webhook_text(notification.get("content") or "论坛讨论有了新回复。", 1800)
             occurred_at = self._format_webhook_time(notification.get("createdAt"))
             inbox_url = self._safe_forum_inbox_url(notification.get("inboxUrl"))
-            return event_id, f"🗨️ 蜂巢回复 · {self._clean_webhook_text(title_raw, 70)}", (
-                f"**{title}**\n\n{content}\n\n"
-                f"🕒 {occurred_at}\n\n[查看论坛回复]({inbox_url})"
-            )
+            return event_id, "💬 蜂巢论坛 · 新回复", (
+                f"📝 {title}\n\n"
+                f"{content}\n\n"
+                f"🕒 回复时间：{occurred_at}\n"
+                "👉 点击卡片查看完整讨论"
+            ), inbox_url
 
         if event == "private.message.created" and self._webhook_private_message:
             message = payload.message if isinstance(payload.message, dict) else {}
             sender = payload.sender if isinstance(payload.sender, dict) else {}
             event_id = self._clean_webhook_text(message.get("id"), 128)
             display_name_raw = sender.get("displayName") or sender.get("username") or "论坛用户"
-            display_name = self._escape_webhook_markdown(display_name_raw, 80)
-            username = self._escape_webhook_markdown(sender.get("username") or "", 80)
-            preview = self._escape_webhook_markdown(message.get("preview") or message.get("content") or "你收到一条新私信。", 1200)
+            display_name = self._clean_webhook_text(display_name_raw, 80)
+            username = self._clean_webhook_text(sender.get("username") or "", 80)
+            preview = self._clean_webhook_text(message.get("preview") or message.get("content") or "你收到一条新私信。", 1200)
             occurred_at = self._format_webhook_time(message.get("createdAt"))
             inbox_url = self._safe_forum_inbox_url(message.get("inboxUrl"), "/inbox")
-            sender_line = f"👤 {display_name}" + (f" · @{username}" if username else "")
-            return event_id, f"💬 蜂巢私信 · {self._clean_webhook_text(display_name_raw, 60)}", (
-                f"{sender_line}\n\n{preview}\n\n"
-                f"🕒 {occurred_at}\n\n[打开蜂巢私信]({inbox_url})"
-            )
+            sender_line = f"👤 发件人：{display_name}" + (f"（@{username}）" if username else "")
+            return event_id, "✉️ 蜂巢论坛 · 新私信", (
+                f"{sender_line}\n\n"
+                f"💭 {preview}\n\n"
+                f"🕒 发送时间：{occurred_at}\n"
+                "👉 点击卡片打开私信会话"
+            ), inbox_url
 
         if event not in {"integration.webhook.test", "system.notification.created", "reply.notification.created", "private.message.created"}:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="不支持的论坛通知类型")
@@ -1318,7 +1320,7 @@ class FengchaoSignin(_PluginBase):
         rendered = self._render_forum_webhook(payload)
         if rendered is None:
             return schemas.Response(success=True, message="该通知类型未订阅")
-        event_id, title, text = rendered
+        event_id, title, text, link = rendered
         if not event_id:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="论坛通知缺少事件 ID")
 
@@ -1333,7 +1335,14 @@ class FengchaoSignin(_PluginBase):
             ]
             if any(compare_digest(str(item.get("key") or ""), delivery_key) for item in recent):
                 return schemas.Response(success=True, message="通知已处理")
-            self.post_message(mtype=NotificationType.SiteMessage, title=title, text=text)
+            self.post_message(
+                mtype=NotificationType.SiteMessage,
+                title=title,
+                text=text,
+                image=FORUM_NOTIFICATION_CARD_IMAGE,
+                link=link,
+                parse_mode="plain",
+            )
             recent.append({"key": delivery_key, "at": now})
             self.save_data("webhook_deliveries", recent[-200:])
 
