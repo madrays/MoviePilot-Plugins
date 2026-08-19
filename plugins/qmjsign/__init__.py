@@ -10,6 +10,7 @@
 - 增强的错误处理和日志
 
 修改记录:
+- v1.1.2: 修复签到失败（“未定义操作”）：改用 https、补齐 qdmode/todaysay/fastreply 参数、优化响应解析
 - v1.0.0: 初始版本，基于QD签到模板实现
 """
 import time
@@ -30,6 +31,34 @@ from app.schemas import NotificationType
 from concurrent.futures import ThreadPoolExecutor
 
 
+def _extract_sign_message(html_content: str) -> Optional[str]:
+    """
+    从 Discuz AJAX 响应（<root><![CDATA[...]]></root>）中提取提示消息文本。
+    兼容 <div class="c"> 与 <div class="c altw">，并优先提取 alert_error/alert_right/alert_info。
+    """
+    def _clean(segment: str) -> str:
+        # 去掉 script 标签及其内容，再去掉其余 HTML 标签
+        segment = re.sub(r'<script.*?</script>', '', segment, flags=re.S)
+        segment = re.sub(r'<[^>]+>', '', segment)
+        return segment.strip()
+
+    # 1) 优先提取 alert_xxx 中的消息
+    alert_match = re.search(r'<div class="alert_(?:error|right|info)">(.*?)</div>', html_content, re.S)
+    if alert_match:
+        msg = _clean(alert_match.group(1))
+        if msg:
+            return msg
+
+    # 2) 回退：提取 <div class="c"> 或 <div class="c altw"> 内容
+    div_match = re.search(r'<div class="c(?: altw)?">(.*?)</div>', html_content, re.S)
+    if div_match:
+        msg = _clean(div_match.group(1))
+        if msg:
+            return msg
+
+    return None
+
+
 class QmjSign(_PluginBase):
     # 插件名称
     plugin_name = "阡陌居签到"
@@ -38,7 +67,7 @@ class QmjSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/qmj.ico"
     # 插件版本
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -349,7 +378,7 @@ class QmjSign(_PluginBase):
             logger.info("正在访问阡陌居首页...")
             try:
                 # 设置较短的超时时间，避免卡住
-                response = session.get("http://www.1000qm.vip/", timeout=(3, 10))
+                response = session.get("https://www.1000qm.vip/", timeout=(3, 10))
                 html_content = response.text
 
                 # 提取formhash参数
@@ -446,19 +475,24 @@ class QmjSign(_PluginBase):
 
             # 步骤2: 执行签到
             logger.info("正在执行签到...")
-            sign_url = "http://www.1000qm.vip/plugin.php?id=dsu_paulsign%3Asign&operation=qiandao&infloat=1&inajax=1"
+            sign_url = "https://www.1000qm.vip/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
 
             # 准备POST数据
             post_data = {
                 "formhash": formhash,
-                "qdxq": "yl"
+                # 以下参数与手动签到成功请求保持一致：
+                # qdmode=1 为快速签到模式（缺失会导致“未定义操作”）
+                "qdxq": "wl",
+                "qdmode": "1",
+                "todaysay": "今天开心 ing",
+                "fastreply": "0"
             }
 
             # 更新请求头
             session.headers.update({
-                "Origin": "http://www.1000qm.vip",
+                "Origin": "https://www.1000qm.vip",
                 "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": "http://www.1000qm.vip/plugin.php?id=dsu_paulsign:sign"
+                "Referer": "https://www.1000qm.vip/plugin.php?id=dsu_paulsign:sign"
             })
 
             try:
@@ -470,16 +504,59 @@ class QmjSign(_PluginBase):
                 logger.info(f"签到响应内容预览: {debug_resp}")
 
                 # 检查签到结果并提取日志信息
-                log_match = re.search(r'<div class="c">([^>]+)<', html_content)
-                if log_match:
-                    log_message = log_match.group(1).strip()
+                log_message = _extract_sign_message(html_content)
+                if log_message:
                     logger.info(f"签到响应消息: {log_message}")
 
-                    # 判断签到是否成功
-                    if "成功" in log_message or "签到" in log_message:
+                    # 判断签到结果（注意顺序：先判失败/已签到，再判成功）
+                    if any(k in log_message for k in ["未定义操作", "失败", "错误", "无效", "无法", "不能"]):
+                        # 签到失败
+                        logger.error(f"签到失败: {log_message}")
+                        sign_dict = {
+                            "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+                            "status": f"签到失败: {log_message}",
+                            "message": log_message
+                        }
+                        self._save_sign_history(sign_dict)
+
+                        if self._notify:
+                            self.post_message(
+                                mtype=NotificationType.SiteMessage,
+                                title="【❌ 阡陌居签到失败】",
+                                text=f"❌ 签到失败: {log_message}"
+                            )
+                            notification_sent = True
+                        return sign_dict
+
+                    elif "已经签到" in log_message or "已签到" in log_message:
+                        logger.info("今日已签到")
+                        sign_status = "已签到"
+
+                        # 创建签到记录
+                        sign_dict = {
+                            "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
+                            "status": sign_status,
+                            "message": log_message
+                        }
+
+                        # 合并威望红包信息
+                        if prestige_info:
+                            sign_dict.update(prestige_info)
+
+                        # 保存签到记录
+                        self._save_sign_history(sign_dict)
+                        self._save_last_sign_date()
+
+                        # 发送通知
+                        if self._notify:
+                            self._send_sign_notification(sign_dict)
+                            notification_sent = True
+
+                        return sign_dict
+
+                    elif "成功" in log_message or "签到" in log_message:
                         logger.info("签到成功")
                         sign_status = "签到成功"
-
 
                         # 创建签到记录
                         sign_dict = {
@@ -517,35 +594,9 @@ class QmjSign(_PluginBase):
 
                         return sign_dict
 
-                    elif "已经签到" in log_message or "已签到" in log_message:
-                        logger.info("今日已签到")
-                        sign_status = "已签到"
-
-                        # 创建签到记录
-                        sign_dict = {
-                            "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
-                            "status": sign_status,
-                            "message": log_message
-                        }
-
-                        # 合并威望红包信息
-                        if prestige_info:
-                            sign_dict.update(prestige_info)
-
-                        # 保存签到记录
-                        self._save_sign_history(sign_dict)
-                        self._save_last_sign_date()
-
-                        # 发送通知
-                        if self._notify:
-                            self._send_sign_notification(sign_dict)
-                            notification_sent = True
-
-                        return sign_dict
-
                     else:
-                        # 签到失败
-                        logger.error(f"签到失败: {log_message}")
+                        # 未知消息，按失败处理
+                        logger.error(f"签到返回未知消息: {log_message}")
                         sign_dict = {
                             "date": datetime.today().strftime('%Y-%m-%d %H:%M:%S'),
                             "status": f"签到失败: {log_message}",
@@ -591,7 +642,6 @@ class QmjSign(_PluginBase):
                         )
                         notification_sent = True
                     return sign_dict
-
             except requests.Timeout:
                 logger.error("签到请求超时")
                 # 常规重试逻辑
@@ -1437,7 +1487,7 @@ class QmjSign(_PluginBase):
         """检查Cookie是否有效"""
         try:
             # 使用更短的超时时间，防止卡住
-            response = session.get("http://www.1000qm.vip/", timeout=(3, 10))
+            response = session.get("https://www.1000qm.vip/", timeout=(3, 10))
             # 检查是否包含登录后的特征
             if "退出" in response.text or "个人资料" in response.text or "用户名" in response.text:
                 logger.info("Cookie验证成功")
