@@ -81,6 +81,20 @@ def _safe_cron(value, default):
         return default
 
 
+def _cron_trigger_with_jitter(expression, jitter_seconds):
+    """Build the jitter into CronTrigger; add_job ignores trigger kwargs for trigger objects."""
+    minute, hour, day, month, day_of_week = str(expression).split()
+    return CronTrigger(
+        minute=minute,
+        hour=hour,
+        day=day,
+        month=month,
+        day_of_week=day_of_week,
+        timezone=settings.TZ,
+        jitter=jitter_seconds,
+    )
+
+
 def _safe_nonnegative_int(value):
     """把 MP 统计模型中的异常数值（NaN/Infinity/负数）安全归一化。"""
     try:
@@ -143,7 +157,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.1"
+    plugin_version = "3.1.2"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -289,12 +303,11 @@ class FengchaoSignin(_PluginBase):
             if self._enabled and self._cron:
                 self._scheduler.add_job(
                     func=self.__signin,
-                    trigger=CronTrigger.from_crontab(self._cron),
+                    trigger=_cron_trigger_with_jitter(self._cron, 1800),
                     name="蜂巢签到",
                     id=signin_job_id,
                     # Tens of thousands of installations commonly keep the
                     # default cron. Spread forum writes over 30 minutes.
-                    jitter=1800,
                 )
                 logger.info(f"已添加新的签到周期任务，周期：{self._cron}")
 
@@ -314,13 +327,12 @@ class FengchaoSignin(_PluginBase):
                 self._scheduler.add_job(
                     func=self.__sync_pt_life,
                     kwargs={'is_scheduled_run': True},
-                    trigger=CronTrigger.from_crontab(cron_to_use),
+                    trigger=_cron_trigger_with_jitter(cron_to_use, 7200),
                     name="蜂巢 PT 人生快照定时同步",
                     id=info_update_job_id,
                     # All MoviePilot instances commonly share the same
                     # default cron. Spread the heavier daily snapshot uploads
                     # across two hours so the forum never sees a 03:00 spike.
-                    jitter=7200,
                 )
                 logger.info(f"已添加新的 PT 人生同步周期任务，周期：{cron_to_use}")
 
