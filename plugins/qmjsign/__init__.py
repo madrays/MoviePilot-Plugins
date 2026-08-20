@@ -1,6 +1,6 @@
 """
 阡陌居签到插件
-版本: 1.0.0
+版本: 1.1.3
 作者: madrays
 功能:
 - 自动完成阡陌居每日签到
@@ -10,10 +10,12 @@
 - 增强的错误处理和日志
 
 修改记录:
+- v1.1.3: 签到心情与签到文字改为随机选择（DSU 心情库 + 对应文案）
 - v1.1.2: 修复签到失败（“未定义操作”）：改用 https、补齐 qdmode/todaysay/fastreply 参数、优化响应解析
 - v1.0.0: 初始版本，基于QD签到模板实现
 """
 import time
+import random
 import requests
 import re
 from datetime import datetime, timedelta
@@ -59,6 +61,36 @@ def _extract_sign_message(html_content: str) -> Optional[str]:
     return None
 
 
+# DSU 每日签到心情选项（qdxq 参数值 -> 含义）
+_SIGN_MOODS = [
+    ("kx", "开心"),
+    ("ng", "难过"),
+    ("ym", "郁闷"),
+    ("wl", "无聊"),
+    ("nu", "生气"),
+    ("ch", "擦汗"),
+    ("fd", "奋斗"),
+    ("yl", "慵懒"),
+    ("shuai", "衰"),
+]
+
+# 各心情对应的签到文字，签到时会随机挑选一条
+_SIGN_TEXTS = {
+    "kx": ["今天开心 ing", "开心的一天，签到打卡~", "心情美美哒，来签个到"],
+    "ng": ["今天有点难过，还是来签个到", "心情低落，签到打卡"],
+    "ym": ["有点郁闷，签个到解解闷", "今天心情郁闷，求安慰"],
+    "wl": ["今天好无聊，来签个到", "无聊的一天，签到打卡"],
+    "nu": ["生气中，先签个到", "今天有点生气！"],
+    "ch": ["忙得满头大汗，来签个到", "擦汗，终于有空签到了"],
+    "fd": ["奋斗的一天，签到打卡", "加油！努力奋斗，先签个到"],
+    "yl": ["慵懒地签个到", "今天有点慵懒，签完继续躺"],
+    "shuai": ["今天有点衰，签个到转运", "签到，希望转运"],
+}
+
+# 通用签到文字兜底
+_SIGN_TEXTS_FALLBACK = ["今日签到", "每日签到", "打卡签到", "签到成功，新的一天"]
+
+
 class QmjSign(_PluginBase):
     # 插件名称
     plugin_name = "阡陌居签到"
@@ -67,7 +99,7 @@ class QmjSign(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/qmj.ico"
     # 插件版本
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -477,14 +509,17 @@ class QmjSign(_PluginBase):
             logger.info("正在执行签到...")
             sign_url = "https://www.1000qm.vip/plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1"
 
-            # 准备POST数据
+            # 随机选择签到心情与签到文字
+            qdxq, mood_label = random.choice(_SIGN_MOODS)
+            todaysay = random.choice(_SIGN_TEXTS.get(qdxq) or _SIGN_TEXTS_FALLBACK)
+            logger.info(f"本次签到心情: {mood_label}({qdxq})，签到文字: {todaysay}")
+
+            # 准备POST数据（qdmode=1 为快速签到模式，缺失会导致“未定义操作”）
             post_data = {
                 "formhash": formhash,
-                # 以下参数与手动签到成功请求保持一致：
-                # qdmode=1 为快速签到模式（缺失会导致“未定义操作”）
-                "qdxq": "wl",
+                "qdxq": qdxq,
                 "qdmode": "1",
-                "todaysay": "今天开心 ing",
+                "todaysay": todaysay,
                 "fastreply": "0"
             }
 
