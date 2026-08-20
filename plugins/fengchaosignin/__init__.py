@@ -33,6 +33,7 @@ import requests
 MOVIEPILOT_API_BASE = "https://pting.club"
 MOVIEPILOT_API_BASE_OVERRIDE = os.getenv("FENGCHAO_API_BASE", "").strip()
 FORUM_NOTIFICATION_CARD_IMAGE = "https://cdn.pting.club/site-logo/site-logo-7d1d31b822cddca4.jpg"
+LOCAL_STATS_RETRY_DELAYS_SECONDS = (30, 90, 180)
 
 
 def _resolve_api_base():
@@ -139,6 +140,10 @@ def _safe_bonus(value):
         return "0"
 
 
+class _MoviePilotStatsNotReady(RuntimeError):
+    """MoviePilot has not populated its local site statistics yet."""
+
+
 class FengchaoWebhookPayload(BaseModel):
     """蜂巢论坛发送的站外通知。"""
 
@@ -157,7 +162,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.2"
+    plugin_version = "3.1.3"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -528,6 +533,39 @@ class FengchaoSignin(_PluginBase):
         if not self._scheduler.running:
             self._scheduler.start()
 
+    def _schedule_local_stats_retry(self, batch_id: str, attempt: int, is_scheduled_run: bool):
+        """Retry locally while MoviePilot is still loading site statistics."""
+        if attempt < 1 or attempt > len(LOCAL_STATS_RETRY_DELAYS_SECONDS):
+            return False
+        if not self._scheduler:
+            self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+
+        delay_seconds = LOCAL_STATS_RETRY_DELAYS_SECONDS[attempt - 1]
+        next_run_time = datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=delay_seconds)
+        self._scheduler.add_job(
+            func=self.__sync_pt_life,
+            kwargs={
+                'is_scheduled_run': is_scheduled_run,
+                'is_retry': True,
+                'retry_batch_id': batch_id,
+                'local_retry_attempt': attempt,
+            },
+            trigger='date',
+            run_date=next_run_time,
+            name=f"蜂巢等待 MP 站点统计 ({attempt}/{len(LOCAL_STATS_RETRY_DELAYS_SECONDS)})",
+            id="fengchao_local_stats_retry",
+            replace_existing=True,
+        )
+        logger.info(
+            "MoviePilot 站点统计尚未就绪，将在 %s 秒后进行第 %s/%s 次本地重试",
+            delay_seconds,
+            attempt,
+            len(LOCAL_STATS_RETRY_DELAYS_SECONDS),
+        )
+        if not self._scheduler.running:
+            self._scheduler.start()
+        return True
+
     def _send_info_update_failure_notification(self, reason: str):
         """
         发送PT 人生同步失败的通知
@@ -580,7 +618,7 @@ class FengchaoSignin(_PluginBase):
             logger.error(f"获取代理设置出错: {str(e)}")
             return None
 
-    def __sync_pt_life(self, is_scheduled_run: bool = False, is_retry: bool = False, retry_batch_id: str = None):
+    def __sync_pt_life(self, is_scheduled_run: bool = False, is_retry: bool = False, retry_batch_id: str = None, local_retry_attempt: int = 0):
         """手动/定时同步：只通过 MP 本地统计模型上传 PT 人生快照。"""
         if is_scheduled_run and not is_retry:
             self._timed_update_current_retry = 0
@@ -606,12 +644,18 @@ class FengchaoSignin(_PluginBase):
             self._timed_update_current_retry = 0
             if self._scheduler and self._scheduler.get_job("fengchao_info_update_retry"):
                 self._scheduler.remove_job("fengchao_info_update_retry")
+            if self._scheduler and self._scheduler.get_job("fengchao_local_stats_retry"):
+                self._scheduler.remove_job("fengchao_local_stats_retry")
             self._send_notification(
                 title="【✅ 蜂巢 PT 人生同步成功】",
                 text=f"已上传 {result.get('siteCount', 0)} 个站点的最新快照。",
             )
             return result
         except Exception as exc:
+            if isinstance(exc, _MoviePilotStatsNotReady):
+                next_attempt = local_retry_attempt + 1
+                if self._schedule_local_stats_retry(batch_id, next_attempt, is_scheduled_run):
+                    return False
             logger.error(f"蜂巢 PT 人生同步失败: {exc}")
             if is_scheduled_run and self._timed_update_current_retry < self._timed_update_retry_count:
                 self._timed_update_current_retry += 1
@@ -753,6 +797,8 @@ class FengchaoSignin(_PluginBase):
                 continue
             config = managed.get(str(site.get("name"))) or {}
             normalized.append({"name": str(site.get("name")), "domain": str(config.get("url") or ""), "mpSiteId": str(config.get("id") or ""), "username": str(site.get("username") or ""), "userLevel": str(site.get("user_level") or ""), "upload": _safe_nonnegative_int(site.get("upload")), "download": _safe_nonnegative_int(site.get("download")), "bonus": _safe_bonus(site.get("bonus")), "seeding": _safe_nonnegative_int(site.get("seeding")), "seedingSize": _safe_nonnegative_int(site.get("seeding_size"))})
+        if not normalized:
+            raise _MoviePilotStatsNotReady("MoviePilot 站点统计尚未加载，请稍后重试")
         now = datetime.now(tz=pytz.UTC).isoformat()
         result = self.__api_request("PUT", "/api/integrations/moviepilot/v1/pt-life/snapshot", {"schemaVersion": 1, "instanceId": self._instance_id, "pluginVersion": self.plugin_version, "moviePilotVersion": str(getattr(settings, "VERSION_FLAG", "")), "clientBatchId": getattr(self, "_current_batch_id", None) or f"{self._instance_id}-{now[:19]}", "collectedAt": now, "sites": normalized})
         self._last_push_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1979,7 +2025,14 @@ class FengchaoSignin(_PluginBase):
             username = str(account.get("username") or "—")
             avatar = asset_url(account.get("avatarPath"))
             avatar_content = [{"component": "VImg", "props": {"src": avatar, "alt": display_name, "cover": True}}] if avatar else [{"component": "VIcon", "props": {"size": 46, "style": "color: rgb(var(--v-theme-primary));"}, "text": "mdi-account"}]
-            account_state = "圈内用户" if status.get("ptCircle") else "MP 已接通" if status.get("active") else "等待同步"
+            if not self._mp_push_enabled:
+                account_state = "PT 同步已关闭"
+            elif status.get("ptCircle"):
+                account_state = "圈内用户"
+            elif status.get("active"):
+                account_state = "MP 已接通"
+            else:
+                account_state = "等待同步"
 
             level = _safe_nonnegative_int(account.get("level"))
             level_name = str(account.get("levelName") or "")
