@@ -1,6 +1,7 @@
 import ast
 import random
 import unittest
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -49,7 +50,36 @@ def load_snapshot_push():
     return namespace["__api_push_stats"], StatsNotReady
 
 
+def load_instance_id_resolver():
+    module = ast.parse(PLUGIN_SOURCE.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_resolve_instance_id"
+    )
+    namespace = {"uuid": uuid}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(PLUGIN_SOURCE), "exec"), namespace)
+    return namespace["_resolve_instance_id"]
+
+
 class FengchaoScheduleTests(unittest.TestCase):
+    def test_restart_after_key_rotation_keeps_new_persisted_instance_id(self):
+        resolve_instance_id = load_instance_id_resolver()
+        old_instance_id = "4c17d360-e63f-45f3-a453-3a2ed1a7382a"
+
+        rotated_instance_id = resolve_instance_id(old_instance_id, old_instance_id, True)
+        self.assertNotEqual(rotated_instance_id, old_instance_id)
+        self.assertEqual(uuid.UUID(rotated_instance_id).version, 4)
+
+        restarted_instance_id = resolve_instance_id(old_instance_id, rotated_instance_id, False)
+        self.assertEqual(restarted_instance_id, rotated_instance_id)
+
+    def test_configured_instance_id_remains_a_migration_fallback(self):
+        resolve_instance_id = load_instance_id_resolver()
+        configured_instance_id = "4c17d360-e63f-45f3-a453-3a2ed1a7382a"
+
+        self.assertEqual(resolve_instance_id(configured_instance_id, "", False), configured_instance_id)
+
     def test_jitter_is_part_of_the_cron_trigger(self):
         build_trigger = load_trigger_builder()
 

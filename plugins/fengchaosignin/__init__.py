@@ -129,6 +129,17 @@ def _safe_uuid4(value):
         return ""
 
 
+def _resolve_instance_id(configured_instance_id, persisted_instance_id, key_changed):
+    """Keep the Key-bound data copy authoritative across plugin reloads."""
+    if key_changed:
+        return str(uuid.uuid4())
+    # ``api_key_fingerprint`` and this UUID are written to the plugin data
+    # store together. After a Key rotation the config may still contain the
+    # previous UUID until MoviePilot saves the hidden field again, so choosing
+    # config first would switch a healthy connection back to the old instance.
+    return persisted_instance_id or configured_instance_id or str(uuid.uuid4())
+
+
 def _safe_bonus(value):
     """将 MP 魔力值限制为论坛 Decimal(38,4) 可接受的非负有限数。"""
     try:
@@ -162,7 +173,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.3"
+    plugin_version = "3.1.4"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -246,18 +257,19 @@ class FengchaoSignin(_PluginBase):
                     or (not previous_key_fingerprint and previous_key_prefix and previous_key_prefix != self._api_key[:20])
                 )
             )
+            self._instance_id = _resolve_instance_id(configured_instance_id, persisted_instance_id, key_changed)
+            instance_config_needs_sync = configured_instance_id != self._instance_id
             if key_changed:
                 # The same MP host may be pointed at another forum account;
                 # never reuse an instance UUID that is already bound there.
-                self._instance_id = str(uuid.uuid4())
                 # The forum key rotation also unbinds the old instance. Drop
                 # owner/status freshness markers so the next scheduled run
                 # performs a new /me bind and cannot reuse the old account's
                 # cached avatar, badges, qualification or snapshot result.
                 for cache_key in ("last_status", "last_push_time", "last_push_result", "last_sync_request"):
                     self.save_data(cache_key, None)
-            else:
-                self._instance_id = configured_instance_id or persisted_instance_id or str(uuid.uuid4())
+            elif configured_instance_id and persisted_instance_id and configured_instance_id != persisted_instance_id:
+                logger.info("检测到实例标识持久化副本不一致，使用插件数据副本修正配置")
             self._history_days = _safe_config_int(config.get("history_days", 30), 30, 1, 3650)
             self._retry_count = _safe_config_int(config.get("retry_count", 1), 1, 0, 10)
             self._retry_interval = _safe_config_int(config.get("retry_interval", 2), 2, 1, 24)
@@ -286,6 +298,11 @@ class FengchaoSignin(_PluginBase):
         if self._api_key:
             self.save_data("api_key_fingerprint", hashlib.sha256(self._api_key.encode("utf-8")).hexdigest())
             self.save_data("api_key_prefix", None)
+        if config and instance_config_needs_sync:
+            # Persist the selected UUID in both MoviePilot stores. This repairs
+            # installations affected by the old config-first precedence and
+            # prevents the next plugin/container reload from restoring it.
+            self.update_config(self.get_config_dict())
 
         # 重置即时任务的重试计数
         self._current_retry = 0
