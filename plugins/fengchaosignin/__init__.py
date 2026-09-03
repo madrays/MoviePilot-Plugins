@@ -96,6 +96,16 @@ def _cron_trigger_with_jitter(expression, jitter_seconds):
     )
 
 
+def _format_local_time(value):
+    """Format scheduler timestamps consistently for the MoviePilot log."""
+    if not value:
+        return "未安排"
+    timezone = pytz.timezone(settings.TZ)
+    if value.tzinfo is None:
+        value = timezone.localize(value)
+    return value.astimezone(timezone).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _safe_nonnegative_int(value):
     """把 MP 统计模型中的异常数值（NaN/Infinity/负数）安全归一化。"""
     try:
@@ -173,7 +183,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.4"
+    plugin_version = "3.1.5"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -311,17 +321,17 @@ class FengchaoSignin(_PluginBase):
         if not self._scheduler or not self._scheduler.running:
             self.stop_service()
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-            logger.info("调度器未运行，已创建新的实例。")
+            logger.debug("蜂巢调度器已重新初始化")
             # 强制首次加载时任务被更新
             self._active_enabled = not self._enabled
 
         signin_job_id = "fengchao_signin_cron"
         signin_config_changed = (self._enabled != self._active_enabled or self._cron != self._active_cron)
         if signin_config_changed:
-            logger.info("检测到签到任务配置变更，正在更新...")
+            logger.debug("蜂巢签到任务配置发生变化，正在更新")
             if self._scheduler.get_job(signin_job_id):
                 self._scheduler.remove_job(signin_job_id)
-                logger.info("已移除旧的签到周期任务。")
+                logger.debug("已移除旧的蜂巢签到周期任务")
             if self._enabled and self._cron:
                 self._scheduler.add_job(
                     func=self.__signin,
@@ -331,7 +341,6 @@ class FengchaoSignin(_PluginBase):
                     # Tens of thousands of installations commonly keep the
                     # default cron. Spread forum writes over 30 minutes.
                 )
-                logger.info(f"已添加新的签到周期任务，周期：{self._cron}")
 
         info_update_job_id = "fengchao_info_update_cron"
         info_update_config_changed = (
@@ -340,10 +349,10 @@ class FengchaoSignin(_PluginBase):
                 self._timed_update_cron != self._active_timed_update_cron
         )
         if info_update_config_changed:
-            logger.info("检测到 PT 人生同步任务配置变更，正在更新...")
+            logger.debug("蜂巢 PT 人生同步任务配置发生变化，正在更新")
             if self._scheduler.get_job(info_update_job_id):
                 self._scheduler.remove_job(info_update_job_id)
-                logger.info("已移除旧的 PT 人生同步周期任务。")
+                logger.debug("已移除旧的蜂巢 PT 人生同步周期任务")
             if self._enabled and self._timed_update_enabled:
                 cron_to_use = self._timed_update_cron if self._timed_update_cron else "0 3 * * *"
                 self._scheduler.add_job(
@@ -356,7 +365,6 @@ class FengchaoSignin(_PluginBase):
                     # default cron. Spread the heavier daily snapshot uploads
                     # across two hours so the forum never sees a 03:00 spike.
                 )
-                logger.info(f"已添加新的 PT 人生同步周期任务，周期：{cron_to_use}")
 
         if self._update_info_now:
             logger.info("蜂巢插件：立即同步 PT 人生")
@@ -375,8 +383,8 @@ class FengchaoSignin(_PluginBase):
             self.update_config(self.get_config_dict())
 
         if self._onlyonce:
-            logger.info(f"蜂巢插件启动，立即运行一次（签到和信息更新）")
-            self._scheduler.add_job(func=self.__signin, trigger='date',
+            logger.info("[蜂巢任务] 已安排立即执行一次签到和 PT 人生同步")
+            self._scheduler.add_job(func=self.__signin, kwargs={"source": "立即执行"}, trigger='date',
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                     name="蜂巢签到与信息更新（单次）")
             self._onlyonce = False
@@ -411,8 +419,19 @@ class FengchaoSignin(_PluginBase):
                 self.update_config(self.get_config_dict())
 
         if self._scheduler and not self._scheduler.running and self._scheduler.get_jobs():
-            self._scheduler.print_jobs()
             self._scheduler.start()
+
+        signin_job = self._scheduler.get_job(signin_job_id) if self._scheduler else None
+        sync_job = self._scheduler.get_job(info_update_job_id) if self._scheduler else None
+        signin_plan = f"下次 {_format_local_time(signin_job.next_run_time)}" if signin_job else "已关闭"
+        sync_plan = f"下次 {_format_local_time(sync_job.next_run_time)}" if sync_job else "已关闭"
+        logger.info(
+            "[蜂巢任务] 计划已就绪 | 签到：%s | PT 人生同步：%s | 结果通知：%s | 论坛通知：%s",
+            signin_plan,
+            sync_plan,
+            "开启" if self._notify else "关闭",
+            "开启" if self._webhook_enabled else "关闭",
+        )
 
         self._active_enabled = self._enabled
         self._active_cron = self._cron
@@ -450,15 +469,19 @@ class FengchaoSignin(_PluginBase):
         }
 
     def _send_notification(self, title, text):
-        """
-        发送通知
-        """
-        if self._notify:
+        """Submit a result notification and return an explicit delivery state."""
+        if not self._notify:
+            return "未发送（结果通知已关闭）"
+        try:
             self.post_message(
                 mtype=NotificationType.SiteMessage,
                 title=title,
                 text=text
             )
+            return "已提交 MoviePilot 通知链"
+        except Exception as exc:
+            logger.error(f"[蜂巢通知] 提交失败 | 标题={title} | 原因={exc}", exc_info=True)
+            return "提交失败（详见错误日志）"
 
     def _schedule_retry(self, hours=None):
         """
@@ -483,11 +506,16 @@ class FengchaoSignin(_PluginBase):
             replace_existing=True,
         )
 
-        logger.info(f"蜂巢签到失败，将在{retry_interval}小时后重试，当前重试次数: {self._current_retry}/{self._retry_count}")
-
         # 启动定时器（如果未启动）
         if not self._scheduler.running:
             self._scheduler.start()
+        logger.info(
+            "[蜂巢签到] 已安排重试 | 时间=%s | 进度=%s/%s",
+            _format_local_time(next_run_time),
+            self._current_retry,
+            self._retry_count,
+        )
+        return next_run_time
 
     def _send_signin_failure_notification(self, reason: str, attempt: int):
         """
@@ -495,30 +523,29 @@ class FengchaoSignin(_PluginBase):
         :param reason: 失败原因
         :param attempt: 当前尝试次数
         """
-        if self._notify:
-            retry_info = ""
-            retry_scheduled = bool(self._scheduler and self._scheduler.get_job("fengchao_signin_retry"))
-            if retry_scheduled:
-                next_retry_hours = self._retry_interval
-                retry_info = (
-                    f"🔄 重试信息\n"
-                    f"• 已安排 {next_retry_hours} 小时后的延迟重试\n"
-                    f"• 重试进度: {attempt}/{self._retry_count}\n"
-                    f"━━━━━━━━━━\n"
-                )
-
-            self._send_notification(
-                title="【❌ 蜂巢签到失败】",
-                text=(
-                    f"📢 执行结果\n"
-                    f"━━━━━━━━━━\n"
-                    f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"❌ 状态：签到请求失败\n"
-                    f"💬 原因：{reason}\n"
-                    f"━━━━━━━━━━\n"
-                    f"{retry_info}"
-                )
+        retry_info = ""
+        retry_scheduled = bool(self._scheduler and self._scheduler.get_job("fengchao_signin_retry"))
+        if retry_scheduled:
+            retry_job = self._scheduler.get_job("fengchao_signin_retry")
+            retry_info = (
+                f"🔄 重试信息\n"
+                f"• 下次重试：{_format_local_time(retry_job.next_run_time)}\n"
+                f"• 重试进度：{attempt}/{self._retry_count}\n"
+                f"━━━━━━━━━━\n"
             )
+
+        return self._send_notification(
+            title="【❌ 蜂巢签到失败】",
+            text=(
+                f"📢 执行结果\n"
+                f"━━━━━━━━━━\n"
+                f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"❌ 状态：签到请求失败\n"
+                f"💬 原因：{reason}\n"
+                f"━━━━━━━━━━\n"
+                f"{retry_info}"
+            )
+        )
 
     def _schedule_info_update_retry(self, batch_id: str):
         """
@@ -544,11 +571,15 @@ class FengchaoSignin(_PluginBase):
             replace_existing=True,
         )
 
-        logger.info(
-            f"蜂巢PT 人生同步失败，将在{retry_interval_hours}小时后重试，当前重试次数: {self._timed_update_current_retry}/{self._timed_update_retry_count}")
-
         if not self._scheduler.running:
             self._scheduler.start()
+        logger.info(
+            "[蜂巢 PT 人生] 已安排重试 | 时间=%s | 进度=%s/%s",
+            _format_local_time(next_run_time),
+            self._timed_update_current_retry,
+            self._timed_update_retry_count,
+        )
+        return next_run_time
 
     def _schedule_local_stats_retry(self, batch_id: str, attempt: int, is_scheduled_run: bool):
         """Retry locally while MoviePilot is still loading site statistics."""
@@ -574,8 +605,8 @@ class FengchaoSignin(_PluginBase):
             replace_existing=True,
         )
         logger.info(
-            "MoviePilot 站点统计尚未就绪，将在 %s 秒后进行第 %s/%s 次本地重试",
-            delay_seconds,
+            "[蜂巢 PT 人生] 等待 MoviePilot 站点统计 | 下次=%s | 进度=%s/%s",
+            _format_local_time(next_run_time),
             attempt,
             len(LOCAL_STATS_RETRY_DELAYS_SECONDS),
         )
@@ -588,37 +619,35 @@ class FengchaoSignin(_PluginBase):
         发送PT 人生同步失败的通知
         :param reason: 失败原因
         """
-        if self._notify:
-            retry_info = ""
-            retry_scheduled = bool(self._scheduler and self._scheduler.get_job("fengchao_info_update_retry"))
-            if retry_scheduled:
-                next_retry_hours = self._timed_update_retry_interval
-                retry_info = (
-                    f"🔄 重试信息\n"
-                    f"• 已安排 {next_retry_hours} 小时后的延迟重试\n"
-                    f"• 重试进度: {self._timed_update_current_retry}/{self._timed_update_retry_count}\n"
-                    f"━━━━━━━━━━\n"
-                )
-
-            self._send_notification(
-                title="【❌ 蜂巢信息定时更新失败】",
-                text=(
-                    f"📢 执行结果\n"
-                    f"━━━━━━━━━━\n"
-                    f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"❌ 状态：PT 人生同步失败\n"
-                    f"💬 原因：{reason}\n"
-                    f"━━━━━━━━━━\n"
-                    f"{retry_info}"
-                )
+        retry_info = ""
+        retry_scheduled = bool(self._scheduler and self._scheduler.get_job("fengchao_info_update_retry"))
+        if retry_scheduled:
+            retry_job = self._scheduler.get_job("fengchao_info_update_retry")
+            retry_info = (
+                f"🔄 重试信息\n"
+                f"• 下次重试：{_format_local_time(retry_job.next_run_time)}\n"
+                f"• 重试进度：{self._timed_update_current_retry}/{self._timed_update_retry_count}\n"
+                f"━━━━━━━━━━\n"
             )
+
+        return self._send_notification(
+            title="【❌ 蜂巢信息定时更新失败】",
+            text=(
+                f"📢 执行结果\n"
+                f"━━━━━━━━━━\n"
+                f"🕐 时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"❌ 状态：PT 人生同步失败\n"
+                f"💬 原因：{reason}\n"
+                f"━━━━━━━━━━\n"
+                f"{retry_info}"
+            )
+        )
 
     def _get_proxies(self):
         """
         获取代理设置
         """
         if not self._use_proxy:
-            logger.info("未启用代理")
             return None
 
         try:
@@ -626,7 +655,7 @@ class FengchaoSignin(_PluginBase):
             if hasattr(settings, 'PROXY') and settings.PROXY:
                 # Proxy URLs can contain credentials; never write them to the
                 # MoviePilot log.
-                logger.info("蜂巢 API 已使用 MoviePilot 系统代理")
+                logger.debug("蜂巢 API 请求使用 MoviePilot 系统代理")
                 return settings.PROXY
             else:
                 logger.warning("系统代理未配置")
@@ -637,16 +666,18 @@ class FengchaoSignin(_PluginBase):
 
     def __sync_pt_life(self, is_scheduled_run: bool = False, is_retry: bool = False, retry_batch_id: str = None, local_retry_attempt: int = 0):
         """手动/定时同步：只通过 MP 本地统计模型上传 PT 人生快照。"""
+        started_monotonic = time.monotonic()
+        trigger = "延迟重试" if is_retry else ("定时任务" if is_scheduled_run else "立即执行")
+        logger.info("[蜂巢 PT 人生] 开始 | 触发=%s", trigger)
         if is_scheduled_run and not is_retry:
             self._timed_update_current_retry = 0
         if not self._api_key:
             reason = "未配置 MP 专用 API Key，请先在论坛“隐秘的角落”生成并粘贴"
-            logger.warning(reason)
-            if is_scheduled_run:
-                self._send_info_update_failure_notification(reason)
+            notification_status = self._send_info_update_failure_notification(reason) if is_scheduled_run else "未触发（立即执行）"
+            logger.warning("[蜂巢 PT 人生] 未执行 | 原因=%s | 通知=%s", reason, notification_status)
             return False
         if not self._mp_push_enabled:
-            logger.info("蜂巢 PT 人生同步已关闭，跳过定时快照上传")
+            logger.info("[蜂巢 PT 人生] 未执行 | 原因=设置中已关闭 PT 人生同步")
             return False
         batch_id = retry_batch_id or f"{self._instance_id}-{datetime.now(tz=pytz.UTC).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:12]}"
         try:
@@ -663,9 +694,15 @@ class FengchaoSignin(_PluginBase):
                 self._scheduler.remove_job("fengchao_info_update_retry")
             if self._scheduler and self._scheduler.get_job("fengchao_local_stats_retry"):
                 self._scheduler.remove_job("fengchao_local_stats_retry")
-            self._send_notification(
+            notification_status = self._send_notification(
                 title="【✅ 蜂巢 PT 人生同步成功】",
                 text=f"已上传 {result.get('siteCount', 0)} 个站点的最新快照。",
+            )
+            logger.info(
+                "[蜂巢 PT 人生] 成功 | 站点=%s | 耗时=%.1f 秒 | 通知=%s",
+                result.get("siteCount", 0),
+                time.monotonic() - started_monotonic,
+                notification_status,
             )
             return result
         except Exception as exc:
@@ -673,24 +710,33 @@ class FengchaoSignin(_PluginBase):
                 next_attempt = local_retry_attempt + 1
                 if self._schedule_local_stats_retry(batch_id, next_attempt, is_scheduled_run):
                     return False
-            logger.error(f"蜂巢 PT 人生同步失败: {exc}")
+            next_retry_time = None
             if is_scheduled_run and self._timed_update_current_retry < self._timed_update_retry_count:
                 self._timed_update_current_retry += 1
                 try:
-                    self._schedule_info_update_retry(batch_id)
+                    next_retry_time = self._schedule_info_update_retry(batch_id)
                 except Exception as schedule_error:
                     self._timed_update_current_retry -= 1
-                    logger.error(f"安排蜂巢 PT 人生延迟重试失败: {schedule_error}")
-            self._send_info_update_failure_notification(str(exc))
+                    logger.error(f"[蜂巢 PT 人生] 安排延迟重试失败 | 原因={schedule_error}", exc_info=True)
+            notification_status = self._send_info_update_failure_notification(str(exc))
+            logger.error(
+                "[蜂巢 PT 人生] 失败 | 触发=%s | 耗时=%.1f 秒 | 下次重试=%s | 通知=%s | 原因=%s",
+                trigger,
+                time.monotonic() - started_monotonic,
+                _format_local_time(next_retry_time),
+                notification_status,
+                exc,
+                exc_info=True,
+            )
             return False
 
-    def __signin(self, retry_count=0, max_retries=3, is_retry=False):
+    def __signin(self, retry_count=0, max_retries=3, is_retry=False, source="定时任务"):
         """
         蜂巢签到
         """
         if not is_retry:
             self._current_retry = 0
-        return self.__api_signin()
+        return self.__api_signin(trigger="延迟重试" if is_retry else source)
     def __api_headers(self):
         if not self._api_key:
             raise RuntimeError("未配置 MP 专用 API Key，请在论坛“隐秘的角落”生成并粘贴 API Key")
@@ -706,21 +752,39 @@ class FengchaoSignin(_PluginBase):
 
     def __api_request(self, method, path, payload=None):
         base_url = _resolve_api_base()
-        response = requests.request(method, f"{base_url}{path}", headers=self.__api_headers(), json=payload, timeout=(5, 30), proxies=self._get_proxies() if self._use_proxy else None, allow_redirects=False)
+        try:
+            response = requests.request(method, f"{base_url}{path}", headers=self.__api_headers(), json=payload, timeout=(5, 30), proxies=self._get_proxies() if self._use_proxy else None, allow_redirects=False)
+        except requests.ConnectTimeout as exc:
+            raise RuntimeError("连接蜂巢论坛超时（建连上限 5 秒）") from exc
+        except requests.ReadTimeout as exc:
+            raise RuntimeError("等待蜂巢论坛响应超时（读取上限 30 秒）") from exc
+        except requests.ConnectionError as exc:
+            raise RuntimeError("无法连接蜂巢论坛，请检查 DNS、IPv4 网络和代理设置") from exc
         try:
             result = response.json() or {}
         except Exception as exc:
-            raise RuntimeError(f"论坛返回非 JSON 响应（HTTP {response.status_code}）") from exc
+            content_type = str(response.headers.get("content-type") or "未知").split(";", 1)[0][:64]
+            request_id = str(
+                response.headers.get("x-request-id")
+                or response.headers.get("x-trace-id")
+                or response.headers.get("cf-ray")
+                or "无"
+            )[:80]
+            raise RuntimeError(
+                f"蜂巢论坛网关返回非 JSON 响应（HTTP {response.status_code}，Content-Type={content_type}，请求标识={request_id}）"
+            ) from exc
         if response.status_code >= 400 or result.get("code") not in (None, 0):
             raise RuntimeError(result.get("message") or f"论坛 API 请求失败（HTTP {response.status_code}）")
         return result.get("data") or {}
 
-    def __api_signin(self):
+    def __api_signin(self, trigger="定时任务"):
         if getattr(self, "_signing_in", False):
             logger.info("已有签到任务在执行，跳过当前任务")
             return False
         self._signing_in = True
         started = datetime.now()
+        started_monotonic = time.monotonic()
+        logger.info("[蜂巢签到] 开始 | 触发=%s | 时间=%s", trigger, started.strftime("%Y-%m-%d %H:%M:%S"))
         self._current_batch_id = f"{self._instance_id}-{started.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:12]}"
         # Network failures are retried by a dated scheduler job instead of a
         # long sleep loop. One invocation therefore issues at most one
@@ -778,23 +842,42 @@ class FengchaoSignin(_PluginBase):
             reward = result.get("reward", 0)
             streak = result.get("currentStreak", 0)
             sync_line = f"📊 PT 站点：{snapshot.get('siteCount', 0)} 个" if not snapshot_error else "📊 PT 同步：本次失败，将由独立同步任务重试"
-            self._send_notification(title=f"【✅ 蜂巢{status_text}】", text=(f"📢 执行结果\n━━━━━━━━━━\n🕐 时间：{started.strftime('%Y-%m-%d %H:%M:%S')}\n✨ 状态：{status_text}\n🎁 奖励：{reward}\n📆 连续签到：{streak}\n{sync_line}\n━━━━━━━━━━"))
+            notification_status = self._send_notification(title=f"【✅ 蜂巢{status_text}】", text=(f"📢 执行结果\n━━━━━━━━━━\n🕐 时间：{started.strftime('%Y-%m-%d %H:%M:%S')}\n✨ 状态：{status_text}\n🎁 奖励：{reward}\n📆 连续签到：{streak}\n{sync_line}\n━━━━━━━━━━"))
+            sync_status = f"成功（{snapshot.get('siteCount', 0)} 个站点）" if not snapshot_error else f"失败（{snapshot_error}）"
+            logger.info(
+                "[蜂巢签到] 成功 | 状态=%s | 奖励=%s | 连续=%s 天 | PT 人生=%s | 耗时=%.1f 秒 | 通知=%s",
+                status_text,
+                reward,
+                streak,
+                sync_status,
+                time.monotonic() - started_monotonic,
+                notification_status,
+            )
             self._save_history({"date": started.strftime('%Y-%m-%d %H:%M:%S'), "status": status_text, "reward": reward, "currentStreak": streak, "siteCount": snapshot.get("siteCount", 0), "failure_count": 0})
             self._current_retry = 0
             if self._scheduler and self._scheduler.get_job("fengchao_signin_retry"):
                 self._scheduler.remove_job("fengchao_signin_retry")
             return True
         except Exception as exc:
-            logger.error(f"蜂巢 API Key 签到失败: {exc}")
+            next_retry_time = None
             if self._current_retry < self._retry_count:
                 self._current_retry += 1
                 try:
-                    self._schedule_retry()
+                    next_retry_time = self._schedule_retry()
                 except Exception as schedule_error:
                     self._current_retry -= 1
-                    logger.error(f"安排蜂巢签到延迟重试失败: {schedule_error}")
+                    logger.error(f"[蜂巢签到] 安排延迟重试失败 | 原因={schedule_error}", exc_info=True)
             self._save_history({"date": started.strftime('%Y-%m-%d %H:%M:%S'), "status": "签到失败", "reason": str(last_error or exc), "failure_count": self._current_retry or 1})
-            self._send_signin_failure_notification(str(last_error or exc), self._current_retry)
+            notification_status = self._send_signin_failure_notification(str(last_error or exc), self._current_retry)
+            logger.error(
+                "[蜂巢签到] 失败 | 触发=%s | 耗时=%.1f 秒 | 下次重试=%s | 通知=%s | 原因=%s",
+                trigger,
+                time.monotonic() - started_monotonic,
+                _format_local_time(next_retry_time),
+                notification_status,
+                last_error or exc,
+                exc_info=True,
+            )
             return False
         finally:
             self._signing_in = False
@@ -813,11 +896,11 @@ class FengchaoSignin(_PluginBase):
             if not isinstance(site, dict) or not site.get("name") or site.get("error"):
                 continue
             config = managed.get(str(site.get("name"))) or {}
-            normalized.append({"name": str(site.get("name")), "domain": str(config.get("url") or ""), "mpSiteId": str(config.get("id") or ""), "username": str(site.get("username") or ""), "userLevel": str(site.get("user_level") or ""), "upload": _safe_nonnegative_int(site.get("upload")), "download": _safe_nonnegative_int(site.get("download")), "bonus": _safe_bonus(site.get("bonus")), "seeding": _safe_nonnegative_int(site.get("seeding")), "seedingSize": _safe_nonnegative_int(site.get("seeding_size"))})
+            normalized.append({"name": str(site.get("name")), "domain": str(config.get("url") or ""), "mpSiteId": str(config.get("id") or ""), "siteUserId": str(site.get("userid") or ""), "username": str(site.get("username") or ""), "userLevel": str(site.get("user_level") or ""), "upload": _safe_nonnegative_int(site.get("upload")), "download": _safe_nonnegative_int(site.get("download")), "bonus": _safe_bonus(site.get("bonus")), "seeding": _safe_nonnegative_int(site.get("seeding")), "seedingSize": _safe_nonnegative_int(site.get("seeding_size"))})
         if not normalized:
             raise _MoviePilotStatsNotReady("MoviePilot 站点统计尚未加载，请稍后重试")
         now = datetime.now(tz=pytz.UTC).isoformat()
-        result = self.__api_request("PUT", "/api/integrations/moviepilot/v1/pt-life/snapshot", {"schemaVersion": 1, "instanceId": self._instance_id, "pluginVersion": self.plugin_version, "moviePilotVersion": str(getattr(settings, "VERSION_FLAG", "")), "clientBatchId": getattr(self, "_current_batch_id", None) or f"{self._instance_id}-{now[:19]}", "collectedAt": now, "sites": normalized})
+        result = self.__api_request("PUT", "/api/integrations/moviepilot/v1/pt-life/snapshot", {"schemaVersion": 2, "instanceId": self._instance_id, "pluginVersion": self.plugin_version, "moviePilotVersion": str(getattr(settings, "VERSION_FLAG", "")), "clientBatchId": getattr(self, "_current_batch_id", None) or f"{self._instance_id}-{now[:19]}", "collectedAt": now, "sites": normalized})
         self._last_push_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self.save_data("last_push_time", self._last_push_time)
         self.save_data("last_push_result", result)
@@ -1525,14 +1608,27 @@ class FengchaoSignin(_PluginBase):
             return schemas.Response(success=False, message=str(exc))
 
     def api_checkin(self) -> schemas.Response:
-        return schemas.Response(success=self.__signin(), data={"history": self.get_data("history") or []})
+        return schemas.Response(success=self.__signin(source="手动执行"), data={"history": self.get_data("history") or []})
 
     def api_sync(self) -> schemas.Response:
+        started_monotonic = time.monotonic()
+        logger.info("[蜂巢 PT 人生] 开始 | 触发=手动执行")
         try:
             result = self.__push_stats_with_retries(retry_count=0)
             self._notify_status_transition(self._sync_if_requested(self.__api_request("GET", "/api/integrations/moviepilot/v1/status")))
+            logger.info(
+                "[蜂巢 PT 人生] 成功 | 触发=手动执行 | 站点=%s | 耗时=%.1f 秒 | 通知=未触发（手动操作）",
+                result.get("siteCount", 0),
+                time.monotonic() - started_monotonic,
+            )
             return schemas.Response(success=True, data=result)
         except Exception as exc:
+            logger.error(
+                "[蜂巢 PT 人生] 失败 | 触发=手动执行 | 耗时=%.1f 秒 | 通知=未触发（手动操作） | 原因=%s",
+                time.monotonic() - started_monotonic,
+                exc,
+                exc_info=True,
+            )
             return schemas.Response(success=False, message=str(exc))
 
     def api_status(self) -> schemas.Response:
@@ -1708,6 +1804,12 @@ class FengchaoSignin(_PluginBase):
                 ]),
                 section("论坛通知", "mdi-bell-outline", "#14b8a6", [
                     {"component": "VRow", "content": [
+                        column([info_card(
+                            "当前论坛服务器仅支持 IPv4 回连。MoviePilot 公网域名必须有可用 A 记录；可以填写 HTTPS 非 443 端口，但纯 IPv6 地址无法接通。",
+                            "mdi-ip-network-outline", "#0ea5e9",
+                        )]),
+                    ]},
+                    {"component": "VRow", "content": [
                         column([switch(
                             "webhook_enabled", "接收论坛通知", "#14b8a6",
                             hint="保存后自动在论坛启用或关闭，无需手动填写 Webhook",
@@ -1728,9 +1830,9 @@ class FengchaoSignin(_PluginBase):
                     {"component": "VRow", "content": [
                         column([field(
                             "webhook_public_url", "MoviePilot 公网地址", type="url",
-                            placeholder="https://mp.example.com",
+                            placeholder="https://mp.example.com:端口",
                             prepend_inner_icon="mdi-web",
-                            hint="填写反向代理后的 HTTPS 地址，可包含固定路径前缀",
+                            hint="仅支持可解析到 IPv4 的 HTTPS 地址；支持显式非 443 端口和固定路径前缀",
                             persistent_hint=True, clearable=True,
                         )], md=6),
                         column([field(
@@ -1780,7 +1882,8 @@ class FengchaoSignin(_PluginBase):
                         {"component": "VRow", "content": [
                             column([{"component": "VSwitch", "props": {
                                 "model": "use_proxy", "label": "使用系统代理", "color": "#14b8a6",
-                                "hint": "开启后 Bearer Key 会经系统代理转发", "persistent-hint": True,
+                                "hint": "目前仅支持国内出口 IP；代理通常会增加超时和故障点，建议保持关闭",
+                                "persistent-hint": True,
                             }}], md=6),
                             column([{"component": "VSwitch", "props": {
                                 "model": "force_refresh", "label": "强制刷新论坛信息（一次性）", "color": "#f97316",

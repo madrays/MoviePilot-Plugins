@@ -1,4 +1,5 @@
 import ast
+import json
 import random
 import unittest
 import uuid
@@ -150,6 +151,42 @@ class FengchaoScheduleTests(unittest.TestCase):
 
         self.assertIn('if not self._mp_push_enabled:', source)
         self.assertIn('account_state = "PT 同步已关闭"', source)
+
+    def test_pt_snapshot_uploads_site_user_id_separately_from_username(self):
+        source = PLUGIN_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('"siteUserId": str(site.get("userid") or "")', source)
+        self.assertIn('"username": str(site.get("username") or "")', source)
+        self.assertIn('"schemaVersion": 2', source)
+
+    def test_task_logs_expose_schedule_result_retry_and_notification_state(self):
+        source = PLUGIN_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("[蜂巢任务] 计划已就绪", source)
+        self.assertNotIn("self._scheduler.print_jobs()", source)
+        self.assertIn("[蜂巢签到] 开始", source)
+        self.assertIn("[蜂巢签到] 成功", source)
+        self.assertIn("[蜂巢签到] 失败", source)
+        self.assertIn("[蜂巢 PT 人生] 成功", source)
+        self.assertIn("下次重试=%s", source)
+        self.assertIn("已提交 MoviePilot 通知链", source)
+        self.assertIn("未发送（结果通知已关闭）", source)
+        self.assertIn("exc_info=True", source)
+
+    def test_network_copy_states_ipv4_and_proxy_boundaries(self):
+        source = PLUGIN_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn("当前论坛服务器仅支持 IPv4 回连", source)
+        self.assertIn("纯 IPv6 地址无法接通", source)
+        self.assertIn("支持显式非 443 端口", source)
+        self.assertIn("目前仅支持国内出口 IP", source)
+        self.assertIn("建议保持关闭", source)
+
+    def test_plugin_catalog_publishes_the_3_1_5_release(self):
+        catalog = json.loads((PLUGIN_SOURCE.parents[2] / "package.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.5")
+        self.assertIn("v3.1.5", catalog["FengchaoSignin"]["history"])
 
 
 if __name__ == "__main__":
