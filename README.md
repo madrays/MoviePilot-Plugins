@@ -1,5 +1,7 @@
 # MoviePilot-Plugins
 
+> 本项目采用 AGPL-3.0-only 开源许可证。欢迎在遵守许可证的前提下使用、修改与分享；请保留原始作者与项目出处。详见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
+
 这是一个MoviePilot的**第三方插件库**，提供签到相关功能扩展。
 
 ## 插件列表
@@ -90,4 +92,8 @@ TOTP两步验证助手需要配合浏览器扩展使用：
 
 ## 许可证
 
-本项目采用 MIT 许可证 - 详见 [LICENSE](LICENSE) 文件
+本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0-only）**。
+
+- 允许：使用、修改与再发布，包括商业使用。
+- 要求：发布修改版或通过网络向用户提供修改版服务时，须按 AGPL 提供对应完整源码。
+- 出处：发布原版或修改版时，须保留 [NOTICE](NOTICE) 中的原始作者、项目名称与仓库地址，并明确标注修改。
