@@ -183,7 +183,7 @@ class FengchaoWebhookPayload(BaseModel):
 
 class FengchaoSignin(_PluginBase):
     # 插件名称
-    plugin_name = "蜂巢签到"
+    plugin_name = "蜂巢论坛签到"
     # 插件描述
     plugin_desc = "蜂巢论坛签到。"
     # 插件图标

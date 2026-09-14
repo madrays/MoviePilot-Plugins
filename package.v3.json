@@ -72,11 +72,12 @@
     "name": "日志清理VUE",
     "description": "定时清理插件产生的日志",
     "labels": "日志,清理,工具",
-    "version": "3.0.0",
+    "version": "3.0.1",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/clean.png",
     "author": "madrays",
     "level": 1,
     "history": {
+      "v3.0.1": "统一 V3 市场与源码中的插件身份和展示名称，避免安装事务识别不一致。",
       "v3.0.0": "迁移为 MoviePilot V3 独立插件版本，保留 V2 分支兼容。",
       "v2.1": "优化已删除插件的日志显示逻辑，提升可用性",
       "v2.0": "联邦插件重制版，仅支持MPv2.4.5版本以上，低版本请勿更新，更新后请重置插件",

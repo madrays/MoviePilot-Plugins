@@ -44,13 +44,13 @@ class LogsCleanConfig(BaseModel):
 # --- Plugin Class ---
 class LogsClean(_PluginBase):
     # 插件名称
-    plugin_name = "日志清理vue"
+    plugin_name = "日志清理VUE"
     # 插件描述
     plugin_desc = "定时清理插件产生的日志"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/clean.png"
     # 插件版本
-    plugin_version = "3.0.0"
+    plugin_version = "3.0.1"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
