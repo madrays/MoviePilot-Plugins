@@ -34,7 +34,7 @@
 **本仓库为第三方插件库，需在MoviePilot中添加仓库地址使用。**
 
 - MoviePilot V2：读取 `package.json` 与 `plugins/`，保持现有插件版本和行为。
-- MoviePilot V3：读取 `package.v3.json` 与 `plugins.v3/`，所有 V3 插件版本统一为 `3.0.0`。
+- MoviePilot V3：读取 `package.v3.json` 与 `plugins.v3/`，各插件保持独立且单调递增的语义版本。
 
 1. 在MoviePilot的插件商店页面，点击"添加第三方仓库"
 2. 添加本仓库地址：`https://github.com/madrays/MoviePilot-Plugins`
@@ -43,6 +43,8 @@
 5. 根据下方说明配置插件参数
 
 > V3 会优先选择独立的 `plugins.v3` 实现，不再依赖旧插件目录的兼容回退加载。
+
+发布 V3 更新前运行：`python3 scripts/validate_v3_plugins.py`。该检查会阻止市场 ID、目录、源码名称、版本或配置前缀不一致，以及误声明不存在的 Release 安装包。
 
 ## 使用说明
 
