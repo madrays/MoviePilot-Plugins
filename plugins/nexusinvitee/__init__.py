@@ -25,9 +25,14 @@ from app.schemas.types import NotificationType, EventType
 from app.db.site_oper import SiteOper
 from app.helper.sites import SitesHelper
 
-from plugins.nexusinvitee.data import DataManager
-from plugins.nexusinvitee.utils import NotificationHelper, SiteHelper
-from plugins.nexusinvitee.module_loader import ModuleLoader
+from .data import DataManager
+from .utils import NotificationHelper, SiteHelper
+from .module_loader import ModuleLoader
+from .parsing import sanitize_invitees
+from .site_access import classify as classify_site_response, detect_schema
+
+# MoviePilot V2/V3 的插件完整模块名不同，动态重载必须使用运行时包名。
+_PLUGIN_PACKAGE = __package__ or __name__.rsplit('.', 1)[0]
 
 class Prescription():
     def __init__(self):
@@ -397,11 +402,11 @@ class nexusinvitee(_PluginBase):
     # 插件名称
     plugin_name = "后宫管理系统"
     # 插件描述
-    plugin_desc = "管理添加到MP站点的邀请系统，包括邀请名额、已邀请用户状态等"
+    plugin_desc = "多体系 PT 站点邀请管理，统一展示名额、成员与分享率健康状态"
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nexusinvitee.png"
     # 插件版本
-    plugin_version = "1.2.7"
+    plugin_version = "1.2.9"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -537,8 +542,9 @@ class nexusinvitee(_PluginBase):
             
             # 1. 清理模块缓存 - 从sys.modules中删除相关模块
             modules_to_reload = []
+            package_name = _PLUGIN_PACKAGE
             for module_name in list(sys.modules.keys()):
-                if module_name.startswith('plugins.nexusinvitee.') and module_name != 'plugins.nexusinvitee':
+                if module_name.startswith(f'{package_name}.') and module_name != package_name:
                     modules_to_reload.append(module_name)
                     # 从sys.modules中删除模块以强制重新导入
                     del sys.modules[module_name]
@@ -546,17 +552,17 @@ class nexusinvitee(_PluginBase):
             
             # 2. 重新导入核心模块
             logger.debug("重新导入核心模块...")
-            importlib.import_module('plugins.nexusinvitee.data')
-            importlib.import_module('plugins.nexusinvitee.utils')
-            importlib.import_module('plugins.nexusinvitee.module_loader')
+            importlib.import_module(f'{package_name}.data')
+            importlib.import_module(f'{package_name}.utils')
+            importlib.import_module(f'{package_name}.module_loader')
             
             # 3. 更新全局引用以确保使用的是最新版本
             logger.debug("更新全局模块引用...")
             global DataManager, NotificationHelper, ModuleLoader
             try:
-                from plugins.nexusinvitee.data import DataManager
-                from plugins.nexusinvitee.utils import NotificationHelper
-                from plugins.nexusinvitee.module_loader import ModuleLoader
+                from .data import DataManager
+                from .utils import NotificationHelper
+                from .module_loader import ModuleLoader
                 logger.debug("核心模块引用更新成功")
             except Exception as e:
                 logger.error(f"更新核心模块引用失败: {str(e)}")
@@ -3378,15 +3384,16 @@ class nexusinvitee(_PluginBase):
                 # 尝试验证Cookie有效性
                 test_url = site_url
                 test_response = session.get(test_url, timeout=(10, 30))
-                if test_response.status_code >= 400:
-                    logger.error(f"站点 {site_name} Cookie验证失败，状态码: {test_response.status_code}")
+                access_reason = classify_site_response(test_response)
+                if access_reason:
+                    logger.error(f"站点 {site_name} 访问验证失败: {access_reason}")
                     return {
-                        "error": f"Cookie验证失败，状态码: {test_response.status_code}",
+                        "error": access_reason,
                         "invite_status": {
                             "can_invite": False,
                             "permanent_count": 0,
                             "temporary_count": 0,
-                            "reason": f"Cookie验证失败，状态码: {test_response.status_code}"
+                            "reason": access_reason
                         }
                     }
 
@@ -3396,23 +3403,32 @@ class nexusinvitee(_PluginBase):
             # 根据站点类型选择不同的处理器
             if is_mteam:
                 logger.info(f"站点 {site_name} 使用M-Team处理器")
-                from plugins.nexusinvitee.sites.mteam import MTeamHandler
+                from .sites.mteam import MTeamHandler
                 handler = MTeamHandler()
+            elif ModuleLoader.get_handler_for_schema(
+                detect_schema(test_response.text, site_url), self._site_handlers
+            ):
+                schema = detect_schema(test_response.text, site_url)
+                handler = ModuleLoader.get_handler_for_schema(schema, self._site_handlers)
+                logger.info(f"站点 {site_name} 根据页面指纹使用 {schema} 处理器")
             elif "hdchina" in site_url.lower():
-                logger.info(f"站点 {site_name} 使用HDChina处理器")
-                from plugins.nexusinvitee.sites.hdchina import HDChinaHandler
-                handler = HDChinaHandler()
+                # 仓库未提供 HDChina 专用处理器，使用通用 NexusPHP 处理器兜底。
+                logger.info(f"站点 {site_name} 使用通用 NexusPHP 处理器")
+                from .sites.nexusphp import NexusPhpHandler
+                handler = NexusPhpHandler()
             else:
                 # 查找匹配的处理器
                 handler = ModuleLoader.get_handler_for_site(site_url, self._site_handlers)
                 if not handler:
                     # 如果找不到合适的处理器，使用通用NexusPHP处理器
                     logger.info(f"站点 {site_name} 未找到专用处理器，使用默认NexusPHP处理器")
-                    from plugins.nexusinvitee.sites.nexusphp import NexusPhpHandler
+                    from .sites.nexusphp import NexusPhpHandler
                     handler = NexusPhpHandler()
             
             # 使用处理器解析邀请页面
             site_data = handler.parse_invite_page(site_info, session)
+            if isinstance(site_data, dict) and isinstance(site_data.get("invitees"), list):
+                site_data["invitees"] = sanitize_invitees(site_data["invitees"])
             
             
             # 检查站点数据结构是否正确

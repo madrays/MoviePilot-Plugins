@@ -12,29 +12,18 @@
       "v1.2.7": "满屏面板"
     }
   },
-  "lemonshengyou": {
-    "name": "柠檬站点神游",
-    "description": "自动完成柠檬站点每日免费神游三清天，获取奖励",
-    "labels": "神游,站点,柠檬",
-    "version": "1.0.5",
-    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/lemon.ico",
-    "author": "madrays",
-    "level": 2,
-    "v2": true,
-    "history": {
-      "v1.0.5": "修复神游成功后，未能正确获取神游状态的bug。"
-    }
-  },
   "nexusinvitee": {
     "name": "后宫管理系统",
-    "description": "管理添加到MP站点的邀请系统，包括邀请名额、已邀请用户状态等",
+    "description": "多体系 PT 站点邀请管理：支持 NexusPHP、Gazelle、TTG、UNIT3D，统一展示名额、后宫成员与健康状态",
     "labels": "PT,后宫,邀请",
-    "version": "1.2.7",
+    "version": "1.2.9",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/nexusinvitee.png",
     "author": "madrays",
     "level": 2,
     "v2": true,
     "history": {
+      "v1.2.9": "吸纳 SAGIRIxr 多体系站点解析与成员清洗思路：新增 Gazelle、TTG、UNIT3D；Cloudflare 验证页明确提示，不包含绕过逻辑",
+      "v1.2.8": "适配 MoviePilot V3 插件加载器，修复包内模块导入失败",
       "v1.2.7": "修复药单导出清单不全问题",
       "v1.2.6": "尝试修复hh后宫",
       "v1.2.5": "适配麒麟",

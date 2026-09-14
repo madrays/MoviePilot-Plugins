@@ -9,7 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from app.log import logger
-from plugins.nexusinvitee.sites import _ISiteHandler
+from . import _ISiteHandler
 
 
 class ButterflyHandler(_ISiteHandler):
@@ -813,4 +813,4 @@ class ButterflyHandler(_ISiteHandler):
         elif ratio > 0:
             return "warning" if ratio >= 0.4 else "danger", ["较低", "text-warning"] if ratio >= 0.4 else ["危险", "text-error"]
         else:
-            return "neutral", ["无数据", "text-grey"] 
+            return "neutral", ["无数据", "text-grey"]

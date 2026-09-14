@@ -10,7 +10,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from app.log import logger
-from plugins.nexusinvitee.sites import _ISiteHandler
+from . import _ISiteHandler
 
 
 class NexusPhpHandler(_ISiteHandler):

@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 
 from app.log import logger
 from app.db.site_oper import SiteOper
-from plugins.nexusinvitee.sites import _ISiteHandler
+from . import _ISiteHandler
 
 
 class HHClubHandler(_ISiteHandler):
@@ -756,4 +756,4 @@ class HHClubHandler(_ISiteHandler):
         except Exception as e:
             logger.error(f"站点 {site_name} 解析主页邀请数量失败: {str(e)}")
         
-        return result 
+        return result

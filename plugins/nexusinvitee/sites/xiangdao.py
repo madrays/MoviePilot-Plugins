@@ -9,7 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from app.log import logger
-from plugins.nexusinvitee.sites import _ISiteHandler
+from . import _ISiteHandler
 
 
 class XiangdaoHandler(_ISiteHandler):
@@ -611,4 +611,4 @@ class XiangdaoHandler(_ISiteHandler):
             
         except Exception as e:
             logger.error(f"解析站点 {site_name} 魔力值商店失败: {str(e)}")
-            return result 
+            return result

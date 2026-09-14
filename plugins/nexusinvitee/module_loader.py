@@ -7,7 +7,10 @@ import inspect
 from typing import List, Type, Dict, Any
 
 from app.log import logger
-from plugins.nexusinvitee.sites import _ISiteHandler
+from .sites import _ISiteHandler
+
+# MoviePilot V2/V3 的插件完整模块名不同，动态导入不能写死顶级 plugins 包。
+_PLUGIN_PACKAGE = __package__ or __name__.rsplit('.', 1)[0]
 
 
 class ModuleLoader:
@@ -37,7 +40,9 @@ class ModuleLoader:
             
             try:
                 # 动态导入模块
-                module = importlib.import_module(f"plugins.nexusinvitee.sites.{module_name}")
+                module = importlib.import_module(
+                    f".sites.{module_name}", package=_PLUGIN_PACKAGE
+                )
                 
                 # 查找模块中继承了_ISiteHandler的类
                 for name, obj in inspect.getmembers(module):
@@ -65,4 +70,14 @@ class ModuleLoader:
                 return handler_class()
         
         # 如果没有找到匹配的处理器，返回None
-        return None 
+        return None
+
+    @staticmethod
+    def get_handler_for_schema(schema: str, handlers: List[Type[_ISiteHandler]]) -> _ISiteHandler:
+        """按首页页面指纹识别出的站点体系选择处理器。"""
+        if not schema:
+            return None
+        for handler_class in handlers:
+            if getattr(handler_class, "site_schema", "") == schema:
+                return handler_class()
+        return None

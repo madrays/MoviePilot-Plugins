@@ -7,7 +7,7 @@ import requests
 import re
 
 from app.log import logger
-from plugins.nexusinvitee.sites import _ISiteHandler
+from . import _ISiteHandler
 
 
 class MTeamHandler(_ISiteHandler):
