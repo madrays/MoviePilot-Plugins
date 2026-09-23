@@ -189,7 +189,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.6"
+    plugin_version = "3.1.7"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -902,7 +902,7 @@ class FengchaoSignin(_PluginBase):
             if not isinstance(site, dict) or not site.get("name") or site.get("error"):
                 continue
             config = managed.get(str(site.get("name"))) or {}
-            normalized.append({"name": str(site.get("name")), "domain": str(config.get("url") or ""), "mpSiteId": str(config.get("id") or ""), "siteUserId": str(site.get("userid") or ""), "username": str(site.get("username") or ""), "userLevel": str(site.get("user_level") or ""), "upload": _safe_nonnegative_int(site.get("upload")), "download": _safe_nonnegative_int(site.get("download")), "bonus": _safe_bonus(site.get("bonus")), "seeding": _safe_nonnegative_int(site.get("seeding")), "seedingSize": _safe_nonnegative_int(site.get("seeding_size"))})
+            normalized.append({"name": str(site.get("name")), "domain": str(config.get("url") or ""), "mpSiteId": str(config.get("id") or ""), "siteUserId": str(site.get("userid") or ""), "username": str(site.get("username") or ""), "userLevel": str(site.get("user_level") or ""), "upload": _safe_nonnegative_int(site.get("upload")), "download": _safe_nonnegative_int(site.get("download")), "bonus": _safe_bonus(site.get("bonus")), "seeding": _safe_nonnegative_int(site.get("seeding")), "seedingSize": _safe_nonnegative_int(site.get("seeding_size")), "joinAt": str(site.get("join_at") or "")})
         if not normalized:
             raise _MoviePilotStatsNotReady("MoviePilot 站点统计尚未加载，请稍后重试")
         now = datetime.now(tz=pytz.UTC).isoformat()

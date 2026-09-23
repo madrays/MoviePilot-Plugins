@@ -157,6 +157,7 @@ class FengchaoScheduleTests(unittest.TestCase):
 
         self.assertIn('"siteUserId": str(site.get("userid") or "")', source)
         self.assertIn('"username": str(site.get("username") or "")', source)
+        self.assertIn('"joinAt": str(site.get("join_at") or "")', source)
         self.assertIn('"schemaVersion": 2', source)
 
     def test_task_logs_expose_schedule_result_retry_and_notification_state(self):
@@ -182,11 +183,11 @@ class FengchaoScheduleTests(unittest.TestCase):
         self.assertIn("目前仅支持国内出口 IP", source)
         self.assertIn("建议保持关闭", source)
 
-    def test_plugin_catalog_publishes_the_3_1_5_release(self):
+    def test_plugin_catalog_publishes_the_3_1_6_release(self):
         catalog = json.loads((PLUGIN_SOURCE.parents[2] / "package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.5")
-        self.assertIn("v3.1.5", catalog["FengchaoSignin"]["history"])
+        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.6")
+        self.assertIn("v3.1.6", catalog["FengchaoSignin"]["history"])
 
 
 if __name__ == "__main__":

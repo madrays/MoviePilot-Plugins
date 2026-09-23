@@ -38,11 +38,12 @@
     "name": "蜂巢论坛签到",
     "description": "通过 MP 专用 API Key 完成蜂巢签到、PT 人生同步，并自动接收论坛通知",
     "labels": "签到,蜂巢,论坛,PT人生,MoviePilot,通知",
-    "version": "3.1.6",
+    "version": "3.1.7",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
     "author": "madrays",
     "level": 2,
     "history": {
+      "v3.1.7": "PT 人生快照补充各站点加入时间，读取 siteuserdata.join_at 并同步至蜂巢，用于逐站加入时间与 P 龄计算。",
       "v3.1.6": "迁移为 MoviePilot V3 独立插件版本，保留 3.1.5 的全部签到、PT 人生与通知能力。",
       "v3.1.5": "PT 人生快照新增独立站点 User ID；重做任务日志，明确下次签到/同步时间、执行结果、耗时、重试与通知投递状态，并补充 IPv4 和代理限制说明。",
       "v3.1.4": "修复轮换 MP 专用 Key 后插件重载会恢复旧实例 UUID、再次触发活跃实例冲突的问题；自动修正配置与插件数据中的实例标识副本。",
