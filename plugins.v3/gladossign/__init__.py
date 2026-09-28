@@ -24,7 +24,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "3.5.0"
+    plugin_version = "3.6.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -48,6 +48,9 @@ class gladossign(_PluginBase):
     _retry_no_proxy_fallback = True
     _history_days = 30
     _scheduler: Optional[BackgroundScheduler] = None
+
+    _DEFAULT_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+                  '(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36')
 
     # 兑换接口的 planType 是字符串枚举（见控制台前端：plan100 / plan200 / plan500）
     _EXCHANGE_PLANS = {
@@ -379,11 +382,15 @@ class gladossign(_PluginBase):
         ``{"code": 4, "reason": "device-mismatch"}``，因此 MoviePilot
         必须原样携带浏览器的指纹才能签到。
         """
+        # 服务端会比对「登录设备」与「当前浏览器」的 UA 平台，必须沿用提取凭证时
+        # 那台设备的 UA，否则非 macOS 登录的用户必被判 device-mismatch。
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+            'User-Agent': self._device_ua(),
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
             'Content-Type': 'application/json;charset=UTF-8',
+            'Sec-CH-UA-Platform': self._ua_platform(self._device_ua()),
+            'Sec-CH-UA-Mobile': '?0',
             'Origin': self._base_url,
             'Referer': self._base_url.rstrip('/') + '/',
             'Cookie': self._cookie,
@@ -391,6 +398,28 @@ class gladossign(_PluginBase):
         if self._device_id:
             headers['Authorization'] = self._device_id
         return headers
+
+    def _device_ua(self) -> str:
+        """优先使用一次性凭证里记录的 UA，缺失时回退默认。"""
+        meta = self._bundle_meta if isinstance(self._bundle_meta, dict) else {}
+        ua = str(meta.get("ua") or "").strip()
+        return ua or self._DEFAULT_UA
+
+    @staticmethod
+    def _ua_platform(ua: str) -> str:
+        """从 UA 推断 sec-ch-ua-platform 取值，与登录设备的声明保持一致。"""
+        text = str(ua or "")
+        if "Windows" in text:
+            return '"Windows"'
+        if "Android" in text:
+            return '"Android"'
+        if "iPhone" in text or "iPad" in text or "iOS" in text:
+            return '"iOS"'
+        if "Linux" in text:
+            return '"Linux"'
+        if "Macintosh" in text or "Mac OS X" in text:
+            return '"macOS"'
+        return '"macOS"'
 
     @staticmethod
     def _device_hint(prefix: str, raw: Any) -> str:
@@ -401,15 +430,21 @@ class gladossign(_PluginBase):
         return f"{prefix}={text[:10]}…{text[-10:]}" if len(text) > 24 else f"{prefix}={text}"
 
     def _describe_device_mismatch(self, data: Dict[str, Any]) -> str:
-        """生成设备不一致的可执行提示，并说明是登录设备变了还是本插件没配指纹。"""
+        """生成设备不一致的可执行提示，区分缺指纹 / 缺设备 UA / 设备本身换了。"""
         base = "登录设备与当前请求设备不一致"
         if not self._device_id:
             return f"{base}：本插件未配置设备指纹，请在浏览器控制台页执行提取代码后填入「设备指纹」"
         detail = "，".join([
-            self._device_hint("服务端登录设备", data.get('loginDevice')),
-            self._device_hint("本次请求设备", data.get('currentDevice')),
+            f"服务端登录设备={data.get('loginDevice') or '未知'}",
+            f"本次请求设备={data.get('currentDevice') or '未知'}",
         ])
-        return f"{base}（{detail}）：请确认指纹取自当前控制台域名，且与 Cookie 来自同一次登录"
+        # 凭证缺少 ua 时无法还原登录设备特征，最常见于旧版提取脚本产出的凭证
+        meta = self._bundle_meta if isinstance(self._bundle_meta, dict) else {}
+        if not meta.get("ua"):
+            return (f"{base}（{detail}）：凭证里缺少设备 UA 信息，请在浏览器重新提取一次凭证"
+                    f"（提取脚本会带上登录设备的 UA 与平台）")
+        return (f"{base}（{detail}）：凭证记录的登录设备与本机 UA 已对齐，"
+                f"若仍失败说明该账号最近在其他设备重新登录过，请用那台设备重新提取凭证")
 
     def _normalize_proxies(self, p: Any) -> Optional[Dict[str, str]]:
         try:
