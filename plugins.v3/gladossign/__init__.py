@@ -1,3 +1,4 @@
+import json
 import time
 from datetime import datetime, timedelta
 from typing import Any, List, Dict, Tuple, Optional
@@ -23,7 +24,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "每日签到获取点数；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "3.0.0"
+    plugin_version = "3.5.0"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -36,6 +37,10 @@ class gladossign(_PluginBase):
     _cron = "0 9 * * *"
     _base_url = "https://glados.cloud"
     _cookie = ""
+    _auth_bundle = ""
+    _bundle_meta: Dict[str, Any] = {}
+    _device_id = ""
+    _auto_exchange = ""
     _proxy_enabled = False
     _timeout_seconds = 30
     _retry_interval_seconds = 300
@@ -43,6 +48,46 @@ class gladossign(_PluginBase):
     _retry_no_proxy_fallback = True
     _history_days = 30
     _scheduler: Optional[BackgroundScheduler] = None
+
+    # 兑换接口的 planType 是字符串枚举（见控制台前端：plan100 / plan200 / plan500）
+    _EXCHANGE_PLANS = {
+        "10": {"points": 100, "label": "10天套餐", "plan_type": "plan100"},
+        "30": {"points": 200, "label": "30天套餐", "plan_type": "plan200"},
+        "100": {"points": 500, "label": "100天套餐", "plan_type": "plan500"},
+    }
+
+    # 一次性提取代码（与控制台 app.bundle.js 模块 811/833/540/55 逐行等价，已在真实浏览器
+    # 里与站点原始实现对照通过）。执行后自动算出设备指纹、识别登录域名、生成凭证 JSON，
+    # 并在页面底部弹出中性风格的分步指引面板（含 Cookie 手动复制指引与兜底复制按钮）。
+    _DEVICE_ID_HELPER = (
+        "(async()=>{ function H(a,b=0){let n=3735928559^b,r=1103547991^b;for(let i=0,t;i<a.length;i++){t=a.charCodeAt(i);n=Math.imul(n^t,2654435761);r=Math.imul(r^t,1597334677)}n=Math.imul(n^n>>>16,2246822507)^Math.imul(r^r>>>13,3266489909);r=Math.imul(r^r>>>16,2246822507)^Math.imul(n^n>>>13,3266489909);return 4294967296*(2097151&r)+(n>>>0)+\"\"} function cyrb53(a,b=0){return H(a.slice(0,a.length/2|0),b)+\"\"+H(a.slice(a.length/2|0),b)} function cf(){try{const c=document.createElement(\"canvas\"),x=c.getContext(\"2d\"),t=\"abz190#$%^@\\u00a3\\u00e9\\u00faGLaDOS!6.5[-%-&*]@345876 <canvas>\";x.textBaseline=\"top\";x.font=\"32px 'Arial'\";x.textBaseline=\"alphabetic\";x.fillStyle=\"#f1680e\";x.fillRect(125,1,62,20);x.fillStyle=\"#0c6d9e\";x.fillText(t,2,15);x.fillStyle=\"rgba(102, 204, 0, 0.7)\";x.fillText(t,4,17);x.fillStyle=\"rgba(12, 24, 10, 0.2)\";x.fillText(t,10,107);x.rotate(.03);x.fillText(t,4,17);x.fillStyle=\"rgb(155,255,5)\";x.shadowBlur=8;x.shadowColor=\"red\";x.fillRect(20,12,100,5);return c.toDataURL()}catch(e){return screen.height+\"x\"+screen.width}} function af(){return new Promise((ok,no)=>{try{const O=window.OfflineAudioContext||window.webkitOfflineAudioContext,ctx=new O(1,44100,44100),t=ctx.currentTime,osc=ctx.createOscillator(),comp=ctx.createDynamicsCompressor();osc.type=\"triangle\";osc.frequency.setValueAtTime(1e4,t);const set=(k,v)=>{try{if(comp[k]&&typeof comp[k].setValueAtTime===\"function\")comp[k].setValueAtTime(v,t)}catch(e){}};set(\"threshold\",-50);set(\"knee\",40);set(\"ratio\",12);set(\"reduction\",-20);set(\"attack\",0);set(\"release\",.25);osc.connect(comp);comp.connect(ctx.destination);osc.start(0);ctx.startRendering();ctx.oncomplete=ev=>{let s=0;for(let i=4500;i<5e3;i++)s+=Math.abs(ev.renderedBuffer.getChannelData(0)[i]);ok(s.toString())}}catch(e){no(e)}})} let ab=\"\";try{ab=btoa(await af())}catch(e){} const device=cyrb53(ab+cf())+\"-\"+window.screen.height+\"-\"+window.screen.width; const cookie=document.cookie||\"\"; const host=location.host; const bundle=JSON.stringify({v:1,cookie:cookie,device:device,domain:host,screen:window.screen.width+\"x\"+window.screen.height,ua:navigator.userAgent,at:new Date().toISOString()}); const copyText=(text)=>{let done=false;try{const ta=document.createElement(\"textarea\");ta.value=text;ta.setAttribute(\"readonly\",\"\");ta.style.cssText=\"position:fixed;top:0;left:-9999px;opacity:0\";document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,text.length);done=document.execCommand(\"copy\");document.body.removeChild(ta)}catch(e){}if(!done){try{navigator.clipboard.writeText(text);done=true}catch(e){}}return done}; const copied=copyText(bundle); const esc=(s)=>String(s).replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\"); const old=document.getElementById(\"__glados_fp__\");if(old)old.remove(); const w=document.createElement(\"div\");w.id=\"__glados_fp__\"; w.style.cssText=\"position:fixed;z-index:2147483647;left:16px;right:16px;bottom:16px;max-width:760px;margin:0 auto;box-sizing:border-box;background:#151719;color:#e6e8eb;border:1px solid #2b2f33;border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.45);font:14px/1.6 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;max-height:78vh;overflow:auto\"; const sec=\"padding:14px 18px;border-top:1px solid #24282c\"; const lbl=\"font-size:12px;letter-spacing:.4px;color:#8b9299;margin:0 0 4px\"; const mono=\"font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace\"; w.innerHTML= \"<div style='display:flex;align-items:center;gap:10px;padding:14px 18px'>\" +\"<span style='width:7px;height:7px;border-radius:50%;background:\"+(copied?\"#4ea1ff\":\"#d9a441\")+\";flex:none'></span>\" +\"<span style='font-weight:600;font-size:15px'>\"+(copied?\"凭证已生成，已尝试复制\":\"凭证已生成，请点下方按钮复制\")+\"</span>\" +\"<span style='margin-left:auto;color:#8b9299;font-size:12.5px'>\"+esc(host)+\"</span>\" +\"</div>\" +\"<div style='\"+sec+\"'>\" +\"<div style='\"+lbl+\"'>设备指纹</div>\" +\"<div style='\"+mono+\";color:#9ecbff;word-break:break-all'>\"+esc(device)+\"</div>\" +\"<div style='\"+lbl+\";margin-top:10px'>自动读到的 Cookie</div>\" +\"<div style='\"+mono+\";color:\"+(cookie?\"#e6e8eb\":\"#d9a441\")+\"'>\"+(cookie?esc(cookie):\"（空 —— 站点使用 HttpOnly Cookie，脚本无法读取）\")+\"</div>\" +\"</div>\" +\"<div style='\"+sec+\"'>\" +\"<div style='font-weight:600;margin:0 0 8px'>还需要你手动做一次：复制 Cookie</div>\" +\"<ol style='margin:0;padding-left:20px;color:#c3c8cd'>\" +\"<li style='margin:3px 0'>F12 → <b style='color:#e6e8eb'>Application</b> → 左侧 <b style='color:#e6e8eb'>Cookies</b> → <b style='color:#e6e8eb'>\"+esc(host)+\"</b></li>\" +\"<li style='margin:3px 0'>双击 <b style='color:#e6e8eb'>koa:sess</b> 和 <b style='color:#e6e8eb'>koa:sess.sig</b> 的 Value 复制</li>\" +\"<li style='margin:3px 0'>拼成一行：<span style='\"+mono+\";color:#9ecbff'>koa:sess=&lt;值&gt;; koa:sess.sig=&lt;值&gt;</span></li>\" +\"</ol>\" +\"</div>\" +\"<div style='\"+sec+\"'>\" +\"<div style='font-weight:600;margin:0 0 8px'>填进 MoviePilot 插件</div>\" +\"<div style='color:#c3c8cd'>① <b style='color:#e6e8eb'>一次性凭证</b> → 粘贴下方 JSON（设备指纹与域名自动识别）</div>\" +\"<div style='color:#c3c8cd;margin-top:2px'>② <b style='color:#e6e8eb'>完整 Cookie</b> → 粘贴上面那行 Cookie</div>\" +\"<div style='color:#c3c8cd;margin-top:2px'>保存 → 点「立即运行一次」</div>\" +\"</div>\" +\"<div style='\"+sec+\"'>\" +\"<div style='\"+mono+\";color:#8b9299;word-break:break-all;max-height:72px;overflow:auto;background:#101214;border:1px solid #24282c;border-radius:6px;padding:9px 11px;user-select:all'>\"+esc(bundle)+\"</div>\" +\"<div style='display:flex;gap:8px;align-items:center;margin-top:12px'>\" +\"<button id='__glados_copy' style='font:600 13.5px/1 -apple-system,\\\\'PingFang SC\\\\',sans-serif;padding:9px 16px;border-radius:6px;border:1px solid #3a6ea5;background:#2f6fb3;color:#fff;cursor:pointer'>复制凭证 JSON</button>\" +\"<button id='__glados_close' style='font:600 13.5px/1 -apple-system,\\\\'PingFang SC\\\\',sans-serif;padding:9px 16px;border-radius:6px;border:1px solid #33383d;background:#1d2023;color:#c3c8cd;cursor:pointer'>关闭</button>\" +\"<span id='__glados_ok' style='font-size:12.5px;color:#6fb3f2'></span>\" +\"</div>\" +\"</div>\"; document.body.appendChild(w); const ok=w.querySelector(\"#__glados_ok\"); w.querySelector(\"#__glados_copy\").onclick=()=>{ok.textContent=copyText(bundle)?\"已复制\":\"复制失败，请手动选中上方文本\";}; w.querySelector(\"#__glados_close\").onclick=()=>w.remove(); console.log(\"凭证 JSON:\",bundle); return bundle})()"
+    )
+
+    def _device_helper_button(self) -> Dict[str, Any]:
+        """生成「复制指纹提取代码」按钮，代码内嵌在 onclick 中，无需额外存储配置。"""
+        snippet = json.dumps(self._DEVICE_ID_HELPER)
+        onclick = (
+            "(function(b){"
+            "const code=" + snippet + ";"
+            "const flash=(t)=>{const o=b.textContent;b.textContent=t;setTimeout(()=>{b.textContent=o},1500)};"
+            "const run=()=>navigator.clipboard.writeText(code).then(()=>flash('已复制提取代码'))"
+            ".catch(()=>{const a=document.createElement('textarea');a.value=code;"
+            "a.style.position='fixed';a.style.left='-9999px';document.body.appendChild(a);a.select();"
+            "try{document.execCommand('copy')?flash('已复制提取代码'):alert('复制失败，请手动复制');}"
+            "catch(e){alert('复制失败，请手动复制')}document.body.removeChild(a)});"
+            "run()})(this)"
+        )
+        return {
+            'component': 'VBtn',
+            'props': {
+                'color': 'primary',
+                'variant': 'tonal',
+                'size': 'small',
+                'class': 'mt-1',
+                'onclick': onclick,
+            },
+            'text': '📋 复制「设备指纹」提取代码',
+        }
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -60,7 +105,38 @@ class gladossign(_PluginBase):
                 self._base_url = "https://glados.cloud"
             logger.info(f"加载配置: Base URL={self._base_url}")
             
+            self._auth_bundle = config.get("auth_bundle") or ""
             self._cookie = (config.get("cookie") or "").strip()
+            self._device_id = (config.get("device_id") or "").strip()
+            # 一次性凭证优先：自动从中解析 Cookie 与设备指纹
+            bundle = self._parse_auth_bundle(self._auth_bundle)
+            if bundle:
+                if bundle.get("cookie"):
+                    self._cookie = bundle["cookie"]
+                if bundle.get("device"):
+                    self._device_id = bundle["device"]
+                # 域名自动识别：凭证里的 domain 是浏览器实际登录域，优先级高于配置项，
+                # 且签到 token 由该域名推导，必须一致，否则会跨域导致 Cookie 失效。
+                bundle_domain = str(bundle.get("domain") or "").strip()
+                if bundle_domain:
+                    if bundle_domain != self._base_url.replace("https://", "").replace("http://", "").split("/")[0]:
+                        logger.info(f"域名自动识别为 {bundle_domain}（凭证来源），已覆盖配置值 {self._base_url}")
+                    self._base_url = "https://" + bundle_domain
+                self._bundle_meta = {k: bundle.get(k) for k in ("domain", "screen", "ua", "at") if bundle.get(k)}
+                cookie_items = len([x for x in self._cookie.split(";") if x.strip()]) if self._cookie else 0
+                logger.info(
+                    f"已解析一次性凭证: 域名={self._base_url}, Cookie项={cookie_items}, "
+                    f"设备指纹={'有' if self._device_id else '无'}, 来源屏幕={bundle.get('screen') or '未知'}"
+                )
+                if not self._cookie:
+                    logger.warning("凭证里没有 Cookie（站点 Cookie 为 HttpOnly，脚本读不到），请在「② 完整 Cookie」栏手动填写：F12 → Application → Cookies → 登录域名 → koa:sess 与 koa:sess.sig")
+            else:
+                self._bundle_meta = {}
+                if self._auth_bundle.strip():
+                    logger.warning("一次性凭证解析失败，已回退到手动填写的 Cookie / 设备指纹")
+            self._auto_exchange = str(config.get("auto_exchange") or "").strip()
+            if self._auto_exchange not in self._EXCHANGE_PLANS:
+                self._auto_exchange = ""
             self._proxy_enabled = bool(config.get("proxy_enabled", False))
             try:
                 self._timeout_seconds = int(config.get("timeout_seconds", 30))
@@ -87,6 +163,9 @@ class gladossign(_PluginBase):
                 "enabled": self._enabled,
                 "notify": self._notify,
                 "cookie": self._cookie,
+                "device_id": self._device_id,
+                "auth_bundle": self._auth_bundle,
+                "auto_exchange": self._auto_exchange,
                 "cron": self._cron,
                 "onlyonce": False,
                 "base_url": self._base_url,
@@ -106,18 +185,11 @@ class gladossign(_PluginBase):
         logger.info("开始 GlaDOS 签到")
         url = f"{self._base_url.rstrip('/')}/api/user/checkin"
         logger.info(f"请求地址: {url}")
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Content-Type': 'application/json;charset=UTF-8',
-            'Origin': self._base_url,
-            'Referer': self._base_url + '/',
-            'Cookie': self._cookie,
-        }
+        headers = self._build_headers()
         proxies = self._get_proxies()
         logger.info(f"使用代理: {'是' if (proxies is not None) else '否'}")
         logger.info(f"Cookie: {'有' if bool(self._cookie) else '无'}")
+        logger.info(f"设备指纹: {'已配置' if bool(self._device_id) else '未配置(控制台将返回 device-mismatch)'}")
         # 提取域名作为 token (例如 glados.cloud 或 glados.one)
         domain = self._base_url.replace('https://', '').replace('http://', '').split('/')[0]
         body = {"token": domain}
@@ -139,8 +211,9 @@ class gladossign(_PluginBase):
                         data = resp.json() or {}
                     except Exception:
                         data = {}
-                    logger.info(f"解析JSON: {data}")
-                    code = int(data.get('code') or -1)
+                    logger.info(f"解析结果: code={data.get('code')}, reason={data.get('reason')}, message={data.get('message')}")
+                    raw_code = data.get('code')
+                    code = int(raw_code) if raw_code is not None else -1
                     # 尝试从 root 获取 points，也可能在 list[0]
                     points_gain = int(data.get('points') or 0) 
                     msg_en = str(data.get('message') or '')
@@ -160,6 +233,14 @@ class gladossign(_PluginBase):
                     dt_str = dt.strftime('%Y-%m-%d %H:%M:%S')
                     status = '签到成功' if (points_gain > 0) else ('已签到' if (code == 1 or ('Repeats' in msg_en) or ('Try Tomorrow' in msg_en)) else '签到失败')
                     msg_cn = (f"签到成功！获得 {points_gain} 点数" if status == '签到成功' else ("重复签到！请明天再试" if status == '已签到' else (msg_en or '签到失败')))
+
+                    if code == 4 and data.get('reason') == 'device-mismatch':
+                        status = '签到失败'
+                        msg_cn = self._describe_device_mismatch(data)
+                        logger.warning(
+                            f"设备校验未通过: loginDevice={data.get('loginDevice')}, "
+                            f"currentDevice={data.get('currentDevice')}, 本插件指纹={self._device_id or '未配置'}"
+                        )
                     
                     if status == '已签到':
                         logger.info(f"检测到重复签到 (Code={code}), API通常不返回余额/UID, 将通过 User/Points 接口获取")
@@ -168,6 +249,13 @@ class gladossign(_PluginBase):
                     
                     # 尝试拉取最新的 Points 接口数据作为权威数据
                     self._fetch_user_summary(headers, px)
+
+                    exchange_result = ""
+                    if status in ('签到成功', '已签到'):
+                        exchange_result = self._try_auto_exchange(headers, px)
+                        if exchange_result.startswith("自动兑换成功"):
+                            # 兑换会改变点数与剩余天数，刷新后再组织通知。
+                            self._fetch_user_summary(headers, px)
                     
                     # 重新读取数据用于通知
                     info_out = self.get_data('glados_user') or {}
@@ -207,6 +295,7 @@ class gladossign(_PluginBase):
                         emoji = '📈' if points_gain > 0 else ('➖' if points_gain == 0 else '📉')
                         
                         text_parts = [
+                            f"📝 {msg_cn}",
                             f"🆔 用户ID：{uid}" if uid else "",
                             f"{emoji} 本次点数：{points_gain}",
                             f"💰 当前点数：{current_points}" if current_points is not None else "",
@@ -214,6 +303,7 @@ class gladossign(_PluginBase):
                             (f"📅 已用天数：{info_out.get('days')}" if info_out.get('days') is not None else ""),
                             (f"🕒 剩余天数：{info_out.get('leftDays')}" if info_out.get('leftDays') is not None else ""),
                             (f"📧 邮箱：{info_out.get('email')}" if info_out.get('email') else ""),
+                            (f"🎁 {exchange_result}" if exchange_result else ""),
                         ]
                         self.post_message(mtype=NotificationType.SiteMessage, title=title, text="\n".join([x for x in text_parts if x]))
                     return {} # 历史记录统一由 _fetch_user_summary 处理
@@ -231,6 +321,95 @@ class gladossign(_PluginBase):
         if self._notify:
             self.post_message(mtype=NotificationType.SiteMessage, title="🔴 GlaDOS 签到失败", text=f"⏰ {d['date']}\n❌ {d['message']}")
         return d
+
+    @staticmethod
+    def _parse_auth_bundle(raw: Any) -> Dict[str, str]:
+        """
+        解析「一次性凭证」，兼容三种粘贴形式：
+          1. 提取脚本产出的 JSON：{"v":1,"cookie":"...","device":"...","screen":"..."}
+          2. 从浏览器复制的请求头片段：Cookie: xxx 与 Authorization: yyy
+          3. 只有 Cookie 的裸串（此时设备指纹留空，由调用方回退到手动栏）
+        解析失败返回空字典。
+        """
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+        # 形 1：JSON 凭证包
+        if text.startswith("{"):
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict):
+                    cookie = str(data.get("cookie") or "").strip()
+                    device = str(data.get("device") or data.get("authorization") or "").strip()
+                    if cookie or device:
+                        return {
+                            "cookie": cookie,
+                            "device": device,
+                            "domain": str(data.get("domain") or "").strip(),
+                            "screen": str(data.get("screen") or "").strip(),
+                            "ua": str(data.get("ua") or "").strip(),
+                            "at": str(data.get("at") or "").strip(),
+                        }
+            except Exception as error:
+                logger.warning(f"一次性凭证 JSON 解析失败: {error}")
+        # 形 2：请求头片段
+        cookie = ""
+        device = ""
+        for line in text.replace("\r", "\n").split("\n"):
+            line = line.strip()
+            lowered = line.lower()
+            if lowered.startswith("cookie:"):
+                cookie = line.split(":", 1)[1].strip()
+            elif lowered.startswith("authorization:"):
+                device = line.split(":", 1)[1].strip()
+        if cookie or device:
+            return {"cookie": cookie, "device": device}
+        # 形 3：裸 Cookie（必须含有 = 且不含换行，避免把指纹误当 Cookie）
+        if "=" in text and "\n" not in text and len(text) < 8000:
+            return {"cookie": text, "device": ""}
+        return {}
+
+    def _build_headers(self) -> Dict[str, str]:
+        """
+        构造与 GlaDOS 控制台一致的请求头。
+
+        控制台前端会给每个 /api 请求附带 ``Authorization: <设备指纹>``，
+        值为 ``cyrb53(base64(音频指纹)+canvas指纹)-屏幕高-屏幕宽``。
+        服务端会用它与登录时记录的设备指纹比对，不一致即返回
+        ``{"code": 4, "reason": "device-mismatch"}``，因此 MoviePilot
+        必须原样携带浏览器的指纹才能签到。
+        """
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Content-Type': 'application/json;charset=UTF-8',
+            'Origin': self._base_url,
+            'Referer': self._base_url.rstrip('/') + '/',
+            'Cookie': self._cookie,
+        }
+        if self._device_id:
+            headers['Authorization'] = self._device_id
+        return headers
+
+    @staticmethod
+    def _device_hint(prefix: str, raw: Any) -> str:
+        """把服务端返回的设备指纹压缩成便于日志排查的片段。"""
+        text = str(raw or '').strip()
+        if not text:
+            return f"{prefix}=未返回"
+        return f"{prefix}={text[:10]}…{text[-10:]}" if len(text) > 24 else f"{prefix}={text}"
+
+    def _describe_device_mismatch(self, data: Dict[str, Any]) -> str:
+        """生成设备不一致的可执行提示，并说明是登录设备变了还是本插件没配指纹。"""
+        base = "登录设备与当前请求设备不一致"
+        if not self._device_id:
+            return f"{base}：本插件未配置设备指纹，请在浏览器控制台页执行提取代码后填入「设备指纹」"
+        detail = "，".join([
+            self._device_hint("服务端登录设备", data.get('loginDevice')),
+            self._device_hint("本次请求设备", data.get('currentDevice')),
+        ])
+        return f"{base}（{detail}）：请确认指纹取自当前控制台域名，且与 Cookie 来自同一次登录"
 
     def _normalize_proxies(self, p: Any) -> Optional[Dict[str, str]]:
         try:
@@ -272,6 +451,70 @@ class gladossign(_PluginBase):
             return int(s)
         except Exception:
             return None
+
+    def _try_auto_exchange(self, headers: Dict[str, str], proxies: Optional[Dict[str, str]]) -> str:
+        """按可选配置兑换套餐；仅使用当前账号已登录会话，不尝试绕过认证。"""
+        plan = self._EXCHANGE_PLANS.get(self._auto_exchange)
+        if not plan:
+            return ""
+
+        def record(status: str, message: str, points_change: int = 0) -> None:
+            self._save_history({
+                "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "ts": int(time.time() * 1000),
+                "status": status,
+                "message": message,
+                "points_gain": points_change,
+            })
+
+        timezone = pytz.timezone(settings.TZ)
+        today = datetime.now(timezone).strftime('%Y-%m-%d')
+        history = self.get_data('glados_history') or []
+        if any(
+            today in str(item.get('date', ''))
+            and item.get('status') in ('兑换', '兑换成功')
+            for item in history
+        ):
+            logger.info("今日已兑换套餐，跳过自动兑换")
+            return ""
+
+        current_points = self._to_int((self.get_data('glados_points_info') or {}).get('points'))
+        required_points = plan['points']
+        if current_points is None:
+            result = "积分数据未就绪，跳过自动兑换"
+            record("兑换跳过", result)
+            return result
+        if current_points < required_points:
+            result = f"积分不足 ({current_points}/{required_points})，未兑换{plan['label']}"
+            record("积分不足", result)
+            return result
+
+        try:
+            response = requests.post(
+                f"{self._base_url.rstrip('/')}/api/user/exchange",
+                json={"planType": plan["plan_type"]},
+                headers=headers,
+                timeout=self._timeout_seconds,
+                proxies=proxies,
+            )
+            data = response.json() or {}
+        except Exception as error:
+            logger.warning(f"自动兑换请求失败: {error}")
+            result = f"自动兑换请求失败：{error}"
+            record("兑换异常", result)
+            return result
+
+        if data.get('code') == 0:
+            result = f"自动兑换成功：{plan['label']} (-{required_points}点)"
+            logger.info(result)
+            return result
+        logger.info(f"兑换响应: code={data.get('code')}, message={data.get('message') or data.get('reason')}, planType={plan['plan_type']}")
+
+        reason = data.get('message') or data.get('reason') or f"HTTP {response.status_code}"
+        logger.warning(f"自动兑换失败: {reason}")
+        result = f"自动兑换失败：{reason}"
+        record("兑换失败", result)
+        return result
 
     def _fetch_user_summary(self, headers: Dict[str, str], proxies: Optional[Dict[str, str]]) -> Dict[str, Any]:
         """
@@ -476,20 +719,56 @@ class gladossign(_PluginBase):
                             {'component': 'VCardText', 'content': [
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                        {'component': 'VAlert', 'props': {'type': 'warning', 'variant': 'outlined', 'class': 'mb-2', 'text': '重要提示：请务必确认您的账号所属 Base URL。不同账号可能分配在不同域名 (如 https://glados.one 或 https://glados.cloud) ，填写错误将无法签到。请登录官网查看浏览器地址栏确认。'}}
+                                        {'component': 'VAlert', 'props': {'type': 'warning', 'variant': 'outlined', 'class': 'mb-2', 'text': '控制台会校验「登录设备」：Cookie 必须与登录时的设备指纹配套，且同域。下面的一键提取会同时拿到 Cookie、设备指纹和登录域名，插件自动识别，无需手填。'}}
                                     ]},
                                 ]},
                                 {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextField', 'props': {'model': 'base_url', 'label': 'Base URL (基础域名)', 'placeholder': '例如 https://glados.cloud'}}]},
-                                ]},
-                                {'component': 'VRow', 'content': [
-                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextarea', 'props': {'model': 'cookie', 'label': 'Cookie', 'rows': 3, 'placeholder': 'koa:sess=...; koa:sess.sig=...'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextField', 'props': {'model': 'base_url', 'label': 'Base URL (基础域名，留空则用凭证里的域名)', 'placeholder': '留空即可：粘贴凭证后会自动识别，例如 https://glados.space'}}]},
                                 ]},
                                 {'component': 'VRow', 'content': [
                                     {'component': 'VCol', 'props': {'cols': 12}, 'content': [
-                                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': '从浏览器复制 Cookie (包含 koa:sess 和 koa:sess.sig)。插件仅负责签到和展示信息，请积攒点数后并在官网手动兑换 (100点=10天 / 200点=30天 / 500点=100天)。'}}
+                                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'class': 'mb-2', 'text': '使用步骤：① 点下方按钮复制提取代码；② 在已登录的 GlaDOS 控制台页面按 F12 → Console，粘贴回车；③ 页面底部弹出结果面板，凭证已自动复制；④ 粘贴到「① 一次性凭证」；⑤ 按提示手动复制 Cookie 到「② 完整 Cookie」；⑥ 保存并运行。'}}
+                                    ]},
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [self._device_helper_button()]},
+                                ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextarea', 'props': {'model': 'auth_bundle', 'label': '① 一次性凭证（设备指纹 + 登录域名）', 'rows': 3, 'placeholder': '粘贴提取代码输出的整段 JSON，例如 {"v":1,"cookie":"","device":"83xxxx-1080-1920","domain":"glados.space"}'}}]},
+                                ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [{'component': 'VTextarea', 'props': {'model': 'cookie', 'label': '② 完整 Cookie（必须手填）', 'rows': 3, 'placeholder': 'koa:sess=xxx; koa:sess.sig=yyy'}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                                        {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': 'Cookie 在哪：F12 → Application（应用程序）→ 左侧 Storage 下的 Cookies → 点你登录的域名 → 找到 koa:sess 与 koa:sess.sig，双击 Value 全选复制，拼成一行 koa:sess=<值>; koa:sess.sig=<值>。浏览器禁止脚本读取 HttpOnly Cookie，所以这一步必须手动复制一次。'}}
                                     ]},
                                 ]},
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                                        {'component': 'VAlert', 'props': {'type': 'warning', 'variant': 'outlined', 'class': 'mt-2', 'text': '凭证有时效：Cookie 失效（控制台掉登录）后需重新提取。若通知提示 Cookie 项为 0，说明站点 Cookie 是 HttpOnly，请在浏览器开发者工具 Network 中复制 Cookie 请求头，填到下方「高级：手动填写」。换设备/换浏览器/改屏幕分辨率后设备指纹会变化，同样需要重新提取。提取代码仅在本机计算，不联网、不上传数据。'}}
+                                    ]},
+                                    {'component': 'VCol', 'props': {'cols': 12}, 'content': [
+                                        {'component': 'VExpansionPanels', 'props': {'variant': 'accordion', 'class': 'mt-2'}, 'content': [
+                                            {'component': 'VExpansionPanel', 'content': [
+                                                {'component': 'VExpansionPanelTitle', 'text': '高级：手动填写 Cookie / 设备指纹（可选，留空则用上面的凭证）'},
+                                                {'component': 'VExpansionPanelText', 'content': [
+                                                    {'component': 'VTextField', 'props': {'model': 'device_id', 'label': '设备指纹 (Authorization)（手动，通常无需填写）', 'placeholder': '例如 83xxxxxxxxxxxxxxxxxxxxxxxxxx-1080-1920'}},
+                                                    {'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'class': 'mt-2', 'text': '设备指纹一般由「一次性凭证」自动带入；只有凭证解析失败时才需要在这里手填。'}},
+                                                ]},
+                                            ]},
+                                        ]},
+                                    ]},
+                                ]},
+                            ]}
+                        ]
+                    },
+                    {
+                        'component': 'VCard',
+                        'props': {'variant': 'elevated', 'elevation': 1, 'rounded': 'lg', 'class': 'mb-3'},
+                        'content': [
+                            {'component': 'VCardTitle', 'props': {'class': 'text-h6 font-weight-bold'}, 'text': '积分自动兑换'},
+                            {'component': 'VCardText', 'content': [
+                                {'component': 'VRow', 'content': [
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [{'component': 'VSelect', 'props': {'model': 'auto_exchange', 'label': '自动兑换套餐', 'clearable': True, 'placeholder': '不自动兑换', 'items': [{'title': '10天（需100积分）', 'value': '10'}, {'title': '30天（需200积分）', 'value': '30'}, {'title': '100天（需500积分）', 'value': '100'}]}}]},
+                                    {'component': 'VCol', 'props': {'cols': 12, 'md': 6}, 'content': [{'component': 'VAlert', 'props': {'type': 'info', 'variant': 'tonal', 'text': '签到完成后，积分达到套餐门槛才会兑换；默认关闭，每日最多自动兑换一次。'}}]},
+                                ]}
                             ]}
                         ]
                     },
@@ -540,7 +819,10 @@ class gladossign(_PluginBase):
             "notify": True,
             "onlyonce": False,
             "base_url": "https://glados.cloud",
+            "auth_bundle": "",
             "cookie": "",
+            "device_id": "",
+            "auto_exchange": "",
             "proxy_enabled": True,
             "timeout_seconds": 30,
             "max_attempts": 2,
