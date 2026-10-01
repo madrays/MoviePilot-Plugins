@@ -38,11 +38,12 @@
     "name": "蜂巢论坛签到",
     "description": "通过 MP 专用 API Key 完成蜂巢签到、PT 人生同步，并自动接收论坛通知",
     "labels": "签到,蜂巢,论坛,PT人生,MoviePilot,通知",
-    "version": "3.1.8",
+    "version": "3.1.9",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png",
     "author": "madrays",
     "level": 2,
     "history": {
+      "v3.1.9": "同一次保存同时触发签到与 PT 人生时改为串行执行，避免弱网络或代理下并发请求提前超时；超时错误补充真实耗时。",
       "v3.1.8": "论坛 API、通知卡片与配置页资源切换至 fengchao.chat / cdn.fengchao.chat；旧 pting.club 兼容入口继续可用。",
       "v3.1.7": "PT 人生快照补充各站点加入时间，读取 siteuserdata.join_at 并同步至蜂巢，用于逐站加入时间与 P 龄计算。",
       "v3.1.6": "迁移为 MoviePilot V3 独立插件版本，保留 3.1.5 的全部签到、PT 人生与通知能力。",

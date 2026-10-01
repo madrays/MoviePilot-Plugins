@@ -183,11 +183,11 @@ class FengchaoScheduleTests(unittest.TestCase):
         self.assertIn("目前仅支持国内出口 IP", source)
         self.assertIn("建议保持关闭", source)
 
-    def test_plugin_catalog_publishes_the_3_1_7_release(self):
+    def test_plugin_catalog_publishes_the_3_1_8_release(self):
         catalog = json.loads((PLUGIN_SOURCE.parents[2] / "package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.7")
-        self.assertIn("v3.1.7", catalog["FengchaoSignin"]["history"])
+        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.8")
+        self.assertIn("v3.1.8", catalog["FengchaoSignin"]["history"])
 
     def test_official_endpoints_use_the_new_forum_domain(self):
         source = PLUGIN_SOURCE.read_text(encoding="utf-8")
@@ -197,6 +197,21 @@ class FengchaoScheduleTests(unittest.TestCase):
             self.assertIn('MOVIEPILOT_API_BASE = "https://fengchao.chat"', plugin_source)
             self.assertIn('https://cdn.fengchao.chat/site-logo/', plugin_source)
             self.assertNotIn('https://cdn.pting.club/', plugin_source)
+
+    def test_manual_signin_and_pt_life_tasks_are_serialized(self):
+        source = PLUGIN_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('func=self.__run_manual_tasks', source)
+        self.assertIn('id="fengchao_manual_run"', source)
+        self.assertIn('kwargs={"run_pt_life": run_info_now, "run_signin": run_signin_now}', source)
+        self.assertLess(source.index('if run_pt_life:'), source.index('if run_signin:'))
+        self.assertNotIn('name="蜂巢签到与信息更新（单次）"', source)
+
+    def test_timeout_error_reports_measured_elapsed_time(self):
+        source = PLUGIN_SOURCE.read_text(encoding="utf-8")
+
+        self.assertIn('elapsed = time.monotonic() - started_monotonic', source)
+        self.assertIn('可能被本机代理或网络提前中断', source)
 
 
 if __name__ == "__main__":

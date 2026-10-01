@@ -190,7 +190,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.8"
+    plugin_version = "3.1.9"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -373,12 +373,26 @@ class FengchaoSignin(_PluginBase):
                     # across two hours so the forum never sees a 03:00 spike.
                 )
 
-        if self._update_info_now:
-            logger.info("蜂巢插件：立即同步 PT 人生")
-            self._scheduler.add_job(func=self.__sync_pt_life, trigger='date',
-                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                    name="蜂巢 PT 人生快照同步")
+        run_info_now = self._update_info_now
+        run_signin_now = self._onlyonce
+        if run_info_now or run_signin_now:
+            if run_info_now and run_signin_now:
+                logger.info("[蜂巢任务] 已安排串行执行 PT 人生同步与签到")
+            elif run_info_now:
+                logger.info("蜂巢插件：立即同步 PT 人生")
+            else:
+                logger.info("[蜂巢任务] 已安排立即执行一次签到和按需 PT 人生同步")
+            self._scheduler.add_job(
+                func=self.__run_manual_tasks,
+                kwargs={"run_pt_life": run_info_now, "run_signin": run_signin_now},
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                name="蜂巢即时任务（串行）",
+                id="fengchao_manual_run",
+                replace_existing=True,
+            )
             self._update_info_now = False
+            self._onlyonce = False
             self.update_config(self.get_config_dict())
 
         if self._force_refresh:
@@ -387,14 +401,6 @@ class FengchaoSignin(_PluginBase):
                                     run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
                                     name="蜂巢论坛信息强制刷新（一次性）")
             self._force_refresh = False
-            self.update_config(self.get_config_dict())
-
-        if self._onlyonce:
-            logger.info("[蜂巢任务] 已安排立即执行一次签到和 PT 人生同步")
-            self._scheduler.add_job(func=self.__signin, kwargs={"source": "立即执行"}, trigger='date',
-                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
-                                    name="蜂巢签到与信息更新（单次）")
-            self._onlyonce = False
             self.update_config(self.get_config_dict())
 
         previously_registered = bool(self.get_data("webhook_registered"))
@@ -744,6 +750,14 @@ class FengchaoSignin(_PluginBase):
         if not is_retry:
             self._current_retry = 0
         return self.__api_signin(trigger="延迟重试" if is_retry else source)
+
+    def __run_manual_tasks(self, run_pt_life=False, run_signin=False):
+        """串行执行用户同一次保存触发的即时任务，避免弱网络/代理下并发连接互相挤压。"""
+        if run_pt_life:
+            self.__sync_pt_life()
+        if run_signin:
+            self.__signin(source="立即执行")
+
     def __api_headers(self):
         if not self._api_key:
             raise RuntimeError("未配置 MP 专用 API Key，请在论坛“隐秘的角落”生成并粘贴 API Key")
@@ -759,12 +773,16 @@ class FengchaoSignin(_PluginBase):
 
     def __api_request(self, method, path, payload=None):
         base_url = _resolve_api_base()
+        started_monotonic = time.monotonic()
         try:
             response = requests.request(method, f"{base_url}{path}", headers=self.__api_headers(), json=payload, timeout=(5, 30), proxies=self._get_proxies() if self._use_proxy else None, allow_redirects=False)
         except requests.ConnectTimeout as exc:
             raise RuntimeError("连接蜂巢论坛超时（建连上限 5 秒）") from exc
         except requests.ReadTimeout as exc:
-            raise RuntimeError("等待蜂巢论坛响应超时（读取上限 30 秒）") from exc
+            elapsed = time.monotonic() - started_monotonic
+            raise RuntimeError(
+                f"等待蜂巢论坛响应超时（实际 {elapsed:.1f} 秒；插件读取上限 30 秒，可能被本机代理或网络提前中断）"
+            ) from exc
         except requests.ConnectionError as exc:
             raise RuntimeError("无法连接蜂巢论坛，请检查 DNS、IPv4 网络和代理设置") from exc
         try:
