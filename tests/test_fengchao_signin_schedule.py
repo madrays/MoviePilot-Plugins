@@ -183,11 +183,20 @@ class FengchaoScheduleTests(unittest.TestCase):
         self.assertIn("目前仅支持国内出口 IP", source)
         self.assertIn("建议保持关闭", source)
 
-    def test_plugin_catalog_publishes_the_3_1_6_release(self):
+    def test_plugin_catalog_publishes_the_3_1_7_release(self):
         catalog = json.loads((PLUGIN_SOURCE.parents[2] / "package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.6")
-        self.assertIn("v3.1.6", catalog["FengchaoSignin"]["history"])
+        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.7")
+        self.assertIn("v3.1.7", catalog["FengchaoSignin"]["history"])
+
+    def test_official_endpoints_use_the_new_forum_domain(self):
+        source = PLUGIN_SOURCE.read_text(encoding="utf-8")
+        v3_source = (PLUGIN_SOURCE.parents[2] / "plugins.v3" / "fengchaosignin" / "__init__.py").read_text(encoding="utf-8")
+
+        for plugin_source in (source, v3_source):
+            self.assertIn('MOVIEPILOT_API_BASE = "https://fengchao.chat"', plugin_source)
+            self.assertIn('https://cdn.fengchao.chat/site-logo/', plugin_source)
+            self.assertNotIn('https://cdn.pting.club/', plugin_source)
 
 
 if __name__ == "__main__":

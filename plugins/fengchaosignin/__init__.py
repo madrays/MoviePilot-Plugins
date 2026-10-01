@@ -29,10 +29,11 @@ from pydantic import BaseModel, Field
 import requests
 
 
-# 论坛正式 API 地址固定内置；仅部署负责人可通过环境变量覆盖。
-MOVIEPILOT_API_BASE = "https://pting.club"
+# 论坛正式 API 地址固定内置；旧 pting.club 由兼容桥暂时保留，
+# 但新版插件必须直连新域名，避免兼容桥将多个实例合并到同一出口。
+MOVIEPILOT_API_BASE = "https://fengchao.chat"
 MOVIEPILOT_API_BASE_OVERRIDE = os.getenv("FENGCHAO_API_BASE", "").strip()
-FORUM_NOTIFICATION_CARD_IMAGE = "https://cdn.pting.club/site-logo/site-logo-7d1d31b822cddca4.jpg"
+FORUM_NOTIFICATION_CARD_IMAGE = "https://cdn.fengchao.chat/site-logo/site-logo-7d1d31b822cddca4.jpg"
 LOCAL_STATS_RETRY_DELAYS_SECONDS = (30, 90, 180)
 
 
@@ -183,7 +184,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.6"
+    plugin_version = "3.1.7"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -1647,7 +1648,7 @@ class FengchaoSignin(_PluginBase):
         """MoviePilot 原生配置页：真实蜂巢 Logo + 分区卡片，次要设置折叠。"""
         version = getattr(settings, "VERSION_FLAG", "v1")
         cron_field_component = "VCronField" if version == "v2" else "VTextField"
-        logo_url = "https://cdn.pting.club/site-logo/site-logo-e4ebd6b95befd416.png"
+        logo_url = "https://cdn.fengchao.chat/site-logo/site-logo-e4ebd6b95befd416.png"
         forum_url = _resolve_api_base()
 
         def rgba(hex_color, alpha):
