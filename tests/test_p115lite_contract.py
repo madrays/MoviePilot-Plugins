@@ -17,7 +17,7 @@ class P115LiteContractTest(unittest.TestCase):
         manifest = json.loads((ROOT / "package.v3.json").read_text())
         metadata = manifest["P115Lite"]
         self.assertEqual(metadata["name"], "115Lite")
-        self.assertEqual(metadata["version"], "3.0.1")
+        self.assertEqual(metadata["version"], "3.0.2")
         self.assertIs(metadata["release"], True)
         self.assertEqual(
             metadata["description"],

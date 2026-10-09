@@ -25,7 +25,12 @@ from ...schemas.transfer import TransferTask
 from . import linked_subtitle_audio
 from .cache_updater import CacheUpdater
 from .handler_linked_batch import TransferHandlerLinkedBatch
-from ...utils.transfer_compat import JobViewAdapter, get_jobview, get_task_lock
+from ...utils.transfer_compat import (
+    JobViewAdapter,
+    get_jobview,
+    get_task_lock,
+    trigger_ai_transfer_retry,
+)
 
 
 class TransferHandler:
@@ -1944,28 +1949,16 @@ class TransferHandler:
                 and settings.AI_AGENT_ENABLE
                 and settings.AI_AGENT_RETRY_TRANSFER
             ):
-                try:
-                    import asyncio
-
-                    from app.sdk.config import global_vars
-
-                    chain = TransferChain()
-                    group_key = (
-                        task.download_hash or str(task.fileitem.path).rsplit("/", 1)[0]
-                        if task.fileitem
-                        else ""
-                    )
-                    asyncio.run_coroutine_threadsafe(
-                        chain.retry_scheduler.schedule_retry(
-                            history.id, group_key=group_key
-                        ),
-                        global_vars.loop,
-                    )
-                    logger.info(
-                        f"【整理接管】已触发AI智能体重试整理历史记录 #{history.id}"
-                    )
-                except Exception as e:
-                    logger.error(f"【整理接管】触发AI智能体重试整理失败: {e}")
+                group_key = (
+                    task.download_hash or str(task.fileitem.path).rsplit("/", 1)[0]
+                    if task.fileitem
+                    else ""
+                )
+                trigger_ai_transfer_retry(
+                    TransferChain(),
+                    history,
+                    group_key=group_key,
+                )
 
             fi = task.fileitem
             if self._is_media_file(fi):

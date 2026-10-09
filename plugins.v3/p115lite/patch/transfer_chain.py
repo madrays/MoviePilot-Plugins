@@ -11,7 +11,7 @@ from ..utils.host_compat import (
     get_notification_type_enum,
 )
 from ..utils.patch_guard import PatchTargetError, check_patch_target
-from ..utils.transfer_compat import JobViewAdapter
+from ..utils.transfer_compat import JobViewAdapter, trigger_ai_transfer_retry
 
 if TYPE_CHECKING:
     from ..helper.transfer import TransferTaskManager, TransferHandler
@@ -363,27 +363,17 @@ class TransferChainPatcher:
                         and settings.AI_AGENT_ENABLE
                         and settings.AI_AGENT_RETRY_TRANSFER
                     ):
-                        try:
-                            import asyncio
-                            from app.sdk.config import global_vars
-
-                            group_key = (
-                                task.download_hash
-                                or str(task.fileitem.path).rsplit("/", 1)[0]
-                                if task.fileitem
-                                else ""
-                            )
-                            asyncio.run_coroutine_threadsafe(
-                                chain_self.retry_scheduler.schedule_retry(
-                                    his.id, group_key=group_key
-                                ),
-                                global_vars.loop,
-                            )
-                            logger.info(
-                                f"【整理接管】已触发AI智能体重试整理历史记录 #{his.id}"
-                            )
-                        except Exception as e:
-                            logger.error(f"【整理接管】触发AI智能体重试整理失败: {e}")
+                        group_key = (
+                            task.download_hash
+                            or str(task.fileitem.path).rsplit("/", 1)[0]
+                            if task.fileitem
+                            else ""
+                        )
+                        trigger_ai_transfer_retry(
+                            chain_self,
+                            his,
+                            group_key=group_key,
+                        )
 
                     return False, "未识别到媒体信息"
 

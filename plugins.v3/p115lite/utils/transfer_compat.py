@@ -21,7 +21,14 @@ from typing import Any, Callable, List, Optional
 
 from app.sdk.logging import logger
 
-__all__ = ["JobViewAdapter", "get_jobview", "get_task_lock"]
+__all__ = [
+    "JobViewAdapter",
+    "get_jobview",
+    "get_task_lock",
+    "trigger_ai_transfer_retry",
+]
+
+_retry_warning_emitted = False
 
 # 适配器初始化时要求宿主必须提供的方法；缺失说明宿主接口已变更
 _REQUIRED_METHODS = (
@@ -289,3 +296,78 @@ def get_task_lock() -> Optional[Callable]:
         logger.error(f"【整理接管】获取宿主 task_lock 失败: {err}")
         return None
     return task_lock
+
+
+def _warn_retry_compat_once(message: str) -> None:
+    """同一进程只记录一次重试兼容告警，避免失败任务轮询刷屏。"""
+    global _retry_warning_emitted
+    if _retry_warning_emitted:
+        return
+    _retry_warning_emitted = True
+    logger.warning(f"【整理接管】{message}")
+
+
+def trigger_ai_transfer_retry(chain, history, *, group_key: str = "") -> bool:
+    """按宿主能力触发 AI 整理重试。
+
+    MoviePilot V3.1.2 起移除了 ``TransferChain.retry_scheduler``，durable
+    整理任务统一经 ``_request_durable_transfer_retry`` 登记重试意图。旧宿主仍
+    回退原异步调度器；宿主不提供任一能力时只告警一次，不让轮询任务持续报错。
+
+    :return: 宿主已接受或已成功提交重试时返回 ``True``。
+    """
+    if chain is None or history is None:
+        _warn_retry_compat_once("缺少整理链或失败历史，已跳过 AI 重试")
+        return False
+
+    durable_retry = getattr(chain, "_request_durable_transfer_retry", None)
+    if callable(durable_retry):
+        try:
+            result = durable_retry(
+                history,
+                requested_by="p115lite_ai_retry",
+            )
+            if result is not None:
+                accepted, message = result
+                history_id = getattr(history, "id", None)
+                if accepted:
+                    logger.info(
+                        f"【整理接管】已登记 durable AI 重试整理历史 "
+                        f"#{history_id}: {message or '已接受'}"
+                    )
+                else:
+                    logger.warning(
+                        f"【整理接管】durable AI 重试未接受 "
+                        f"#{history_id}: {message or '宿主拒绝重试'}"
+                    )
+                return bool(accepted)
+        except Exception as err:
+            _warn_retry_compat_once(
+                f"durable AI 重试接口调用失败，尝试旧版调度器: {err}"
+            )
+
+    scheduler = getattr(chain, "retry_scheduler", None)
+    schedule_retry = getattr(scheduler, "schedule_retry", None)
+    if callable(schedule_retry):
+        try:
+            import asyncio
+
+            from app.sdk.config import global_vars
+
+            asyncio.run_coroutine_threadsafe(
+                schedule_retry(getattr(history, "id", None), group_key=group_key),
+                global_vars.loop,
+            )
+            logger.info(
+                f"【整理接管】已触发旧版 AI 重试整理历史 "
+                f"#{getattr(history, 'id', None)}"
+            )
+            return True
+        except Exception as err:
+            _warn_retry_compat_once(f"旧版 AI 重试调度失败: {err}")
+            return False
+
+    _warn_retry_compat_once(
+        "当前宿主未提供可用的 AI 整理重试接口，本次已跳过"
+    )
+    return False

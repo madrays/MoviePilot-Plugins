@@ -118,7 +118,7 @@ class P115Lite(_PluginBase):
         "main/icons/p115lite.png"
     )
     # 插件版本（统一以 version.py 为唯一来源，避免多处写死导致版本漂移）
-    plugin_version = "3.0.1"
+    plugin_version = "3.0.2"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
