@@ -1,4 +1,17 @@
 {
+  "P115Lite": {
+    "name": "115Lite",
+    "description": "115Lite 自用版，感谢原作者 DDSRem、zkmydgth",
+    "labels": "115,云盘,STRM,整理",
+    "version": "3.0.0",
+    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/p115lite.png",
+    "author": "madrays",
+    "level": 1,
+    "history": {
+      "v3.0.0": "基于 DDSRem 与 zkmydgth 的现有实现做定点裁剪并合并 115Lite 存储；仅移除阿里云、签到、侧边栏、多端播放、频道搜索、捐赠、上传和 FUSE，其余原版功能保留；固定 p115client 与 concurrenttools 兼容依赖。"
+    },
+    "system_version": ">=3.0.0"
+  },
   "twofahelper": {
     "name": "两步验证助手",
     "description": "懒人板2FA，配合浏览器扩展使用，支持自动弹出验证码一键复制",

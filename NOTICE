@@ -6,3 +6,13 @@ Copyright (C) 2024-2026 madrays and respective contributors.
 
 This attribution notice must be retained when distributing this project or a
 modified version, pursuant to the additional term in LICENSE.
+
+115Lite incorporates and modifies code from:
+- DDSRem / DDSRem-Dev/MoviePilot-Plugins (original P115StrmHelper and P115Disk)
+  https://github.com/DDSRem-Dev/MoviePilot-Plugins
+- zkmydgth / zkmydgth/MoviePilot-Plugins (MoviePilot V3 adaptation of P115StrmHelper)
+  https://github.com/zkmydgth/MoviePilot-Plugins
+
+Those upstream components were distributed under GPL-compatible open-source
+terms. Their author and repository references must be retained when conveying
+115Lite or a modified version of it.

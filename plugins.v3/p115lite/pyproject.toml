@@ -1,0 +1,25 @@
+[project]
+name = "moviepilot-plugin-p115lite"
+dynamic = ["version"]
+requires-python = ">=3.12"
+dependencies = [
+    # 与 python-concurrenttools 成对锁定，原因见 requirements.txt 顶部注释：
+    # 0.0.9.7.x 重构了 iterdir 模块，移除了本插件在用的 iter_file_list 等 API。
+    "p115client==0.0.9.6.5.1",
+    "python-concurrenttools==0.1.8",
+    "sentry-sdk~=2.67.1",
+    "pyahocorasick>=2.3.1",
+    "diskcache~=5.6.3",
+    "zstandard~=0.25.0",
+    "p115center-sdk==0.0.17",
+    "orjson",
+    "numpy",
+    "cachetools",
+    "httpx[http2]",
+    # Rust 加速扩展（可选）：不在 PyPI 上，以 wheel 随插件 wheels/ 分发，
+    # 上游构建矩阵已含 cp312 与 cp314 → 3.12 与 3.14 宿主都能装并启用；
+    # 3.13 无对应 wheel，显式排除以免解析失败。装不上时走纯 Python 降级路径。
+    "full_strm_sync==0.1.6; python_version < '3.13' or python_version == '3.14'",
+    "txt_tree_storage==0.2.1; python_version < '3.13' or python_version == '3.14'",
+    "share_strm_scan==0.2.2; python_version < '3.13' or python_version == '3.14'",
+]

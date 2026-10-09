@@ -1,0 +1,678 @@
+from time import time
+from threading import Lock, Thread, Event as ThreadEvent
+from typing import Optional
+
+from apscheduler.triggers.cron import CronTrigger
+
+from ..core.config import configer
+from ..core.p115_client import create_client
+from ..core.i18n import i18n
+from ..core.message import post_message
+from ..helper.clean import Cleaner
+from ..helper.life import MonitorLife
+from ..helper.mediainfo_download import MediaInfoDownloader
+from ..helper.offline import OfflineDownloadHelper
+from ..helper.r302 import Redirect
+from ..helper.share import ShareTransferHelper
+from ..helper.strm import (
+    FullSyncStrmHelper,
+    IncrementSyncStrmHelper,
+    ShareInteractiveGenStrmQueue,
+    ShareStrmHelper,
+)
+from ..helper.strm.share import share_audit_download_queue, share_strm_cleaner
+from ..helper.transfer import TransferTaskManager, TransferHandler
+from ..helper.webdav import WebdavCore
+from ..helper.mediaserver import emby_mediainfo_queue
+from ..helper.mediasyncdel.webhook_queue import sync_del_webhook_queue
+from ..patch import TransferChainPatcher
+from ..service.backup import BackupService
+from ..service.one_shot import schedule_plugin_one_shot
+from ..service.life import monitor_life_thread_worker
+from ..utils.sentry import sentry_manager
+
+from app.sdk.logging import logger
+from app.schemas.types import MessageType
+from app.scheduler import Scheduler
+
+
+@sentry_manager.capture_all_class_exceptions
+class ServiceHelper:
+    """
+    服务项
+    """
+
+    def __init__(self):
+        self.client = None
+        self.mediainfodownloader: Optional[MediaInfoDownloader] = None
+        self.monitorlife: Optional[MonitorLife] = None
+        self.sharetransferhelper: Optional[ShareTransferHelper] = None
+
+        self.monitor_stop_event: Optional[ThreadEvent] = None
+        self.monitor_life_thread: Optional[Thread] = None
+        self.monitor_life_lock = Lock()
+        self.monitor_life_fail_time: Optional[float] = None
+
+        self.offlinehelper: Optional[OfflineDownloadHelper] = None
+
+        self.redirect: Optional[Redirect] = None
+
+        self.backup_service = BackupService()
+
+        self.transfer_task_manager: Optional[TransferTaskManager] = None
+        self.transfer_handler: Optional[TransferHandler] = None
+
+        self.webdav_core: Optional[WebdavCore] = None
+
+        self.share_interactive_gen_strm_queue = ShareInteractiveGenStrmQueue()
+
+        self._sync_state_lock = Lock()
+        self._full_sync_running = False
+        self._increment_sync_running = False
+        self._full_sync_pending = False
+
+    def init_service(self):
+        """
+        初始化服务
+        """
+        try:
+            # 115 网盘客户端初始化
+            self.client = create_client(
+                configer.cookies,
+                default_timeout=configer.get_default_timeout(),
+                slow_timeout=configer.get_slow_timeout(),
+            )
+
+            # 媒体信息下载工具初始化
+            self.mediainfodownloader = MediaInfoDownloader(
+                cookie=configer.get_config("cookies")
+            )
+            self.share_interactive_gen_strm_queue.bind_mediainfodownloader(
+                self.mediainfodownloader
+            )
+            share_audit_download_queue.bind_downloader(self.mediainfodownloader)
+
+            # 生活事件监控初始化
+            self.monitorlife = MonitorLife(
+                client=self.client,
+                mediainfodownloader=self.mediainfodownloader,
+                stop_event=None,
+            )
+
+            # 分享转存初始化
+            self.sharetransferhelper = ShareTransferHelper(self.client)
+
+            # 离线下载初始化
+            self.offlinehelper = OfflineDownloadHelper(
+                client=self.client, monitorlife=self.monitorlife
+            )
+
+            # 302跳转初始化
+            self.redirect = Redirect(client=self.client, pid=None)
+
+            # STRM 备份服务绑定客户端
+            self.backup_service.client = self.client
+
+            # 初始化整理任务管理器和 TransferChain 补丁
+            self._init_transfer_enhancement()
+
+            # 初始化 Webdav 服务
+            self.webdav_core = WebdavCore(client=self.client)
+
+            # 启动 Emby 媒体信息提取全局队列 worker
+            emby_mediainfo_queue.start()
+
+            if configer.share_audit_queue_enabled:
+                share_audit_download_queue.start()
+
+            return True
+        except Exception as e:
+            logger.error(f"服务项初始化失败: {e}")
+            return False
+
+    def _init_transfer_enhancement(self):
+        """
+        初始化或更新接管网盘整理功能。
+
+        接管实现会等待批量处理结束并调用 MoviePilot V3 durable 终态回调，
+        保留批量性能的同时避免 transferpending 被反复回放。
+        """
+        try:
+            TransferChainPatcher.disable()
+        except Exception:
+            pass
+
+        # 即使 115Lite 接管未开启，也先为仍在运行的旧版 P115StrmHelper 补丁
+        # 提供 V3 方法名兼容，避免其在整理收尾阶段抛异常并触发队列反复回放。
+        try:
+            TransferChainPatcher.ensure_host_compatibility()
+        except Exception as e:
+            logger.warning(f"【整理接管】安装旧插件兼容别名失败: {e}")
+
+        if self.transfer_task_manager:
+            try:
+                self.transfer_task_manager.shutdown()
+            except Exception:
+                pass
+            self.transfer_task_manager = None
+        self.transfer_handler = None
+
+        if configer.pan_transfer_takeover:
+            if configer.storage_module != "115Lite":
+                logger.warning(
+                    "【整理接管】接管网盘整理功能需要存储模块为 '115Lite'，当前存储模块为 "
+                    f"'{configer.storage_module}'，接管功能已禁用"
+                )
+                return
+            try:
+                self.transfer_handler = TransferHandler(
+                    client=self.client,
+                    storage_name="115Lite",
+                )
+                self.transfer_task_manager = TransferTaskManager(
+                    batch_delay=10.0,
+                    batch_max_size=500,
+                    batch_callback=self.transfer_handler.process_batch,
+                )
+                patch_enabled = TransferChainPatcher.enable(
+                    task_manager=self.transfer_task_manager,
+                    handler=self.transfer_handler,
+                    storage_module="115Lite",
+                )
+                if patch_enabled:
+                    logger.info("【整理接管】已启用（V3 durable 终态）")
+                else:
+                    self.transfer_task_manager.shutdown()
+                    self.transfer_task_manager = None
+                    self.transfer_handler = None
+                    logger.warning("【整理接管】宿主接口不兼容，已回退原生整理")
+            except Exception as error:
+                logger.error(f"【整理接管】初始化失败: {error}", exc_info=True)
+                self.transfer_task_manager = None
+                self.transfer_handler = None
+
+    def is_background_active(self) -> bool:
+        """
+        判断插件后台是否有活跃任务
+
+        :return bool: 存在运行中的后台线程或同步任务时返回 True
+        """
+        if self.monitor_life_thread and self.monitor_life_thread.is_alive():
+            return True
+        with self._sync_state_lock:
+            if self._full_sync_running or self._increment_sync_running:
+                return True
+        scheduler = Scheduler()
+        with scheduler._lock:
+            jobs = list((getattr(scheduler, "_jobs", None) or {}).values())
+        return any(
+            job.get("running") and job.get("pid") == "P115Lite" for job in jobs
+        )
+
+    def check_monitor_life_guard(self):
+        """
+        检查并守护生活事件监控线程
+        """
+        should_run = (
+            configer.monitor_life_enabled
+            and configer.monitor_life_paths
+            and configer.monitor_life_event_modes
+        ) or (configer.pan_transfer_enabled and configer.pan_transfer_paths)
+
+        with self.monitor_life_lock:
+            if should_run:
+                is_alive = (
+                    self.monitor_life_thread and self.monitor_life_thread.is_alive()
+                )
+
+                if is_alive:
+                    if self.monitor_life_fail_time is not None:
+                        logger.debug("【监控生活事件】线程运行正常，清除失败时间记录")
+                        self.monitor_life_fail_time = None
+                else:
+                    current_time = time()
+                    if self.monitor_life_fail_time is None:
+                        self.monitor_life_fail_time = current_time
+                        logger.debug(
+                            "【监控生活事件】检测到线程已停止，开始记录失败时间"
+                        )
+                    else:
+                        fail_duration = current_time - self.monitor_life_fail_time
+                        fail_duration_minutes = int(fail_duration / 60)
+                        fail_duration_seconds = int(fail_duration % 60)
+                        logger.debug(
+                            f"【监控生活事件】线程已停止，持续失败时间: {fail_duration_minutes}分{fail_duration_seconds}秒"
+                        )
+
+                        if fail_duration >= 300:
+                            logger.warning(
+                                "【监控生活事件】连续5分钟检测到线程已停止，正在重新启动..."
+                            )
+                            if configer.notify:
+                                post_message(
+                                    mtype=MessageType.Plugin,
+                                    title=i18n.translate(
+                                        "monitor_life_auto_restart_title"
+                                    ),
+                                    text=f"\n{i18n.translate('monitor_life_auto_restart_text')}\n",
+                                )
+                            self._start_monitor_life_internal()
+                            self.monitor_life_fail_time = None
+            else:
+                if self.monitor_life_thread and self.monitor_life_thread.is_alive():
+                    logger.info("【监控生活事件】配置已关闭，守护线程正在停止线程")
+                    self._stop_monitor_life_internal()
+                self.monitor_life_fail_time = None
+
+    def start_monitor_life(self):
+        """
+        启动生活事件监控
+        """
+        with self.monitor_life_lock:
+            self._start_monitor_life_internal(register_guard_service=False)
+
+    def _stop_monitor_life_internal(self):
+        """
+        停止生活事件监控线程
+        """
+        if self.monitor_life_thread and self.monitor_life_thread.is_alive():
+            logger.info("【监控生活事件】停止生活事件监控线程")
+            if self.monitor_stop_event:
+                self.monitor_stop_event.set()
+
+            self.monitor_life_thread.join(timeout=25)
+            if self.monitor_life_thread.is_alive():
+                logger.warning("【监控生活事件】线程未在预期时间内结束")
+            else:
+                logger.info("【监控生活事件】线程已正常退出")
+
+            self.monitor_life_thread = None
+            if self.monitor_stop_event:
+                self.monitor_stop_event = None
+
+    def _start_monitor_life_internal(self, register_guard_service: bool = True):
+        """
+        启动生活事件监控线程
+
+        :param register_guard_service: 是否在启动后调用 _update_monitor_life_guard_service
+            初始化时（start_monitor_life）设为 False，让 get_service() 统一注册
+            运行时恢复时（check_monitor_life_guard）保留 True，确保守护服务存在
+        """
+        if (
+            configer.get_config("monitor_life_enabled")
+            and configer.get_config("monitor_life_paths")
+            and configer.get_config("monitor_life_event_modes")
+        ) or (
+            configer.get_config("pan_transfer_enabled")
+            and configer.get_config("pan_transfer_paths")
+        ):
+            if self.monitor_life_thread and self.monitor_life_thread.is_alive():
+                logger.info("【监控生活事件】检测到已有线程在运行，停止旧线程中...")
+                self._stop_monitor_life_internal()
+
+            if self.monitor_life_thread and self.monitor_life_thread.is_alive():
+                logger.debug("【监控生活事件】线程仍在运行，跳过启动")
+                return
+
+            self.monitor_stop_event = ThreadEvent()
+
+            if not self.monitorlife:
+                logger.error("【监控生活事件】monitorlife 未初始化，无法启动监控线程")
+                return
+
+            self.monitor_life_thread = Thread(
+                target=monitor_life_thread_worker,
+                args=(
+                    self.monitorlife,
+                    self.monitor_stop_event,
+                ),
+                name="P115Lite-MonitorLife",
+                daemon=False,
+            )
+            self.monitor_life_thread.start()
+            logger.info("【监控生活事件】生活事件监控线程已启动")
+            self.monitor_life_fail_time = None
+
+            if register_guard_service:
+                try:
+                    self._update_monitor_life_guard_service()
+                except Exception as e:
+                    logger.debug(f"【监控生活事件】重新注册守护服务失败: {e}")
+        else:
+            self._stop_monitor_life_internal()
+
+    def _update_monitor_life_guard_service(self):
+        """
+        只重新注册115生活事件线程守护服务
+        """
+        pid = "P115Lite"
+        service_id = "P115Lite_monitor_life_guard"
+        job_id = f"{pid}_{service_id}"
+
+        should_register = (
+            configer.monitor_life_enabled
+            and configer.monitor_life_paths
+            and configer.monitor_life_event_modes
+        ) or (configer.pan_transfer_enabled and configer.pan_transfer_paths)
+
+        if not should_register:
+            logger.debug("【监控生活事件】守护服务未启用，跳过注册")
+            return
+
+        guard_service = {
+            "id": service_id,
+            "name": "115生活事件线程守护",
+            "trigger": CronTrigger.from_crontab("* * * * *"),
+            "func": self.check_monitor_life_guard,
+            "kwargs": {},
+        }
+
+        scheduler = Scheduler()
+        scheduler.remove_plugin_job(pid, job_id)
+
+        with scheduler._lock:
+            try:
+                sid = f"{pid}_{service_id}"
+                scheduler._jobs[job_id] = {
+                    "func": guard_service["func"],
+                    "name": guard_service["name"],
+                    "pid": pid,
+                    "provider_name": "115Lite",
+                    "kwargs": guard_service.get("func_kwargs") or {},
+                    "running": False,
+                }
+                scheduler._scheduler.add_job(
+                    scheduler.start,
+                    guard_service["trigger"],
+                    id=sid,
+                    name=guard_service["name"],
+                    **(guard_service.get("kwargs") or {}),
+                    kwargs={"job_id": job_id},
+                    replace_existing=True,
+                )
+                logger.debug("【监控生活事件】已重新注册115生活事件线程守护服务")
+            except Exception as e:
+                logger.error(f"【监控生活事件】注册守护服务失败: {str(e)}")
+
+    def full_sync_strm_files(self):
+        """
+        全量同步（带并发互斥与优先级控制）
+        """
+        with self._sync_state_lock:
+            if self._full_sync_running:
+                logger.info("【全量同步】全量同步已在运行，跳过本次触发")
+                return
+            if self._increment_sync_running:
+                logger.info("【全量同步】增量同步正在运行，已登记待执行全量同步")
+                self._full_sync_pending = True
+                return
+            self._full_sync_running = True
+        try:
+            self._run_full_sync()
+        finally:
+            with self._sync_state_lock:
+                self._full_sync_running = False
+
+    def _run_full_sync(self):
+        """
+        全量同步实际执行逻辑
+        """
+        if (
+            not configer.get_config("full_sync_strm_paths")
+            or not configer.get_config("moviepilot_address")
+            or not configer.get_config("user_download_mediaext")
+        ):
+            return
+
+        strm_helper = FullSyncStrmHelper(
+            client=self.client,
+            mediainfodownloader=self.mediainfodownloader,
+        )
+        strm_helper.strm_exec_history_kind = "full"
+        strm_helper.generate_strm_files(
+            full_sync_strm_paths=configer.get_config("full_sync_strm_paths"),
+        )
+        (
+            strm_count,
+            mediainfo_count,
+            strm_fail_count,
+            mediainfo_fail_count,
+            remove_unless_strm_count,
+            strm_cleanup_deferred_count,
+        ) = strm_helper.get_generate_total()
+        if configer.get_config("notify"):
+            text = f"""
+📄 生成STRM文件 {strm_count} 个
+⬇️ 下载媒体文件 {mediainfo_count} 个
+❌ 生成STRM失败 {strm_fail_count} 个
+🚫 下载媒体失败 {mediainfo_fail_count} 个
+"""
+            if remove_unless_strm_count != 0:
+                text += f"🗑️ 清理无效STRM文件 {remove_unless_strm_count} 个"
+            if strm_cleanup_deferred_count != 0:
+                text += f"\n⏳ 待二次确认清理无效 STRM {strm_cleanup_deferred_count} 个"
+            post_message(
+                mtype=MessageType.Plugin,
+                title=i18n.translate("full_sync_done_title"),
+                text=text,
+            )
+
+    def start_full_sync(self):
+        """
+        启动全量同步
+        """
+        schedule_plugin_one_shot(
+            service_id="full_sync_strm",
+            name="115网盘助手全量生成STRM",
+            func=self.full_sync_strm_files,
+        )
+
+    def full_sync_database(self):
+        """
+        全量同步数据库
+        """
+        if (
+            not configer.get_config("full_sync_strm_paths")
+            or not configer.get_config("moviepilot_address")
+            or not configer.get_config("user_download_mediaext")
+        ):
+            return
+
+        strm_helper = FullSyncStrmHelper(
+            client=self.client,
+            mediainfodownloader=self.mediainfodownloader,
+        )
+        strm_helper.generate_database(
+            full_sync_strm_paths=configer.get_config("full_sync_strm_paths"),
+        )
+
+    def start_full_sync_db(self):
+        """
+        启动全量同步数据库
+        """
+        schedule_plugin_one_shot(
+            service_id="full_sync_database",
+            name="115网盘助手全量同步数据库",
+            func=self.full_sync_database,
+        )
+
+    def share_strm_cleanup_run(self):
+        """
+        定时任务：分享 STRM 失效清理扫描
+        """
+        try:
+            share_strm_cleaner.run_full_cleanup()
+        except Exception as e:
+            logger.error(f"【分享STRM清理】定时任务失败: {e}", exc_info=True)
+
+    def share_strm_files(self):
+        """
+        分享生成STRM
+        """
+        if not configer.share_strm_config or not configer.moviepilot_address:
+            return
+
+        try:
+            strm_helper = ShareStrmHelper(mediainfodownloader=self.mediainfodownloader)
+            strm_helper.strm_exec_history_kind = "share"
+            strm_helper.generate_strm_files()
+            strm_count, mediainfo_count, strm_fail_count, mediainfo_fail_count = (
+                strm_helper.get_generate_total()
+            )
+            if configer.get_config("notify"):
+                post_message(
+                    mtype=MessageType.Plugin,
+                    title=i18n.translate("share_sync_done_title"),
+                    text=f"\n📄 生成STRM文件 {strm_count} 个\n"
+                    + f"⬇️ 下载媒体文件 {mediainfo_count} 个\n"
+                    + f"❌ 生成STRM失败 {strm_fail_count} 个\n"
+                    + f"🚫 下载媒体失败 {mediainfo_fail_count} 个",
+                )
+        except Exception as e:
+            logger.error(f"【分享STRM生成】运行失败: {e}")
+            return
+
+    def start_share_sync(self):
+        """
+        启动分享同步
+        """
+        schedule_plugin_one_shot(
+            service_id="share_strm",
+            name="115网盘助手分享生成STRM",
+            func=self.share_strm_files,
+        )
+
+    def increment_sync_strm_files(self, send_msg: bool = False):
+        """
+        增量同步（带并发互斥与优先级控制）
+        """
+        with self._sync_state_lock:
+            if self._full_sync_running:
+                logger.info("【增量同步】全量同步正在运行，跳过本次增量同步")
+                return
+            if self._increment_sync_running:
+                logger.info("【增量同步】增量同步已在运行，跳过本次触发")
+                return
+            self._increment_sync_running = True
+        try:
+            self._run_increment_sync(send_msg)
+        finally:
+            run_full = False
+            with self._sync_state_lock:
+                self._increment_sync_running = False
+                if self._full_sync_pending:
+                    self._full_sync_pending = False
+                    run_full = True
+            if run_full:
+                logger.info("【增量同步】增量同步完成，执行待运行的全量同步")
+                self.full_sync_strm_files()
+
+    def _run_increment_sync(self, send_msg: bool = False):
+        """
+        增量同步实际执行逻辑
+        """
+        if (
+            not configer.get_config("increment_sync_strm_paths")
+            or not configer.get_config("moviepilot_address")
+            or not configer.get_config("user_download_mediaext")
+        ):
+            return
+
+        strm_helper = IncrementSyncStrmHelper(
+            client=self.client, mediainfodownloader=self.mediainfodownloader
+        )
+        strm_helper.strm_exec_history_kind = "increment"
+        strm_helper.generate_strm_files(
+            sync_strm_paths=configer.get_config("increment_sync_strm_paths"),
+        )
+        (
+            strm_count,
+            mediainfo_count,
+            strm_fail_count,
+            mediainfo_fail_count,
+            remove_unless_strm_count,
+        ) = strm_helper.get_generate_total()
+        if configer.get_config("notify") and (
+            send_msg
+            or (
+                strm_count != 0
+                or mediainfo_count != 0
+                or strm_fail_count != 0
+                or mediainfo_fail_count != 0
+                or remove_unless_strm_count != 0
+            )
+        ):
+            text = f"""
+📄 生成STRM文件 {strm_count} 个
+⬇️ 下载媒体文件 {mediainfo_count} 个
+❌ 生成STRM失败 {strm_fail_count} 个
+🚫 下载媒体失败 {mediainfo_fail_count} 个
+"""
+            if remove_unless_strm_count != 0:
+                text += f"🗑️ 清理无效STRM文件 {remove_unless_strm_count} 个"
+            post_message(
+                mtype=MessageType.Plugin,
+                title=i18n.translate("inc_sync_done_title"),
+                text=text,
+            )
+
+    def main_cleaner(self):
+        """
+        主清理模块
+        """
+        client = Cleaner(client=self.client)
+
+        if configer.get_config("clear_receive_path_enabled"):
+            client.clear_receive_path()
+
+        if configer.get_config("clear_recyclebin_enabled"):
+            client.clear_recyclebin()
+
+    def offline_status(self):
+        """
+        监控 115 网盘离线下载进度
+        """
+        if self.offlinehelper:
+            self.offlinehelper.pull_status_to_task()
+
+    def stop(self):
+        """
+        停止所有服务
+        """
+        try:
+            with self.monitor_life_lock:
+                if self.monitor_life_thread:
+                    self._stop_monitor_life_internal()
+                elif self.monitor_stop_event:
+                    self.monitor_stop_event.set()
+                    self.monitor_stop_event = None
+            if self.redirect:
+                self.redirect.close_http_client_sync()
+            try:
+                emby_mediainfo_queue.stop()
+            except Exception as e:
+                logger.debug(f"【Emby 媒体信息队列】停止 worker 异常: {e}")
+            try:
+                sync_del_webhook_queue.stop()
+            except Exception as e:
+                logger.debug(f"【同步删除 Webhook 队列】停止 worker 异常: {e}")
+            try:
+                share_audit_download_queue.stop()
+            except Exception as e:
+                logger.debug(f"【分享审核下载】停止 worker 异常: {e}")
+            try:
+                TransferChainPatcher.disable()
+            except Exception as e:
+                logger.error(f"【整理接管】禁用补丁失败: {e}")
+            if self.transfer_task_manager:
+                try:
+                    self.transfer_task_manager.shutdown()
+                except Exception as e:
+                    logger.error(f"【整理接管】关闭任务管理器失败: {e}")
+                self.transfer_task_manager = None
+            self.transfer_handler = None
+        except Exception as e:
+            logger.error(f"发生错误: {e}")
+
+
+servicer = ServiceHelper()

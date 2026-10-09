@@ -1,0 +1,53 @@
+# ⚠️ p115client 必须与 python-concurrenttools 成对锁定，不要单独升任一方。
+#
+# 【为什么锁 concurrenttools == 0.1.8】
+# p115client 0.0.9.6.5.1 声明 `python-concurrenttools>=0.1.8` 但没有上限，
+# 而 upstream concurrenttools 0.1.9 把 threadpool_map 改名为 thread_conmap，
+# 导致 p115client/tool/upload.py 第 23 行的
+#     from concurrenttools import threadpool_map
+# 抛 ImportError —— 本插件 21 个测试模块集体 import 失败、CI 变红。
+# 因此必须显式压住上限，让解析结果停在 0.1.8。
+# （注：CI 的 --find-links 只是"额外候选来源"，pip 仍会与 index 结果合并后
+#   按版本取高，所以 wheels/ 里放 0.1.8 并不能自动拦住 0.1.9。）
+#
+# 【为什么锁定 0.0.9.6.5.1 而不升到 0.0.9.7.2】
+# 0.0.9.7.x 对 iterdir 模块做了一次大重构（__all__ 砍掉 29 个符号），
+# 改名后又移除了本插件正在使用的下列 API，升级会直接打断插件：
+#     iter_file_list            -> iterdir
+#     iter_files_with_path_skim -> iter_files_skim(with_path=True)
+#     traverse_tree_with_path   -> traverse_tree(with_path=True)
+# 其中 full_sync_iter_function 是用户可见配置项，两个取值在新版里均已失效。
+# 要升级 p115client，需先完成上述 14 处调用点的适配改造。
+p115client==0.0.9.6.5.1
+python-concurrenttools==0.1.8
+sentry-sdk~=2.67.1
+pyahocorasick>=2.3.1
+diskcache~=5.6.3
+zstandard~=0.25.0
+p115center-sdk==0.0.17
+orjson
+numpy
+httpx[http2]
+cachetools
+
+# Provided by the MoviePilot host at runtime, but declared explicitly so the
+# self-contained test-suite (bundled host stub) can import every plugin module.
+apscheduler~=3.11.0
+sqlalchemy~=2.0
+jieba~=0.42.1
+jinja2~=3.1
+aiofiles~=25.1
+
+# Rust Mode —— 可选加速依赖
+#
+# 这 3 个是 Rust 编译的 CPython 扩展，**不在 PyPI 上**，以 wheel 形式随本插件
+# wheels/ 目录分发（上游构建矩阵 = Python 3.12 + 3.14 × 6 平台，cp312 与 cp314
+# 轮子都在）。所以 3.12 与 3.14 宿主都能装上并自动启用 Rust 加速。
+# 3.13 上游没有产出 wheel，这里显式排除，避免解析到无匹配轮子导致整体安装失败。
+# 装不上时插件自动走纯 Python 降级路径（功能完整，仅大目录/大批量场景慢一些）。
+#
+# 手动安装（按解释器自动选到匹配轮子）：
+#   uv pip install --find-links wheels full_strm_sync==0.1.6 txt_tree_storage==0.2.1 share_strm_scan==0.2.2
+full_strm_sync==0.1.6; python_version < "3.13" or python_version == "3.14"
+txt_tree_storage==0.2.1; python_version < "3.13" or python_version == "3.14"
+share_strm_scan==0.2.2; python_version < "3.13" or python_version == "3.14"
