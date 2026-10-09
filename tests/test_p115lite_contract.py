@@ -17,7 +17,8 @@ class P115LiteContractTest(unittest.TestCase):
         manifest = json.loads((ROOT / "package.v3.json").read_text())
         metadata = manifest["P115Lite"]
         self.assertEqual(metadata["name"], "115Lite")
-        self.assertEqual(metadata["version"], "3.0.0")
+        self.assertEqual(metadata["version"], "3.0.1")
+        self.assertIs(metadata["release"], True)
         self.assertEqual(
             metadata["description"],
             "115Lite 自用版，感谢原作者 DDSRem、zkmydgth",
@@ -56,6 +57,7 @@ class P115LiteContractTest(unittest.TestCase):
         dependencies = set(project["project"]["dependencies"])
         self.assertIn("p115client==0.0.9.6.5.1", dependencies)
         self.assertIn("python-concurrenttools==0.1.8", dependencies)
+        self.assertEqual(project["project"]["requires-python"], ">=3.14,<3.15")
 
     def test_removed_feature_modules_are_absent(self) -> None:
         """明确要求删除的模块不能重新进入发行目录"""

@@ -36,15 +36,15 @@
 #### 兼容性
 
 - MoviePilot：仅支持 V3，宿主版本要求 `>= 3.0.0`
-- Python：`>= 3.12`
-- Rust 加速轮子：随源码提供 CPython 3.12/3.14 多平台构建；Python 3.13 没有对应上游轮子，会使用纯 Python 降级路径
-- 本地精简测试包：Debian/glibc、`x86_64`、CPython 3.14
+- Python：`>= 3.14,<3.15`
+- Release 包：Debian/glibc、`x86_64`、CPython 3.14，内含对应的 3 个 Rust 加速轮子
+- 其他 Python 版本或系统架构不在此自用版 Release 的支持范围内
 - Vue 联邦前端：ZIP 根目录包含 `__init__.py` 与 `dist/`，可由“本地插件安装”直接识别
 
 #### 安装与迁移
 
 1. 在 MoviePilot V3 添加插件仓库：`https://github.com/madrays/MoviePilot-Plugins`
-2. 安装并启用 `115Lite`
+2. 安装并启用 `115Lite`；宿主会优先下载 GitHub Release ZIP，不再逐文件拉取源码
 3. 配置 115 Cookie，并在 MoviePilot 目录设置中把资源存储、媒体库存储选择为 `115Lite`
 4. 从原版迁移时点击配置页底部的“获取原版配置”；插件会读取 `P115StrmHelper` 配置并换算存储名和路径格式
 5. 导入只填充表单，不会自动保存；检查路径后点击“保存配置”

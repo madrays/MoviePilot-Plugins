@@ -51,8 +51,9 @@ def main() -> int:
         if not source.is_file():
             errors.append(f"{plugin_id}: 缺少 V3 源码 {source.relative_to(ROOT)}")
             continue
-        if metadata.get("release"):
-            errors.append(f"{plugin_id}: 不能声明 release=true，仓库未发布对应 Release 资产")
+        release = metadata.get("release", False)
+        if not isinstance(release, bool):
+            errors.append(f"{plugin_id}: release 必须是布尔值")
         if metadata.get("system_version") != ">=3.0.0":
             errors.append(f"{plugin_id}: system_version 必须为 >=3.0.0")
         version = metadata.get("version")

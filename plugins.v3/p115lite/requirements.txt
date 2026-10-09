@@ -41,13 +41,11 @@ aiofiles~=25.1
 # Rust Mode —— 可选加速依赖
 #
 # 这 3 个是 Rust 编译的 CPython 扩展，**不在 PyPI 上**，以 wheel 形式随本插件
-# wheels/ 目录分发（上游构建矩阵 = Python 3.12 + 3.14 × 6 平台，cp312 与 cp314
-# 轮子都在）。所以 3.12 与 3.14 宿主都能装上并自动启用 Rust 加速。
-# 3.13 上游没有产出 wheel，这里显式排除，避免解析到无匹配轮子导致整体安装失败。
-# 装不上时插件自动走纯 Python 降级路径（功能完整，仅大目录/大批量场景慢一些）。
+# wheels/ 目录分发。自用仓库只保留 Debian x86_64 / CPython 3.14 轮子，
+# 其它 Python 版本不安装 Rust 扩展，自动走纯 Python 降级路径。
 #
 # 手动安装（按解释器自动选到匹配轮子）：
 #   uv pip install --find-links wheels full_strm_sync==0.1.6 txt_tree_storage==0.2.1 share_strm_scan==0.2.2
-full_strm_sync==0.1.6; python_version < "3.13" or python_version == "3.14"
-txt_tree_storage==0.2.1; python_version < "3.13" or python_version == "3.14"
-share_strm_scan==0.2.2; python_version < "3.13" or python_version == "3.14"
+full_strm_sync==0.1.6; python_version == "3.14"
+txt_tree_storage==0.2.1; python_version == "3.14"
+share_strm_scan==0.2.2; python_version == "3.14"
