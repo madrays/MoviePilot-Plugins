@@ -1,6 +1,7 @@
 import ast
 import json
 import random
+import types
 import unittest
 import uuid
 from datetime import datetime, timedelta
@@ -61,6 +62,115 @@ def load_instance_id_resolver():
     namespace = {"uuid": uuid}
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(PLUGIN_SOURCE), "exec"), namespace)
     return namespace["_resolve_instance_id"]
+
+
+def load_api_request_method(fake_requests, outcomes):
+    module = ast.parse(PLUGIN_SOURCE.read_text(encoding="utf-8"))
+    assignments = [
+        node for node in module.body
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id in {
+                "API_CONNECT_TIMEOUT_SECONDS",
+                "API_READ_TIMEOUT_SECONDS",
+                "API_TRANSPORT_RETRY_DELAYS_SECONDS",
+                "API_RETRYABLE_STATUS_CODES",
+            }
+            for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+        )
+    ]
+    helpers = [
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_api_request_is_retryable", "_api_retry_delay_seconds"}
+    ]
+    plugin = next(node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "FengchaoSignin")
+    request_method = next(node for node in plugin.body if isinstance(node, ast.FunctionDef) and node.name == "__api_request")
+
+    class FakeLogger:
+        warnings = []
+
+        @classmethod
+        def warning(cls, *args):
+            cls.warnings.append(args)
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = True
+            self.calls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def request(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    sessions = []
+
+    def build_session():
+        session = FakeSession()
+        sessions.append(session)
+        return session
+
+    fake_requests.Session = build_session
+    namespace = {
+        "requests": fake_requests,
+        "time": types.SimpleNamespace(monotonic=lambda: 10.0, sleep=lambda _delay: None),
+        "random": types.SimpleNamespace(uniform=lambda _start, _end: 0.0),
+        "logger": FakeLogger,
+        "uuid": uuid,
+        "_resolve_api_base": lambda: "https://fengchao.test",
+    }
+    exec(compile(ast.Module(body=[*assignments, *helpers, request_method], type_ignores=[]), str(PLUGIN_SOURCE), "exec"), namespace)
+    return namespace["__api_request"], sessions, FakeLogger
+
+
+class FakeApiResponse:
+    def __init__(self, status_code=200, payload=None, headers=None, json_error=None):
+        self.status_code = status_code
+        self.payload = payload
+        self.headers = headers or {"content-type": "application/json"}
+        self.json_error = json_error
+        self.closed = False
+
+    def json(self):
+        if self.json_error:
+            raise self.json_error
+        return self.payload
+
+    def close(self):
+        self.closed = True
+
+
+def fake_requests_module():
+    class ConnectTimeout(Exception):
+        pass
+
+    class ReadTimeout(Exception):
+        pass
+
+    class ConnectionError(Exception):
+        pass
+
+    return types.SimpleNamespace(
+        ConnectTimeout=ConnectTimeout,
+        ReadTimeout=ReadTimeout,
+        ConnectionError=ConnectionError,
+    )
+
+
+def fake_api_plugin(*, use_proxy=False):
+    plugin = types.SimpleNamespace(_instance_id="test-instance", _use_proxy=use_proxy)
+    setattr(plugin, "__api_headers", lambda: {"Authorization": "Bearer test", "Accept": "application/json"})
+    setattr(plugin, "_get_proxies", lambda: {"https": "http://proxy.test:8080"})
+    return plugin
 
 
 class FengchaoScheduleTests(unittest.TestCase):
@@ -183,11 +293,14 @@ class FengchaoScheduleTests(unittest.TestCase):
         self.assertIn("目前仅支持国内出口 IP", source)
         self.assertIn("建议保持关闭", source)
 
-    def test_plugin_catalog_publishes_the_3_1_8_release(self):
+    def test_plugin_catalog_publishes_the_transport_recovery_release(self):
         catalog = json.loads((PLUGIN_SOURCE.parents[2] / "package.json").read_text(encoding="utf-8"))
+        v3_catalog = json.loads((PLUGIN_SOURCE.parents[2] / "package.v3.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.8")
-        self.assertIn("v3.1.8", catalog["FengchaoSignin"]["history"])
+        self.assertEqual(catalog["FengchaoSignin"]["version"], "3.1.10")
+        self.assertIn("v3.1.10", catalog["FengchaoSignin"]["history"])
+        self.assertEqual(v3_catalog["FengchaoSignin"]["version"], "3.1.10")
+        self.assertIn("v3.1.10", v3_catalog["FengchaoSignin"]["history"])
 
     def test_official_endpoints_use_the_new_forum_domain(self):
         source = PLUGIN_SOURCE.read_text(encoding="utf-8")
@@ -212,6 +325,65 @@ class FengchaoScheduleTests(unittest.TestCase):
 
         self.assertIn('elapsed = time.monotonic() - started_monotonic', source)
         self.assertIn('可能被本机代理或网络提前中断', source)
+        self.assertIn('session.trust_env = False', source)
+        self.assertIn('API_TRANSPORT_RETRY_DELAYS_SECONDS = (1.0, 3.0)', source)
+
+    def test_checkin_retries_an_ambiguous_timeout_and_disables_environment_proxy(self):
+        requests_module = fake_requests_module()
+        timeout = requests_module.ReadTimeout("proxy read timeout")
+        response = FakeApiResponse(payload={
+            "code": 0,
+            "data": {"alreadyCheckedIn": True, "checkIn": {"todayReward": 6}},
+        })
+        api_request, sessions, logger = load_api_request_method(requests_module, [timeout, response])
+
+        result = api_request(fake_api_plugin(), "POST", "/api/integrations/moviepilot/v1/check-in", {})
+
+        self.assertTrue(result["alreadyCheckedIn"])
+        self.assertEqual(result["checkIn"]["todayReward"], 6)
+        self.assertEqual(len(sessions), 1)
+        self.assertFalse(sessions[0].trust_env)
+        self.assertEqual(len(sessions[0].calls), 2)
+        first_kwargs = sessions[0].calls[0][1]
+        second_kwargs = sessions[0].calls[1][1]
+        self.assertIsNone(first_kwargs["proxies"])
+        self.assertEqual(first_kwargs["timeout"], (8, 20))
+        self.assertEqual(first_kwargs["headers"]["X-MoviePilot-Request-Id"], second_kwargs["headers"]["X-MoviePilot-Request-Id"])
+        self.assertEqual(len(logger.warnings), 1)
+
+    def test_retryable_gateway_status_recovers_but_webhook_test_is_not_replayed(self):
+        requests_module = fake_requests_module()
+        retry_response = FakeApiResponse(status_code=502, payload={"code": 502}, headers={"retry-after": "1"})
+        success_response = FakeApiResponse(payload={"code": 0, "data": {"checkedInToday": True}})
+        api_request, sessions, _logger = load_api_request_method(requests_module, [retry_response, success_response])
+
+        result = api_request(fake_api_plugin(), "GET", "/api/integrations/moviepilot/v1/status")
+
+        self.assertTrue(result["checkedInToday"])
+        self.assertTrue(retry_response.closed)
+        self.assertEqual(len(sessions[0].calls), 2)
+
+        webhook_requests = fake_requests_module()
+        webhook_api_request, webhook_sessions, _logger = load_api_request_method(
+            webhook_requests,
+            [webhook_requests.ReadTimeout("ambiguous webhook delivery")],
+        )
+        with self.assertRaisesRegex(RuntimeError, "等待蜂巢论坛响应超时"):
+            webhook_api_request(fake_api_plugin(), "POST", "/api/integrations/moviepilot/v1/notification-webhook", {})
+        self.assertEqual(len(webhook_sessions[0].calls), 1)
+
+    def test_explicit_proxy_remains_opt_in_and_does_not_reenable_environment_proxy(self):
+        requests_module = fake_requests_module()
+        api_request, sessions, _logger = load_api_request_method(
+            requests_module,
+            [FakeApiResponse(payload={"code": 0, "data": {"ok": True}})],
+        )
+
+        result = api_request(fake_api_plugin(use_proxy=True), "GET", "/api/integrations/moviepilot/v1/status")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(sessions[0].trust_env)
+        self.assertEqual(sessions[0].calls[0][1]["proxies"], {"https": "http://proxy.test:8080"})
 
 
 if __name__ == "__main__":

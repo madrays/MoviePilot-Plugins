@@ -35,6 +35,28 @@ MOVIEPILOT_API_BASE = "https://fengchao.chat"
 MOVIEPILOT_API_BASE_OVERRIDE = os.getenv("FENGCHAO_API_BASE", "").strip()
 FORUM_NOTIFICATION_CARD_IMAGE = "https://cdn.fengchao.chat/site-logo/site-logo-7d1d31b822cddca4.jpg"
 LOCAL_STATS_RETRY_DELAYS_SECONDS = (30, 90, 180)
+API_CONNECT_TIMEOUT_SECONDS = 8
+API_READ_TIMEOUT_SECONDS = 20
+API_TRANSPORT_RETRY_DELAYS_SECONDS = (1.0, 3.0)
+API_RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+
+
+def _api_request_is_retryable(method: str, path: str) -> bool:
+    """Only replay requests whose server contract is explicitly idempotent."""
+    normalized_method = str(method or "").upper()
+    return normalized_method in {"GET", "PUT"} or (
+        normalized_method == "POST"
+        and path == "/api/integrations/moviepilot/v1/check-in"
+    )
+
+
+def _api_retry_delay_seconds(response, attempt: int) -> float:
+    """Use a bounded Retry-After value, otherwise a short local backoff."""
+    retry_after = str(response.headers.get("retry-after") or "").strip() if response is not None else ""
+    if retry_after.isdigit():
+        return float(min(10, max(1, int(retry_after))))
+    index = min(max(0, int(attempt)), len(API_TRANSPORT_RETRY_DELAYS_SECONDS) - 1)
+    return API_TRANSPORT_RETRY_DELAYS_SECONDS[index]
 
 
 def _resolve_api_base():
@@ -184,7 +206,7 @@ class FengchaoSignin(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/fengchao.png"
     # 插件版本
-    plugin_version = "3.1.8"
+    plugin_version = "3.1.10"
     # 插件作者
     plugin_author = "madrays"
     # 作者主页
@@ -767,34 +789,91 @@ class FengchaoSignin(_PluginBase):
 
     def __api_request(self, method, path, payload=None):
         base_url = _resolve_api_base()
-        started_monotonic = time.monotonic()
-        try:
-            response = requests.request(method, f"{base_url}{path}", headers=self.__api_headers(), json=payload, timeout=(5, 30), proxies=self._get_proxies() if self._use_proxy else None, allow_redirects=False)
-        except requests.ConnectTimeout as exc:
-            raise RuntimeError("连接蜂巢论坛超时（建连上限 5 秒）") from exc
-        except requests.ReadTimeout as exc:
-            elapsed = time.monotonic() - started_monotonic
-            raise RuntimeError(
-                f"等待蜂巢论坛响应超时（实际 {elapsed:.1f} 秒；插件读取上限 30 秒，可能被本机代理或网络提前中断）"
-            ) from exc
-        except requests.ConnectionError as exc:
-            raise RuntimeError("无法连接蜂巢论坛，请检查 DNS、IPv4 网络和代理设置") from exc
-        try:
-            result = response.json() or {}
-        except Exception as exc:
-            content_type = str(response.headers.get("content-type") or "未知").split(";", 1)[0][:64]
-            request_id = str(
-                response.headers.get("x-request-id")
-                or response.headers.get("x-trace-id")
-                or response.headers.get("cf-ray")
-                or "无"
-            )[:80]
-            raise RuntimeError(
-                f"蜂巢论坛网关返回非 JSON 响应（HTTP {response.status_code}，Content-Type={content_type}，请求标识={request_id}）"
-            ) from exc
-        if response.status_code >= 400 or result.get("code") not in (None, 0):
-            raise RuntimeError(result.get("message") or f"论坛 API 请求失败（HTTP {response.status_code}）")
-        return result.get("data") or {}
+        retryable = _api_request_is_retryable(method, path)
+        max_attempts = 1 + len(API_TRANSPORT_RETRY_DELAYS_SECONDS) if retryable else 1
+        request_headers = self.__api_headers()
+        request_headers["X-MoviePilot-Request-Id"] = f"{self._instance_id}-{uuid.uuid4().hex}"
+        proxies = self._get_proxies() if self._use_proxy else None
+
+        # requests.request() creates an implicit Session with trust_env=True.
+        # That still consumes HTTP(S)_PROXY when proxies=None, so the old
+        # "使用系统代理" switch did not actually disable MoviePilot's proxy.
+        # Keep one explicit session for this logical request and only use a
+        # proxy when the user enabled it in the plugin.
+        with requests.Session() as session:
+            session.trust_env = False
+            for attempt in range(max_attempts):
+                started_monotonic = time.monotonic()
+                try:
+                    response = session.request(
+                        method,
+                        f"{base_url}{path}",
+                        headers=request_headers,
+                        json=payload,
+                        timeout=(API_CONNECT_TIMEOUT_SECONDS, API_READ_TIMEOUT_SECONDS),
+                        proxies=proxies,
+                        allow_redirects=False,
+                    )
+                except requests.ConnectTimeout as exc:
+                    elapsed = time.monotonic() - started_monotonic
+                    error = RuntimeError(f"连接蜂巢论坛超时（实际 {elapsed:.1f} 秒；建连上限 {API_CONNECT_TIMEOUT_SECONDS} 秒）")
+                    if attempt + 1 >= max_attempts:
+                        raise error from exc
+                    delay = _api_retry_delay_seconds(None, attempt) + random.uniform(0, 0.5)
+                    logger.warning("蜂巢 API 传输失败，%.1f 秒后重试（%s/%s）：%s", delay, attempt + 1, max_attempts, error)
+                    time.sleep(delay)
+                    continue
+                except requests.ReadTimeout as exc:
+                    elapsed = time.monotonic() - started_monotonic
+                    error = RuntimeError(
+                        f"等待蜂巢论坛响应超时（实际 {elapsed:.1f} 秒；插件读取上限 {API_READ_TIMEOUT_SECONDS} 秒，可能被本机代理或网络提前中断）"
+                    )
+                    if attempt + 1 >= max_attempts:
+                        raise error from exc
+                    delay = _api_retry_delay_seconds(None, attempt) + random.uniform(0, 0.5)
+                    logger.warning("蜂巢 API 传输失败，%.1f 秒后重试（%s/%s）：%s", delay, attempt + 1, max_attempts, error)
+                    time.sleep(delay)
+                    continue
+                except requests.ConnectionError as exc:
+                    error = RuntimeError("无法连接蜂巢论坛，请检查 DNS、IPv4 网络和代理设置")
+                    if attempt + 1 >= max_attempts:
+                        raise error from exc
+                    delay = _api_retry_delay_seconds(None, attempt) + random.uniform(0, 0.5)
+                    logger.warning("蜂巢 API 传输失败，%.1f 秒后重试（%s/%s）：%s", delay, attempt + 1, max_attempts, error)
+                    time.sleep(delay)
+                    continue
+
+                if retryable and response.status_code in API_RETRYABLE_STATUS_CODES and attempt + 1 < max_attempts:
+                    delay = _api_retry_delay_seconds(response, attempt) + random.uniform(0, 0.5)
+                    logger.warning("蜂巢 API 返回可重试状态 HTTP %s，%.1f 秒后重试（%s/%s）", response.status_code, delay, attempt + 1, max_attempts)
+                    response.close()
+                    time.sleep(delay)
+                    continue
+
+                try:
+                    result = response.json() or {}
+                except Exception as exc:
+                    if retryable and attempt + 1 < max_attempts:
+                        delay = _api_retry_delay_seconds(response, attempt) + random.uniform(0, 0.5)
+                        logger.warning("蜂巢 API 返回非 JSON 网关响应 HTTP %s，%.1f 秒后重试（%s/%s）", response.status_code, delay, attempt + 1, max_attempts)
+                        response.close()
+                        time.sleep(delay)
+                        continue
+                    content_type = str(response.headers.get("content-type") or "未知").split(";", 1)[0][:64]
+                    response_request_id = str(
+                        response.headers.get("x-request-id")
+                        or response.headers.get("x-trace-id")
+                        or response.headers.get("cf-ray")
+                        or "无"
+                    )[:80]
+                    raise RuntimeError(
+                        f"蜂巢论坛网关返回非 JSON 响应（HTTP {response.status_code}，Content-Type={content_type}，请求标识={response_request_id}）"
+                    ) from exc
+                if response.status_code >= 400 or result.get("code") not in (None, 0):
+                    raise RuntimeError(result.get("message") or f"论坛 API 请求失败（HTTP {response.status_code}）")
+                return result.get("data") or {}
+
+        raise RuntimeError("蜂巢 API 请求未完成")
 
     def __api_signin(self, trigger="定时任务"):
         if getattr(self, "_signing_in", False):
@@ -858,7 +937,8 @@ class FengchaoSignin(_PluginBase):
                     time.sleep(backoff_seconds + random.uniform(0, min(30, backoff_seconds * 0.1)))
             already = bool(result.get("alreadyCheckedIn"))
             status_text = "已签到" if already else "签到成功"
-            reward = result.get("reward", 0)
+            check_in_summary = result.get("checkIn") if isinstance(result.get("checkIn"), dict) else {}
+            reward = check_in_summary.get("todayReward", result.get("reward", 0))
             streak = result.get("currentStreak", 0)
             sync_line = f"📊 PT 站点：{snapshot.get('siteCount', 0)} 个" if not snapshot_error else "📊 PT 同步：本次失败，将由独立同步任务重试"
             notification_status = self._send_notification(title=f"【✅ 蜂巢{status_text}】", text=(f"📢 执行结果\n━━━━━━━━━━\n🕐 时间：{started.strftime('%Y-%m-%d %H:%M:%S')}\n✨ 状态：{status_text}\n🎁 奖励：{reward}\n📆 连续签到：{streak}\n{sync_line}\n━━━━━━━━━━"))
