@@ -6,12 +6,18 @@ from typing import Callable, Optional, Tuple, TYPE_CHECKING
 
 from app.sdk.logging import logger
 
-from ..utils.host_compat import (
-    get_notification_class,
-    get_notification_type_enum,
-)
 from ..utils.patch_guard import PatchTargetError, check_patch_target
-from ..utils.transfer_compat import JobViewAdapter, trigger_ai_transfer_retry
+from ..utils.transfer_compat import (
+    JobViewAdapter,
+    abandon_taken_over_admission,
+    checkpoint_planning_rejection,
+    latest_transfer_history,
+    record_uncheckpointed_failure,
+    resolve_jobview,
+    resolve_scrape_batch_finish,
+    scrape_batch_finish_names,
+    trigger_ai_transfer_retry,
+)
 
 if TYPE_CHECKING:
     from ..helper.transfer import TransferTaskManager, TransferHandler
@@ -23,7 +29,11 @@ _TRANSFER_MODULE_HINT = "app.chain.transfer"
 
 # 宿主 __handle_transfer 的期望形参（不含 self）
 _HANDLE_TRANSFER_PARAMS = ["task", "callback"]
-_BATCH_SETTLEMENT_TIMEOUT_SECONDS = 3600
+_DURABLE_SETTLEMENT_TARGETS = (
+    "_TransferChain__checkpoint_planning_rejection",
+    "_TransferChain__record_uncheckpointed_failure",
+)
+_SETTLEMENT_PARAMS = ["task", "error"]
 
 
 class TransferChainPatcher:
@@ -33,11 +43,33 @@ class TransferChainPatcher:
 
     _original_handle_transfer = None
     _enabled = False
+    _scrape_finish_warned = False
+    _jobview_verified = False
     _task_manager: Optional["TransferTaskManager"] = None
     _handler: Optional["TransferHandler"] = None
     _storage_module: str = ""
     _jobview_adapters: dict = {}
     _lock = Lock()
+
+    @classmethod
+    def _warn_scrape_batch_finish_missing(cls) -> None:
+        """宿主缺少刮削批次收尾方法时只告警一次。"""
+        if cls._scrape_finish_warned:
+            return
+        cls._scrape_finish_warned = True
+        logger.warning(
+            "【整理接管】宿主未提供刮削批次收尾方法"
+            f"（候选名: {scrape_batch_finish_names()}）"
+        )
+
+    @classmethod
+    def _verify_jobview_once(cls, chain_self) -> None:
+        """用第一个真实宿主实例复核 jobview 接口。"""
+        if cls._jobview_verified:
+            return
+        cls._jobview_verified = True
+        if not cls._jobview_of(chain_self).verify():
+            logger.error("【整理接管】宿主 jobview 接口不完整，作业状态同步将降级")
 
     @classmethod
     def ensure_host_compatibility(cls) -> None:
@@ -92,60 +124,38 @@ class TransferChainPatcher:
             expected_params=_HANDLE_TRANSFER_PARAMS,
             module_hint=_TRANSFER_MODULE_HINT,
         )
-        # finally 分支依赖：每次处理完清理批次 pending 集合
-        check_patch_target(
-            transfer_chain,
-            "_finish_scrape_batch_task",
-            module_hint=_TRANSFER_MODULE_HINT,
-        )
-        for name in (
-            "_TransferChain__build_planning_input",
-            "_TransferChain__select_storage_oper",
-            "_TransferChain__plan_host_transfer",
-            "_TransferChain__persist_transfer_checkpoint",
-            "_TransferChain__restore_planned_task",
-        ):
+        # 插件替换了宿主整个 handle_transfer，提前失败分支必须具备
+        # durable 收口入口，否则 accepted 任务会每 15 秒回放。
+        for name in _DURABLE_SETTLEMENT_TARGETS:
             check_patch_target(
                 transfer_chain,
                 name,
+                expected_params=_SETTLEMENT_PARAMS,
                 module_hint=_TRANSFER_MODULE_HINT,
             )
+        if resolve_scrape_batch_finish(transfer_chain) is None:
+            raise PatchTargetError(
+                "补丁目标缺失: TransferChain 上找不到刮削批次收尾方法"
+            )
+
+        jobview, probe_ok = resolve_jobview(transfer_chain)
+        if jobview is None and probe_ok:
+            raise PatchTargetError("补丁目标缺失: TransferChain 上取不到 jobview")
+        if jobview is not None:
+            for name in (
+                "add_task",
+                "migrate_task",
+                "running_task",
+                "finish_task",
+                "remove_task",
+                "remove_job",
+                "try_remove_job",
+                "is_done",
+            ):
+                check_patch_target(jobview, name)
         # 回退到原方法时需要，缺失会导致"非 115→115"路径整体失效
         for name in ("transfer",):
             check_patch_target(transfer_chain, name)
-
-    @classmethod
-    def _prepare_durable_checkpoint(cls, chain_self, task) -> None:
-        """在异步批处理产生任何文件副作用前提交 MoviePilot V3 整理计划。"""
-        if task.preview or task.plan_checkpoint is not None:
-            return
-
-        from app.application.classification.reference import (
-            effective_classification_snapshot,
-        )
-
-        planning_input = task.planning_input or (
-            chain_self._TransferChain__build_planning_input(task)
-        )
-        task.bind_planning_input(planning_input)
-        source_oper = chain_self._TransferChain__select_storage_oper(
-            task.fileitem.storage
-        )
-        checkpoint = chain_self._TransferChain__plan_host_transfer(
-            task,
-            planning_input=planning_input,
-            source_oper=source_oper,
-            classification_snapshot=effective_classification_snapshot(
-                task.mediainfo
-            ),
-        )
-        checkpoint = chain_self._TransferChain__persist_transfer_checkpoint(
-            task,
-            planning_input=planning_input,
-            checkpoint=checkpoint,
-        )
-        task.bind_plan_checkpoint(checkpoint)
-        chain_self._TransferChain__restore_planned_task(task)
 
     @classmethod
     def enable(
@@ -198,6 +208,8 @@ class TransferChainPatcher:
 
                 # 应用补丁
                 TransferChain._TransferChain__handle_transfer = patched_handle_transfer
+                cls._scrape_finish_warned = False
+                cls._jobview_verified = False
                 cls._enabled = True
                 logger.info("【整理接管】TransferChain 补丁已启用")
                 return True
@@ -249,27 +261,22 @@ class TransferChainPatcher:
         """
         from app.chain.media import MediaChain
         from app.chain.tmdb import TmdbChain
-        from app.application.history import add_transfer_fail
         from app.sdk.config import settings
         from app.sdk.media import MediaInfo
         from app.db.oper.transferhistory import TransferHistoryOper
         from app.application.directory import DirectoryHelper
-        from app.schemas import TransferInfo
         from app.schemas.types import MediaSource, MediaType
 
         from ..schemas.transfer import TransferTask as PluginTransferTask
 
-        # V3 把 Notification 改名为 Message、NotificationType 改名为 MessageType，
-        # 并只在完整应用启动后由兼容层挂载旧名别名。统一走兼容解析，避免插件
-        # 在单测／离线自检场景下取不到符号。
-        notification_class = get_notification_class()
-        notification_type_enum = get_notification_type_enum()
+        cls._verify_jobview_once(chain_self)
 
         try:
-            # 当前 V3 的 jobview 只存在于 TransferChain 实例上，不能在安装补丁时
-            # 从类对象预检。第一次处理任务时校验；失败则安全回退宿主原方法。
-            if not cls._jobview_of(chain_self).verify():
-                logger.warning("【整理接管】运行时 jobview 校验失败，回退宿主整理")
+            # 已有冻结计划的回放任务必须交回宿主执行，插件不得重新规划。
+            if getattr(task, "plan_checkpoint", None) is not None:
+                logger.debug(
+                    f"【整理接管】{task.fileitem.name} 已有冻结计划，交回宿主原生执行"
+                )
                 return cls._call_original(chain_self, task, callback)
 
             ########## 原始方法执行部分 ##########
@@ -328,54 +335,12 @@ class TransferChainPatcher:
                     # preview 模式下不创建历史记录
                     if task.preview:
                         return False, "未识别到媒体信息"
-                    # 新增整理失败历史记录
-                    his = add_transfer_fail(
-                        fileitem=task.fileitem,
-                        mode=task.transfer_type,
-                        meta=task.meta,
-                        downloader=task.downloader,
-                        download_hash=task.download_hash,
+                    settled = cls._settle_planning_rejection(
+                        chain_self, task, callback, "未识别到媒体信息"
                     )
-                    chain_self.post_message(
-                        notification_class(
-                            mtype=notification_type_enum.Manual,
-                            title=f"{task.fileitem.name} 未识别到媒体信息，无法入库！",
-                            text=(
-                                "原因：未识别到媒体信息\n"
-                                "如果按钮不可用，可回复：\n"
-                                f"```\n/redo {his.id}\n/redo {his.id} [tmdbid]|[类型]\n```\n"
-                                "自动重试或手动识别整理。"
-                            ),
-                            username=task.username,
-                            link=settings.MP_DOMAIN("#/history"),
-                            buttons=chain_self.build_failed_transfer_buttons(
-                                his.id if his else None
-                            ),
-                            save_history=False,
-                        )
-                    )
-                    # 任务失败，直接移除task
-                    cls._jobview_of(chain_self).remove_task(task.fileitem)
-
-                    # AI智能体自动重试整理
-                    if (
-                        his
-                        and settings.AI_AGENT_ENABLE
-                        and settings.AI_AGENT_RETRY_TRANSFER
-                    ):
-                        group_key = (
-                            task.download_hash
-                            or str(task.fileitem.path).rsplit("/", 1)[0]
-                            if task.fileitem
-                            else ""
-                        )
-                        trigger_ai_transfer_retry(
-                            chain_self,
-                            his,
-                            group_key=group_key,
-                        )
-
-                    return False, "未识别到媒体信息"
+                    if settled is None:
+                        return cls._call_original(chain_self, task, callback)
+                    return settled
 
                 mediainfo_changed = True
 
@@ -399,6 +364,9 @@ class TransferChainPatcher:
                 if not cls._jobview_of(chain_self).migrate_task(task):
                     logger.info(
                         f"【整理接管】{task.fileitem.name} 已存在整理任务，跳过重复处理"
+                    )
+                    record_uncheckpointed_failure(
+                        chain_self, task, f"{task.fileitem.name} 已在整理队列中"
                     )
                     return False, f"{task.fileitem.name} 已在整理队列中"
 
@@ -443,12 +411,12 @@ class TransferChainPatcher:
 
             ########## 原始方法执行结束 ##########
 
-            # 如果是目录（蓝光原盘），回退到原方法处理
+            # 如果是目录（蓝光原盘），交回宿主原生 durable 流程。
             if task.fileitem.type == "dir":
                 logger.debug(
                     f"【整理接管】检测到目录类型任务（可能是蓝光原盘），回退到原方法: {task.fileitem.path}"
                 )
-                return cls._call_original_transfer_part(chain_self, task, callback)
+                return cls._call_original(chain_self, task, callback)
 
             if (
                 cls._should_intercept(source_storage, target_storage)
@@ -467,24 +435,20 @@ class TransferChainPatcher:
                     configer.pan_transfer_linked_subtitle_audio
                     and is_subtitle_or_audio_file(task.fileitem)
                 ):
-                    cls._prepare_durable_checkpoint(chain_self, task)
                     logger.debug(
                         f"【整理接管】忽略字幕/音频文件（将跟随主文件一起处理）: {task.fileitem.name}"
                     )
-                    transferinfo = TransferInfo(
-                        success=True,
-                        fileitem=task.fileitem,
-                        target_item=None,
-                        message="已由插件接管（字幕/音频文件，跟随主文件处理）",
-                        transfer_type=task.transfer_type or "move",
-                        file_list=[task.fileitem.path],
-                        file_list_new=[],
-                        need_notify=False,
-                        need_scrape=False,
-                    )
-                    if callback:
-                        return callback(task, transferinfo)
-                    return True, transferinfo.message
+                    if not abandon_taken_over_admission(
+                        chain_self,
+                        task,
+                        reason=f"字幕/音频跟随主文件处理: {task.fileitem.path}",
+                    ):
+                        return cls._call_original(chain_self, task, callback)
+                    cls._jobview_of(chain_self).running_task(task)
+                    cls._jobview_of(chain_self).finish_task(task)
+                    if cls._jobview_of(chain_self).is_done(task):
+                        cls._jobview_of(chain_self).remove_job(task)
+                    return True, "已由插件接管（字幕/音频文件，跟随主文件处理）"
 
                 need_rename, need_notify, need_scrape = cls._derive_transfer_flags(task)
 
@@ -499,29 +463,18 @@ class TransferChainPatcher:
                         need_scrape,
                     )
 
-                cls._prepare_durable_checkpoint(chain_self, task)
-
                 # 注意：这个验证在 transfer_media 中进行，但由于我们拦截了，需要在这里进行
                 if task.mediainfo.type == MediaType.TV and task.fileitem.type == "file":
                     if task.meta.begin_episode is None:
                         logger.warn(
                             f"【整理接管】文件 {task.fileitem.path} 整理失败：未识别到文件集数"
                         )
-                        fail_msg = "未识别到文件集数"
-                        src_path = task.fileitem.path
-                        transferinfo = TransferInfo(
-                            success=False,
-                            fileitem=task.fileitem,
-                            message=fail_msg,
-                            transfer_type=task.transfer_type,
-                            file_list=[src_path],
-                            fail_list=[src_path],
-                            need_notify=need_notify,
-                            need_scrape=need_scrape,
+                        settled = cls._settle_planning_rejection(
+                            chain_self, task, callback, "未识别到文件集数"
                         )
-                        if callback:
-                            return callback(task, transferinfo)
-                        return False, fail_msg
+                        if settled is None:
+                            return cls._call_original(chain_self, task, callback)
+                        return settled
 
                     # 文件结束季为空
                     task.meta.end_season = None
@@ -537,8 +490,7 @@ class TransferChainPatcher:
                 target_path = cls._compute_target_path(task, need_rename=need_rename)
                 if not target_path:
                     logger.error(f"【整理接管】计算目标路径失败: {task.fileitem.path}")
-                    # 回退到原方法
-                    return cls._call_original_transfer_part(chain_self, task, callback)
+                    return cls._call_original(chain_self, task, callback)
 
                 # 确定整理方式
                 transfer_type = task.transfer_type
@@ -549,6 +501,14 @@ class TransferChainPatcher:
                 overwrite_mode = None
                 if task.target_directory:
                     overwrite_mode = task.target_directory.overwrite_mode
+
+                # 插件接管后宿主不再拥有该文件的恢复责任。注销失败就回退原生整理。
+                if not abandon_taken_over_admission(
+                    chain_self,
+                    task,
+                    reason=f"插件接管 115→115 整理: {target_path}",
+                ):
+                    return cls._call_original(chain_self, task, callback)
 
                 # 正在处理
                 cls._jobview_of(chain_self).running_task(task)
@@ -570,8 +530,6 @@ class TransferChainPatcher:
                     username=task.username,
                     downloader=task.downloader,
                     download_hash=task.download_hash,
-                    host_task=task,
-                    settlement_callback=callback,
                 )
 
                 # 加入批量队列
@@ -581,42 +539,35 @@ class TransferChainPatcher:
                     f"【整理接管】任务已加入批量队列: {task.fileitem.name} -> {target_path}"
                 )
 
-                if not plugin_task.completion_event.wait(
-                    timeout=_BATCH_SETTLEMENT_TIMEOUT_SECONDS
-                ):
-                    timeout_info = TransferInfo(
-                        success=False,
-                        fileitem=task.fileitem,
-                        message="115Lite 批量整理等待超时",
-                        transfer_type=transfer_type or "move",
-                        file_list=[task.fileitem.path],
-                        fail_list=[task.fileitem.path],
-                        need_notify=need_notify,
-                        need_scrape=need_scrape,
-                    )
-                    return plugin_task.settle(timeout_info)
+                return True, "已由插件接管"
 
-                return plugin_task.settlement_result or (
-                    False,
-                    "115Lite 批量整理未返回终态",
-                )
-
-            # 非 115 -> 115 原方法整理
-            return cls._call_original_transfer_part(chain_self, task, callback)
+            # 非 115 → 115 必须走宿主原生 durable 规划、执行检查点和终态结算。
+            return cls._call_original(chain_self, task, callback)
 
         except Exception as e:
             logger.error(
                 f"【整理接管】Patched handle_transfer 异常: {e}", exc_info=True
             )
             try:
-                return cls._call_original(chain_self, task, callback)
+                result = cls._call_original(chain_self, task, callback)
             except Exception as fallback_error:
                 logger.error(f"【整理接管】回退到原方法也失败: {fallback_error}")
+                result = None
+            if result is None:
+                record_uncheckpointed_failure(chain_self, task, e)
                 return False, f"整理异常: {e}"
+            return result
         finally:
             # 与原生 __handle_transfer 一致：每次处理完尝试移除已完成作业，并清理批次 pending 集合
             cls._jobview_of(chain_self).try_remove_job(task)
-            chain_self._finish_scrape_batch_task(task)
+            finish_scrape_batch = resolve_scrape_batch_finish(chain_self)
+            if finish_scrape_batch is None:
+                cls._warn_scrape_batch_finish_missing()
+            else:
+                try:
+                    finish_scrape_batch(task)
+                except Exception as finish_error:
+                    logger.error(f"【整理接管】清理刮削批次 pending 失败: {finish_error}")
 
     @classmethod
     def _derive_transfer_flags(cls, task) -> Tuple[bool, bool, bool]:
@@ -865,6 +816,33 @@ class TransferChainPatcher:
             return False, f"Preview 异常: {e}"
 
     @classmethod
+    def _settle_planning_rejection(
+        cls,
+        chain_self,
+        task,
+        callback: Optional[Callable],
+        message: str,
+    ) -> Optional[Tuple[bool, str]]:
+        """按宿主 V3 语义冻结规划拒绝并完成 durable 终态结算。"""
+        result = checkpoint_planning_rejection(chain_self, task, message, callback)
+        if result is None:
+            return None
+        cls._register_ai_retry(chain_self, task)
+        return result
+
+    @classmethod
+    def _register_ai_retry(cls, chain_self, task) -> None:
+        """失败结算后按宿主 durable 身份登记 AI 重试。"""
+        from app.sdk.config import settings
+
+        if not (settings.AI_AGENT_ENABLE and settings.AI_AGENT_RETRY_TRANSFER):
+            return
+        history = latest_transfer_history(chain_self, task)
+        if history is None:
+            return
+        trigger_ai_transfer_retry(chain_self, history)
+
+    @classmethod
     def _call_original(
         cls, chain_self, task, callback: Optional[Callable]
     ) -> Optional[Tuple[bool, str]]:
@@ -879,80 +857,3 @@ class TransferChainPatcher:
         if cls._original_handle_transfer:
             return cls._original_handle_transfer(chain_self, task, callback)
         return None
-
-    @classmethod
-    def _call_original_transfer_part(
-        cls, chain_self, task, callback: Optional[Callable]
-    ) -> Optional[Tuple[bool, str]]:
-        """
-        调用原方法的 transfer 部分
-
-        :param chain_self: TransferChain 实例
-        :param task: 任务
-        :param callback: 回调
-        :return: 返回值
-        """
-        from app.sdk.events import eventmanager
-        from app.schemas import StorageOperSelectionEventData, TransferInfo
-        from app.schemas.types import ChainEventType
-
-        try:
-            # 正在处理
-            cls._jobview_of(chain_self).running_task(task)
-
-            # 获取源存储操作对象
-            source_oper = None
-            source_event_data = StorageOperSelectionEventData(
-                storage=task.fileitem.storage
-            )
-            source_event = eventmanager.send_event(
-                ChainEventType.StorageOperSelection, source_event_data
-            )
-            if source_event and source_event.event_data:
-                source_event_data = source_event.event_data
-                if source_event_data.storage_oper:
-                    source_oper = source_event_data.storage_oper
-
-            # 获取目标存储操作对象
-            target_oper = None
-            target_event_data = StorageOperSelectionEventData(
-                storage=task.target_storage
-            )
-            target_event = eventmanager.send_event(
-                ChainEventType.StorageOperSelection, target_event_data
-            )
-            if target_event and target_event.event_data:
-                target_event_data = target_event.event_data
-                if target_event_data.storage_oper:
-                    target_oper = target_event_data.storage_oper
-
-            # 执行整理
-            transferinfo: TransferInfo = chain_self.transfer(
-                fileitem=task.fileitem,
-                meta=task.meta,
-                mediainfo=task.mediainfo,
-                target_directory=task.target_directory,
-                target_storage=task.target_storage,
-                target_path=task.target_path,
-                transfer_type=task.transfer_type,
-                episodes_info=task.episodes_info,
-                scrape=task.scrape,
-                library_type_folder=task.library_type_folder,
-                library_category_folder=task.library_category_folder,
-                source_oper=source_oper,
-                target_oper=target_oper,
-                preview=task.preview,
-            )
-
-            if not transferinfo:
-                logger.error("文件整理模块运行失败")
-                return False, "文件整理模块运行失败"
-
-            if callback:
-                return callback(task, transferinfo)
-
-            return transferinfo.success, transferinfo.message
-
-        except Exception as e:
-            logger.error(f"【整理接管】执行 transfer 失败: {e}", exc_info=True)
-            return False, f"整理失败: {e}"

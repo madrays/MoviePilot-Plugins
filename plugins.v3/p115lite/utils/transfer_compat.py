@@ -17,14 +17,21 @@ MoviePilot V3 把作业队列实现从 ``app.chain.transfer`` 收敛到
   诊断日志，绝不影响主流程。
 """
 
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, List, Optional, Tuple
 
 from app.sdk.logging import logger
 
 __all__ = [
     "JobViewAdapter",
+    "abandon_taken_over_admission",
+    "checkpoint_planning_rejection",
     "get_jobview",
     "get_task_lock",
+    "latest_transfer_history",
+    "record_uncheckpointed_failure",
+    "resolve_jobview",
+    "resolve_scrape_batch_finish",
+    "scrape_batch_finish_names",
     "trigger_ai_transfer_retry",
 ]
 
@@ -267,6 +274,122 @@ def _build_probe_task(mediainfo, season: Optional[int], fileitem=None):
         return MPTransferTask(fileitem=fileitem, mediainfo=mediainfo, meta=meta)
     except Exception as err:
         logger.debug(f"【整理接管】构造探针任务失败: {err}")
+        return None
+
+
+_SCRAPE_BATCH_FINISH_NAMES = (
+    "_finish_scrape_batch_task",
+    "_TransferChain__finish_scrape_batch_task",
+)
+
+
+def scrape_batch_finish_names() -> List[str]:
+    """返回刮削批次收尾方法的候选名。"""
+    return list(_SCRAPE_BATCH_FINISH_NAMES)
+
+
+def resolve_scrape_batch_finish(owner: Any) -> Optional[Callable]:
+    """兼容解析 MoviePilot 的刮削批次收尾方法。"""
+    for name in _SCRAPE_BATCH_FINISH_NAMES:
+        func = getattr(owner, name, None)
+        if callable(func):
+            return func
+    return None
+
+
+def resolve_jobview(owner: Any) -> Tuple[Any, bool]:
+    """从真实宿主实例解析 jobview，不主动构造半成品单例。"""
+    jobview = getattr(owner, "jobview", None)
+    if jobview is not None:
+        return jobview, True
+    if isinstance(owner, type):
+        getter = getattr(owner, "get_existing_instance", None)
+        if not callable(getter):
+            return None, False
+        try:
+            instance = getter()
+        except Exception as err:
+            logger.warning(f"【整理接管】查询宿主链已有实例失败: {err}")
+            return None, False
+        if instance is None:
+            return None, False
+        return getattr(instance, "jobview", None), True
+    return None, True
+
+
+def checkpoint_planning_rejection(
+    chain: Any,
+    task: Any,
+    message: str,
+    callback: Optional[Callable] = None,
+) -> Optional[Tuple[bool, str]]:
+    """把确定性规划拒绝交给宿主 durable 终态入口收口。"""
+    rejection = getattr(chain, "_TransferChain__checkpoint_planning_rejection", None)
+    if not callable(rejection):
+        logger.warning(
+            "【整理接管】宿主未提供规划拒绝收口入口，"
+            "本次必须回退原生整理"
+        )
+        return None
+    transferinfo = rejection(task, message)
+    if callback:
+        return callback(task, transferinfo)
+    return bool(transferinfo.success), transferinfo.message or ""
+
+
+def record_uncheckpointed_failure(chain: Any, task: Any, error: Any) -> bool:
+    """按宿主语义记录 checkpoint 之前的失败原因。"""
+    record = getattr(chain, "_TransferChain__record_uncheckpointed_failure", None)
+    if not callable(record):
+        logger.warning("【整理接管】宿主未提供未结算失败登记入口")
+        return False
+    try:
+        record(task, error)
+    except Exception as err:
+        logger.error(f"【整理接管】登记整理规划失败原因出错: {err}")
+        return False
+    return True
+
+
+def abandon_taken_over_admission(chain: Any, task: Any, *, reason: str) -> bool:
+    """原子注销被插件接管的 durable 准入记录。
+
+    只允许在 accepted、无检查点、无步骤且无历史的未执行阶段注销。
+    失败时返回 ``False``，调用方必须回退宿主原生整理。
+    """
+    task_id = getattr(task, "admission_task_id", None)
+    lease_token = getattr(task, "lease_token", None)
+    if not task_id or not lease_token:
+        logger.warning(f"【整理接管】任务缺少 durable 身份，无法注销宿主准入: {reason}")
+        return False
+    repository = getattr(chain, "_transfer_admissions", None)
+    abandon = getattr(repository, "abandon_unstarted", None)
+    if not callable(abandon):
+        logger.warning("【整理接管】宿主未提供准入注销入口，无法安全接管")
+        return False
+    try:
+        deleted = abandon(task_id=task_id, lease_token=lease_token)
+    except Exception as err:
+        logger.error(f"【整理接管】注销宿主整理准入记录失败: {err}")
+        return False
+    if not deleted:
+        logger.warning(f"【整理接管】宿主整理准入未注销，本次回退原生整理: {reason}")
+        return False
+    logger.debug(f"【整理接管】已注销宿主准入，插件接管后续流转: {reason}")
+    return True
+
+
+def latest_transfer_history(chain: Any, task: Any) -> Any:
+    """按 durable 任务身份查询刚结算的整理历史。"""
+    task_id = getattr(task, "admission_task_id", None)
+    if not task_id:
+        return None
+    try:
+        from app.db.oper.transferhistory import TransferHistoryOper
+
+        return TransferHistoryOper().get_by_transfer_task_id(task_id=task_id)
+    except Exception as err:
+        logger.debug(f"【整理接管】按整理任务查询历史失败: {err}")
         return None
 
 

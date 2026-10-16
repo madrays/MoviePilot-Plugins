@@ -134,8 +134,8 @@ class ServiceHelper:
         """
         初始化或更新接管网盘整理功能。
 
-        接管实现会等待批量处理结束并调用 MoviePilot V3 durable 终态回调，
-        保留批量性能的同时避免 transferpending 被反复回放。
+        接管前原子注销 MoviePilot V3 对该文件的 durable 恢复责任，
+        再由插件批量处理和记录结果，避免宿主每 15 秒重放。
         """
         try:
             TransferChainPatcher.disable()
@@ -180,7 +180,7 @@ class ServiceHelper:
                     storage_module="115Lite",
                 )
                 if patch_enabled:
-                    logger.info("【整理接管】已启用（V3 durable 终态）")
+                    logger.info("【整理接管】已启用（V3 durable 责任隔离）")
                 else:
                     self.transfer_task_manager.shutdown()
                     self.transfer_task_manager = None

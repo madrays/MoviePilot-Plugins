@@ -50,6 +50,45 @@ def _load_module(logger: _Logger):
 
 
 class P115LiteRetryCompatTest(unittest.TestCase):
+    def test_abandons_host_admission_before_plugin_takeover(self) -> None:
+        logger = _Logger()
+        module = _load_module(logger)
+        calls = []
+
+        class Repository:
+            def abandon_unstarted(self, *, task_id, lease_token):
+                calls.append((task_id, lease_token))
+                return True
+
+        chain = types.SimpleNamespace(_transfer_admissions=Repository())
+        task = types.SimpleNamespace(
+            admission_task_id="task-1",
+            lease_token="lease-1",
+        )
+        self.assertTrue(
+            module.abandon_taken_over_admission(
+                chain,
+                task,
+                reason="115Lite takeover",
+            )
+        )
+        self.assertEqual(calls, [("task-1", "lease-1")])
+
+    def test_refuses_takeover_when_admission_cannot_be_abandoned(self) -> None:
+        logger = _Logger()
+        module = _load_module(logger)
+        task = types.SimpleNamespace(
+            admission_task_id="task-2",
+            lease_token="lease-2",
+        )
+        self.assertFalse(
+            module.abandon_taken_over_admission(
+                object(),
+                task,
+                reason="missing repository",
+            )
+        )
+
     def test_prefers_v3_durable_retry_api(self) -> None:
         logger = _Logger()
         module = _load_module(logger)

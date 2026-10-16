@@ -17,7 +17,7 @@ class P115LiteContractTest(unittest.TestCase):
         manifest = json.loads((ROOT / "package.v3.json").read_text())
         metadata = manifest["P115Lite"]
         self.assertEqual(metadata["name"], "115Lite")
-        self.assertEqual(metadata["version"], "3.0.2")
+        self.assertEqual(metadata["version"], "3.0.3")
         self.assertIs(metadata["release"], True)
         self.assertEqual(
             metadata["description"],
@@ -132,30 +132,27 @@ class P115LiteContractTest(unittest.TestCase):
 
         self.assertIn('current_name = "_finish_scrape_batch_task"', patcher)
         self.assertIn('legacy_name = "_TransferChain__finish_scrape_batch_task"', patcher)
-        self.assertIn("chain_self._finish_scrape_batch_task(task)", patcher)
+        self.assertIn("resolve_scrape_batch_finish(chain_self)", patcher)
         self.assertNotIn(
             "chain_self._TransferChain__finish_scrape_batch_task(task)",
             patcher,
         )
         self.assertNotIn("check_patch_target(transfer_chain.jobview", patcher)
-        self.assertIn("cls._jobview_of(chain_self).verify()", patcher)
+        self.assertIn("cls._verify_jobview_once(chain_self)", patcher)
         self.assertIn("TransferChainPatcher.ensure_host_compatibility()", service)
 
-    def test_takeover_waits_for_v3_durable_settlement(self) -> None:
-        """接管保留批量性能，但必须等待并调用宿主 durable 终态回调"""
-        schema = (PLUGIN / "schemas" / "transfer.py").read_text()
+    def test_takeover_abandons_host_durable_admission_before_batching(self) -> None:
+        """接管前必须注销宿主恢复责任，否则回退原生整理"""
         patcher = (PLUGIN / "patch" / "transfer_chain.py").read_text()
-        handler = (PLUGIN / "helper" / "transfer" / "handler.py").read_text()
         service = (PLUGIN / "service" / "__init__.py").read_text()
         system = (FRONTEND / "src/components/sections/SystemConfigSection.vue").read_text()
 
-        self.assertIn("settlement_callback", schema)
-        self.assertIn("completion_event", schema)
-        self.assertIn("def settle(self, transferinfo", schema)
-        self.assertIn("_prepare_durable_checkpoint(chain_self, task)", patcher)
-        self.assertIn("plugin_task.completion_event.wait", patcher)
-        self.assertIn("self._settle_host_task(task, transferinfo)", handler)
-        self.assertIn("V3 durable 终态", service)
+        self.assertIn("abandon_taken_over_admission(", patcher)
+        self.assertNotIn("_prepare_durable_checkpoint", patcher)
+        self.assertNotIn("plugin_task.completion_event.wait", patcher)
+        self.assertNotIn("settlement_callback=callback", patcher)
+        self.assertIn("return cls._call_original(chain_self, task, callback)", patcher)
+        self.assertIn("V3 durable 责任隔离", service)
         self.assertIn("接管网盘整理", system)
 
 
