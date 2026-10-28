@@ -43,3 +43,7 @@ plugins/*/history.json
 # OS
 .DS_Store
 Thumbs.db 
+# Frontend (federation plugins)
+node_modules/
+frontend/*/dist/
+frontend/*/.vite/
