@@ -27,7 +27,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "邮箱验证码登录，服务端自动签到；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "4.0.3"
+    plugin_version = "4.0.4"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -44,10 +44,11 @@ class gladossign(_PluginBase):
     _device_id = ""
     _device_ua = ""
     _device_platform = "auto"
+    _session_invalid = False
     _auto_exchange = ""
     _proxy_enabled = False
     _timeout_seconds = 30
-    _retry_interval_seconds = 300
+    _retry_interval_seconds = 10
     _max_attempts = 2
     _retry_no_proxy_fallback = True
     _history_days = 30
@@ -112,7 +113,7 @@ class gladossign(_PluginBase):
             self._proxy_enabled = bool(config.get("proxy_enabled", False))
             self._timeout_seconds = self._as_int(config.get("timeout_seconds"), 30)
             self._max_attempts = max(1, self._as_int(config.get("max_attempts"), 2))
-            self._retry_interval_seconds = self._as_int(config.get("retry_interval_seconds"), 300)
+            self._retry_interval_seconds = self._as_int(config.get("retry_interval_seconds"), 10)
             self._retry_no_proxy_fallback = bool(config.get("retry_no_proxy_fallback", True))
             self._history_days = self._as_int(config.get("history_days"), 30)
 
@@ -395,6 +396,43 @@ class gladossign(_PluginBase):
             "cookie_items": len([x for x in cookie.split(";") if x.strip()]) if cookie else 0,
         }
 
+    _LOGIN_HINT = (
+        "请在 MoviePilot → 插件 → GlaDOS 签到 → 配置，填写邮箱获取验证码并重新登录。"
+        "登录状态会持久化保存，正常情况下无需反复登录。"
+    )
+
+    def _send_notice(self, title: str, text: str, dedupe_key: str = "", dedupe_hours: int = 12) -> None:
+        """发送通知；同一类失败可按去重窗口抑制，避免每天刷屏。"""
+        if not self._notify:
+            return
+        if dedupe_key:
+            state = self.get_data("glados_notice_state") or {}
+            if isinstance(state, dict) and state.get("key") == dedupe_key:
+                age = time.time() - float(state.get("ts") or 0)
+                if age < dedupe_hours * 3600:
+                    logger.info(f"同类通知已在 {age / 60:.0f} 分钟内发送，跳过：{dedupe_key}")
+                    return
+            self.save_data("glados_notice_state", {"key": dedupe_key, "ts": int(time.time())})
+        self.post_message(mtype=NotificationType.SiteMessage, title=title, text=text)
+
+    def _notice_relogin(self, reason: str, dedupe_hours: int = 12) -> None:
+        self._send_notice(
+            "🔔 GlaDOS 需要重新登录",
+            f"❌ {reason}\n\n{self._LOGIN_HINT}",
+            dedupe_key="relogin",
+            dedupe_hours=dedupe_hours,
+        )
+
+    @staticmethod
+    def _looks_like_challenge(resp: Any) -> bool:
+        """判断响应是否是 Cloudflare/HTML 拦截页而不是 JSON。"""
+        try:
+            ctype = str((resp.headers or {}).get("Content-Type") or "").lower()
+            text = str(getattr(resp, "text", "") or "")[:2000].lower()
+            return "text/html" in ctype or "<html" in text or "cf-chl" in text or "cloudflare" in text
+        except Exception:
+            return False
+
     def _cookie_pairs(self) -> Dict[str, str]:
         pairs: Dict[str, str] = {}
         for part in str(self._cookie or "").split(";"):
@@ -654,8 +692,7 @@ class gladossign(_PluginBase):
                 "message": message,
                 "points_gain": 0,
             })
-            if self._notify:
-                self.post_message(mtype=NotificationType.SiteMessage, title="🔴 GlaDOS 签到失败", text=message)
+            self._notice_relogin(message)
             return {"code": -1, "status": "未登录", "msg": message}
 
         url = f"{self._base_url.rstrip('/')}/api/user/checkin"
@@ -690,6 +727,26 @@ class gladossign(_PluginBase):
                         f"响应状态: {resp.status_code}, 耗时: {cost_ms}ms, "
                         f"code={data.get('code')}, reason={data.get('reason')}, message={data.get('message')}"
                     )
+                    # HTTP 层被拦截/限流：重试无意义，直接给出可执行提示
+                    if resp.status_code in (403, 429) or (not data and self._looks_like_challenge(resp)):
+                        message = (
+                            f"请求被 GlaDOS/Cloudflare 拦截或限流（HTTP {resp.status_code}）。"
+                            "请稍后重试；若持续出现，请在插件配置里开启「使用全局代理」更换出口 IP。"
+                        )
+                        logger.warning(message)
+                        self._save_history({
+                            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "status": "被拦截" if resp.status_code != 429 else "被限流",
+                            "message": message,
+                            "points_gain": 0,
+                        })
+                        self._send_notice(
+                            "🔴 GlaDOS 请求被拦截",
+                            message,
+                            dedupe_key=f"blocked:{resp.status_code}",
+                            dedupe_hours=20,
+                        )
+                        return {"code": -1, "status": "被拦截", "msg": message}
                     result = self._handle_checkin_response(data)
                     if result is not None:
                         return result
@@ -699,22 +756,30 @@ class gladossign(_PluginBase):
                         f"请求失败(第{index + 1}组第{attempt}/{self._max_attempts}次): {error}"
                     )
                     if attempt < self._max_attempts:
-                        time.sleep(max(0, self._retry_interval_seconds))
+                        time.sleep(max(0, min(self._retry_interval_seconds, 30)))
+
+        if isinstance(last_error, requests.exceptions.Timeout):
+            title = "🔴 GlaDOS 签到超时"
+            detail = (
+                f"请求超时（{self._timeout_seconds}s，共尝试 {self._max_attempts} 次）。"
+                "请检查 MoviePilot 服务器出网；如已配置代理，可尝试开启「使用全局代理」。"
+            )
+        elif isinstance(last_error, requests.exceptions.ConnectionError):
+            title = "🔴 无法连接 GlaDOS"
+            detail = "网络连接失败：请检查 MoviePilot 服务器 DNS/出网/代理设置。"
+        else:
+            title = "🔴 GlaDOS 签到失败"
+            detail = f"请求异常：{last_error}"
 
         record = {
             "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "status": "签到失败",
-            "message": f"请求异常: {last_error}",
+            "message": detail,
             "points_gain": 0,
         }
         self._save_history(record)
-        if self._notify:
-            self.post_message(
-                mtype=NotificationType.SiteMessage,
-                title="🔴 GlaDOS 签到失败",
-                text=f"⏰ {record['date']}\n❌ {record['message']}",
-            )
-        return {"code": -1, "status": "签到失败", "msg": record["message"]}
+        self._send_notice(title, f"⏰ {record['date']}\n❌ {detail}", dedupe_key="request_failed", dedupe_hours=6)
+        return {"code": -1, "status": "签到失败", "msg": detail}
 
     def _handle_checkin_response(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """解析签到响应；返回 None 表示应继续重试。"""
@@ -734,14 +799,14 @@ class gladossign(_PluginBase):
                 "message": message,
                 "points_gain": 0,
             })
-            if self._notify:
-                self.post_message(mtype=NotificationType.SiteMessage, title="🔴 GlaDOS 登录失效", text=message)
+            self._notice_relogin(message)
             return {"code": -2, "status": "登录失效", "msg": message}
 
         if code == 4 and data.get("reason") == "device-mismatch":
             message = (
                 "服务端判定设备不一致（登录设备={login}，当前设备={current}）。"
-                "插件已固定设备身份，出现该提示通常意味着账号在别处重新登录过，请在本插件重新登录。"
+                "插件使用固定设备身份，出现该提示通常意味着该账号最近在浏览器或其他设备登录过，"
+                "请在本插件重新登录以重新绑定；若反复出现，可在配置里更换「设备平台」后再登录。"
             ).format(
                 login=data.get("loginDevice") or "未知",
                 current=data.get("currentDevice") or "未知",
@@ -753,8 +818,12 @@ class gladossign(_PluginBase):
                 "message": message,
                 "points_gain": 0,
             })
-            if self._notify:
-                self.post_message(mtype=NotificationType.SiteMessage, title="🔴 GlaDOS 设备校验失败", text=message)
+            self._send_notice(
+                "🔴 GlaDOS 设备校验失败",
+                f"❌ {message}\n\n{self._LOGIN_HINT}",
+                dedupe_key="device_mismatch",
+                dedupe_hours=12,
+            )
             return {"code": 4, "status": "设备不一致", "msg": message}
 
         points_gain = self._to_int(data.get("points")) or 0
@@ -764,7 +833,7 @@ class gladossign(_PluginBase):
         if not points_gain and item.get("points"):
             points_gain = self._to_int(item.get("points")) or 0
 
-        if points_gain > 0:
+        if code == 0:
             status = "签到成功"
         elif code == 1 or "Repeats" in message_en or "Try Tomorrow" in message_en:
             status = "已签到"
@@ -773,6 +842,10 @@ class gladossign(_PluginBase):
 
         self._fetch_user_summary(self._build_headers(), self._get_proxies())
         points = self._current_points()
+        if self._session_invalid and status in ("签到成功", "已签到"):
+            # 签到本身成功，但会话在查询资料时失效：提示重新登录，避免第二天静默失败
+            self._clear_session()
+            self._notice_relogin("本次签到已完成，但查询账号信息时会话已失效（没有权限）")
 
         exchange_result = ""
         if status in ("签到成功", "已签到"):
@@ -814,23 +887,35 @@ class gladossign(_PluginBase):
         else:
             summary = message_en or "签到失败"
 
-        if self._notify:
-            title = {
-                "签到成功": "✅ GlaDOS 签到成功",
-                "已签到": "✅ 今日已签到",
-            }.get(status, "🔴 GlaDOS 签到失败")
+        if status == "签到失败":
+            self._send_notice(
+                "🔴 GlaDOS 签到失败",
+                "\n".join([
+                    f"❌ {message_en or '签到失败'}",
+                    f"🔢 服务端返回 code={code}" if raw_code is not None else "",
+                    f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"📧 {self._email}" if self._email else "",
+                ]).strip(),
+                dedupe_key=f"checkin_failed:{code}:{message_en[:30]}",
+                dedupe_hours=20,
+            )
+        else:
+            title = "✅ GlaDOS 签到成功" if status == "签到成功" else "✅ 今日已签到"
+            # 只展示真正尝试过的兑换结果，避免“积分不足/未到门槛”每天刷一行
+            show_exchange = bool(exchange_result) and (
+                exchange_result.startswith("自动兑换成功")
+                or exchange_result.startswith("自动兑换失败")
+                or exchange_result.startswith("自动兑换请求失败")
+            )
             lines = [
                 f"📝 {summary}",
                 f"💰 当前点数：{points}" if points is not None else "",
                 f"🕒 剩余天数：{user.get('leftDays')}" if user.get("leftDays") is not None else "",
                 f"📧 邮箱：{user.get('email') or self._email}" if (user.get("email") or self._email) else "",
-                f"🎁 {exchange_result}" if exchange_result else "",
+                f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"🎁 {exchange_result}" if show_exchange else "",
             ]
-            self.post_message(
-                mtype=NotificationType.SiteMessage,
-                title=title,
-                text="\n".join(item for item in lines if item),
-            )
+            self._send_notice(title, "\n".join(item for item in lines if item))
 
         result = {
             "code": 0 if status in ("签到成功", "已签到") else -1,
@@ -852,6 +937,7 @@ class gladossign(_PluginBase):
         timeout = max(10, min(self._timeout_seconds, 30))
         headers = self._strip_cookie(headers)
         http = self._new_http_session()
+        self._session_invalid = False
         try:
             resp = http.get(
                 f"{self._base_url.rstrip('/')}/api/user/points",
@@ -865,6 +951,8 @@ class gladossign(_PluginBase):
                 if data.get("code") == 0:
                     self.save_data("glados_points_info", data)
                     self._sync_history_from_api(data.get("history") or [])
+                elif data.get("code") == -2:
+                    self._session_invalid = True
         except Exception as error:
             logger.warning(f"获取 Points 失败: {error}")
 
@@ -877,6 +965,8 @@ class gladossign(_PluginBase):
             )
             self._persist_rotated_cookies(http)
             data = resp.json() or {}
+            if data.get("code") == -2:
+                self._session_invalid = True
             if data.get("code") == 0 and isinstance(data.get("data"), dict):
                 payload = data["data"]
                 result = {

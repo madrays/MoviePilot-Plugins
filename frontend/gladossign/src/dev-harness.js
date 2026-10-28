@@ -8,16 +8,21 @@ import Page from './components/Page.vue'
 import Config from './components/Config.vue'
 import Dashboard from './components/Dashboard.vue'
 
+const initialTheme = new URLSearchParams(location.search).get('theme') === 'light' ? 'gladosLight' : 'gladosDark'
 const vuetify = createVuetify({
   components,
   directives,
   icons: { defaultSet: 'mdi', aliases, sets: { mdi } },
   theme: {
-    defaultTheme: 'gladosDark',
+    defaultTheme: initialTheme,
     themes: {
       gladosDark: {
         dark: true,
-        colors: { primary: '#4ea1ff', success: '#3ecf8e', warning: '#ffb545', error: '#ff6b6b', background: '#121212', surface: '#1b1f24' },
+        colors: { primary: '#ff7a1a', success: '#4ade80', warning: '#f5b942', error: '#ff6b5e', background: '#070a08', surface: '#0d1310' },
+      },
+      gladosLight: {
+        dark: false,
+        colors: { primary: '#b8430b', success: '#2c6e46', warning: '#8a6200', error: '#a5231a', background: '#eceee7', surface: '#f8f9f3' },
       },
     },
   },

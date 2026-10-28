@@ -1,0 +1,612 @@
+/* ===================================================================
+   GlaDOS Terminal —— 插件视觉层
+   设计约束：
+   - 跟随 MoviePilot 明暗主题（.v-theme--dark / .v-theme--light）
+   - 冷中性底 + 单一橙色警示 + 青色数据点缀，仪器面板质感
+   - 等宽字体只用于读数与日志（语义用途，不是装饰）
+   =================================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Oxanium:wght@500;600;700&family=Share+Tech+Mono&display=swap');
+
+.gshell {
+  /* 浅色：实验记录纸 */
+  --g-bg: #e6ebee;
+  --g-panel: #f3f6f7;
+  --g-panel-2: #e9eef0;
+  --g-ink: #0f1518;
+  --g-dim: #58676e;
+  --g-line: #c0cbd1;
+  --g-grid: rgba(15, 21, 24, 0.05);
+  --g-accent: #b8430b;
+  --g-accent-2: #0d6b70;
+  --g-ok: #2c6e46;
+  --g-warn: #8a6200;
+  --g-bad: #a5231a;
+  --g-shadow: none;
+
+  color: var(--g-ink);
+  font-family: 'Oxanium', 'Roboto', 'PingFang SC', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  background-color: var(--g-bg);
+  background-image:
+    linear-gradient(var(--g-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--g-grid) 1px, transparent 1px);
+  background-size: 100% 28px, 28px 100%;
+  border: 1px solid var(--g-line);
+}
+
+.gshell.g-dark {
+  /* 深色：GLaDOS 终端 */
+  --g-bg: #06090b;
+  --g-panel: #0b1114;
+  --g-panel-2: #0f171b;
+  --g-ink: #d6e7e8;
+  --g-dim: #7c9399;
+  --g-line: #1b262b;
+  --g-grid: rgba(110, 190, 200, 0.055);
+  --g-accent: #ff7a1a;
+  --g-accent-2: #3fdfe6;
+  --g-ok: #4ade80;
+  --g-warn: #f5b942;
+  --g-bad: #ff6b5e;
+}
+
+/* ---------- 终端条 ---------- */
+.gbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--g-line);
+  background: var(--g-panel);
+}
+.gglyph {
+  color: var(--g-accent);
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  letter-spacing: 0.2em;
+}
+.gtitle {
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.gtitle .gdim {
+  color: var(--g-dim);
+  font-weight: 500;
+}
+.gspacer {
+  flex: 1;
+}
+.gled {
+  width: 7px;
+  height: 7px;
+  display: inline-block;
+  background: var(--g-dim);
+  box-shadow: 0 0 0 1px var(--g-line);
+}
+.gled.ok {
+  background: var(--g-ok);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--g-ok) 70%, transparent);
+}
+.gled.bad {
+  background: var(--g-bad);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--g-bad) 70%, transparent);
+}
+.gmono {
+  font-family: 'Share Tech Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  color: var(--g-dim);
+}
+
+/* ---------- 面板 ---------- */
+.gpanel {
+  position: relative;
+  background: var(--g-panel);
+  border: 1px solid var(--g-line);
+}
+.gpanel--ticks::before,
+.gpanel--ticks::after {
+  content: '';
+  position: absolute;
+  width: 9px;
+  height: 9px;
+  border-color: var(--g-accent);
+  border-style: solid;
+  pointer-events: none;
+}
+.gpanel--ticks::before {
+  top: -1px;
+  left: -1px;
+  border-width: 1px 0 0 1px;
+}
+.gpanel--ticks::after {
+  right: -1px;
+  bottom: -1px;
+  border-width: 0 1px 1px 0;
+}
+
+.gsec {
+  padding: 14px 16px 16px;
+  border-bottom: 1px solid var(--g-line);
+}
+.gsechead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.gnum {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--g-accent);
+  border: 1px solid color-mix(in oklab, var(--g-accent) 45%, var(--g-line));
+  padding: 1px 6px;
+}
+.gsechead .glabel {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--g-dim);
+}
+.gsechead .gline {
+  flex: 1;
+  height: 1px;
+  background: var(--g-line);
+}
+
+/* ---------- 读数 ---------- */
+.gmetrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  background: var(--g-panel-2);
+}
+.gcell {
+  padding: 12px 14px;
+  box-shadow: inset 1px 0 0 var(--g-line);
+}
+.gcell:first-child {
+  box-shadow: none;
+}
+.gcell .gk {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--g-dim);
+}
+.gcell .gv {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 26px;
+  line-height: 1.15;
+  margin-top: 4px;
+  color: var(--g-ink);
+  font-variant-numeric: tabular-nums;
+}
+.gcell .gv.is-accent {
+  color: var(--g-accent);
+}
+.gcell .gv.is-cyan {
+  color: var(--g-accent-2);
+}
+.gcell .gs {
+  font-size: 11px;
+  color: var(--g-dim);
+  margin-top: 2px;
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+}
+
+/* ---------- 按钮 ---------- */
+.gbtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 15px;
+  border: 1px solid var(--g-line);
+  background: transparent;
+  color: var(--g-ink);
+  font: 600 11.5px/1 'Share Tech Mono', ui-monospace, monospace;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background-color 0.15s ease;
+}
+.gbtn:hover:not(:disabled) {
+  border-color: var(--g-accent-2);
+  color: var(--g-accent-2);
+}
+.gbtn.primary {
+  border-color: var(--g-accent);
+  color: var(--g-accent);
+  background: color-mix(in oklab, var(--g-accent) 9%, transparent);
+}
+.gbtn.primary:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--g-accent) 16%, transparent);
+  color: var(--g-accent);
+  border-color: var(--g-accent);
+}
+.gbtn:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+.gbtn .gico {
+  font-size: 13px;
+  line-height: 1;
+}
+
+/* ---------- 日志/记录 ---------- */
+.glog {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 12px;
+}
+.gloghead,
+.glogrow {
+  display: grid;
+  grid-template-columns: 152px 64px 62px minmax(0, 1fr);
+  gap: 10px;
+  padding: 8px 16px;
+  align-items: baseline;
+}
+.gloghead {
+  color: var(--g-dim);
+  font-size: 10.5px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--g-line);
+}
+.glogrow {
+  border-bottom: 1px solid var(--g-line);
+}
+.glogrow:last-child {
+  border-bottom: 0;
+}
+.glogrow .gd {
+  color: var(--g-dim);
+}
+.glogrow .gm {
+  color: var(--g-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gtag {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  padding: 1px 5px;
+  border: 1px solid var(--g-line);
+  color: var(--g-dim);
+}
+.gtag.ok {
+  color: var(--g-ok);
+  border-color: color-mix(in oklab, var(--g-ok) 45%, var(--g-line));
+}
+.gtag.bad {
+  color: var(--g-bad);
+  border-color: color-mix(in oklab, var(--g-bad) 45%, var(--g-line));
+}
+
+/* ---------- 提示行 ---------- */
+.gnote {
+  display: flex;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--g-line);
+  background: var(--g-panel-2);
+  font-size: 12.5px;
+  color: var(--g-dim);
+}
+.gnote strong {
+  color: var(--g-ink);
+  font-weight: 600;
+}
+.gnote.warn {
+  border-color: color-mix(in oklab, var(--g-warn) 40%, var(--g-line));
+  background: color-mix(in oklab, var(--g-warn) 6%, var(--g-panel-2));
+  color: color-mix(in oklab, var(--g-warn) 65%, var(--g-ink));
+}
+.gnote.bad {
+  border-color: color-mix(in oklab, var(--g-bad) 40%, var(--g-line));
+  background: color-mix(in oklab, var(--g-bad) 6%, var(--g-panel-2));
+  color: color-mix(in oklab, var(--g-bad) 70%, var(--g-ink));
+}
+
+/* ---------- 空态 ---------- */
+.gempty {
+  padding: 26px 18px;
+  text-align: center;
+  border: 1px dashed var(--g-line);
+  color: var(--g-dim);
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 12.5px;
+  letter-spacing: 0.04em;
+}
+
+/* ---------- 表单适配 ---------- */
+.gshell :deep(.v-field) {
+  border-radius: 0;
+  background: var(--g-panel-2);
+}
+.gshell :deep(.v-field__outline) {
+  color: var(--g-line);
+}
+.gshell :deep(.v-label) {
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--g-dim);
+}
+.gshell :deep(.v-field__input) {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 13px;
+  color: var(--g-ink);
+}
+.gshell :deep(.v-messages__message) {
+  font-size: 11px;
+  color: var(--g-dim);
+}
+
+/* ---------- 入场动效 ---------- */
+@keyframes gIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.ganim {
+  animation: gIn 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.ganim-2 {
+  animation-delay: 0.05s;
+}
+.ganim-3 {
+  animation-delay: 0.1s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ganim,
+  .ganim-2,
+  .ganim-3 {
+    animation: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .gloghead {
+    display: none;
+  }
+  .glogrow {
+    grid-template-columns: 1fr auto;
+    row-gap: 3px;
+    padding: 10px 14px;
+  }
+  .glogrow > span:nth-child(3) {
+    display: none;
+  }
+  .glogrow .gm {
+    grid-column: 1 / -1;
+    white-space: normal;
+    color: var(--g-dim);
+    font-size: 11.5px;
+  }
+  .gtitle .gdim {
+    display: none;
+  }
+}
+
+
+/* ---------- Morph 图标 ---------- */
+.gaccent { color: var(--g-accent); }
+.gok { color: var(--g-ok); }
+.gbad { color: var(--g-bad); }
+.gcyan { color: var(--g-accent-2); }
+.gdimtxt { color: var(--g-dim); }
+.gico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.gspin svg {
+  animation: gspin 0.9s linear infinite;
+}
+@keyframes gspin {
+  to { transform: rotate(360deg); }
+}
+.gmeta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.gtag .glyph {
+  margin-right: 3px;
+}
+.gflip {
+  transform: rotate(180deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .gspin svg { animation: none; }
+}
+
+
+/* ---------- 主视觉 / 信号 ---------- */
+.ghero {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 20px 18px 18px;
+  border-bottom: 1px solid var(--g-line);
+  background:
+    radial-gradient(120% 140% at 88% 10%, color-mix(in oklab, var(--g-accent) 7%, transparent), transparent 60%),
+    var(--g-panel);
+  overflow: hidden;
+  position: relative;
+}
+.ghero::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 35%, color-mix(in oklab, var(--g-accent-2) 6%, transparent) 50%, transparent 65%);
+  transform: translateX(-120%);
+  animation: gsweep 7s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes gsweep {
+  0%, 55% { transform: translateX(-120%); }
+  75%, 100% { transform: translateX(120%); }
+}
+.ghero-main {
+  min-width: 0;
+  flex: 1;
+}
+.ghero-kicker {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--g-accent-2);
+}
+.ghero-title {
+  margin: 6px 0 8px;
+  font-size: 30px;
+  line-height: 1.1;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--g-ink);
+}
+.ghero-title span {
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  color: var(--g-dim);
+  font-weight: 500;
+  margin-left: 10px;
+  text-transform: uppercase;
+}
+.gboot {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 11.5px;
+  color: var(--g-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gboot .gprompt { color: var(--g-accent); }
+.gcursor {
+  display: inline-block;
+  width: 7px;
+  margin-left: 2px;
+  animation: gblink 1.1s steps(1, end) infinite;
+}
+@keyframes gblink { 50% { opacity: 0; } }
+
+.gsignal {
+  width: 112px;
+  height: 112px;
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.gsignal-ring {
+  position: absolute;
+  inset: 0;
+  border: 1px dashed var(--g-line);
+  border-radius: 50%;
+  animation: grot 22s linear infinite;
+}
+.gsignal-ring--2 {
+  inset: 16px;
+  border-style: solid;
+  border-color: color-mix(in oklab, var(--g-accent-2) 45%, var(--g-line));
+  animation-duration: 9s;
+  animation-direction: reverse;
+  border-top-color: transparent;
+}
+.gsignal-core {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--g-ok);
+  box-shadow: 0 0 14px color-mix(in oklab, var(--g-ok) 80%, transparent);
+  animation: gpulse 2.6s ease-in-out infinite;
+}
+.gsignal.is-off .gsignal-core {
+  background: var(--g-bad);
+  box-shadow: 0 0 14px color-mix(in oklab, var(--g-bad) 80%, transparent);
+}
+.gsignal.is-off .gsignal-ring--2 {
+  border-color: color-mix(in oklab, var(--g-bad) 35%, var(--g-line));
+}
+.gsignal-label {
+  position: absolute;
+  bottom: -6px;
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 9.5px;
+  letter-spacing: 0.2em;
+  color: var(--g-dim);
+}
+@keyframes grot { to { transform: rotate(360deg); } }
+@keyframes gpulse {
+  50% { transform: scale(1.4); opacity: 0.65; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ghero::after, .gsignal-ring, .gsignal-core, .gcursor { animation: none; }
+}
+
+/* ---------- 7 日点数图 ---------- */
+.gchart {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 12px 16px 8px;
+  min-height: 108px;
+}
+.gchartbar {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.gchartbar-track {
+  width: 100%;
+  max-width: 54px;
+  height: 54px;
+  display: flex;
+  align-items: flex-end;
+  border-bottom: 1px solid var(--g-line);
+}
+.gchartbar-val {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 10px;
+  color: var(--g-dim);
+}
+.gchartbar-fill {
+  width: 100%;
+  min-height: 2px;
+  height: 0;
+  background: color-mix(in oklab, var(--g-accent-2) 32%, transparent);
+  border-top: 1px solid var(--g-accent-2);
+  transition: height 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.gchartbar.is-today .gchartbar-fill {
+  background: color-mix(in oklab, var(--g-accent) 26%, transparent);
+  border-top-color: var(--g-accent);
+}
+.gchartbar-label {
+  font-family: 'Share Tech Mono', ui-monospace, monospace;
+  font-size: 9.5px;
+  color: var(--g-dim);
+}
+@media (max-width: 640px) {
+  .ghero { gap: 12px; padding: 16px 14px; }
+  .ghero-title { font-size: 22px; }
+  .gsignal { width: 84px; height: 84px; }
+  .gsignal-label { display: none; }
+}
