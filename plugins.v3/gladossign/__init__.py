@@ -27,7 +27,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "邮箱验证码登录，服务端自动签到；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "4.0.2"
+    plugin_version = "4.0.3"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -100,6 +100,9 @@ class gladossign(_PluginBase):
             base_url = str(config.get("base_url") or "").strip()
             self._base_url = base_url or "https://glados.cloud"
             self._email = str(config.get("email") or "").strip()
+            if not self._email:
+                account = self.get_data("glados_account") or {}
+                self._email = str((account or {}).get("email") or "").strip()
             self._device_platform = str(config.get("device_platform") or "auto").strip().lower()
             if self._device_platform not in ("auto", "windows", "macos", "linux"):
                 self._device_platform = "auto"
@@ -392,6 +395,64 @@ class gladossign(_PluginBase):
             "cookie_items": len([x for x in cookie.split(";") if x.strip()]) if cookie else 0,
         }
 
+    def _cookie_pairs(self) -> Dict[str, str]:
+        pairs: Dict[str, str] = {}
+        for part in str(self._cookie or "").split(";"):
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name = name.strip()
+            if name:
+                pairs[name] = value.strip()
+        return pairs
+
+    def _new_http_session(self) -> requests.Session:
+        """用已保存的 Cookie 建立会话，便于捕获服务端轮换下发的 Cookie。"""
+        session = requests.Session()
+        host = self._origin().split("://")[-1].split("/")[0]
+        for name, value in self._cookie_pairs().items():
+            try:
+                session.cookies.set(name, value, domain=host, path="/")
+            except Exception:
+                try:
+                    session.cookies.set(name, value)
+                except Exception:
+                    pass
+        return session
+
+    @staticmethod
+    def _strip_cookie(headers: Dict[str, str]) -> Dict[str, str]:
+        return {key: value for key, value in (headers or {}).items() if key.lower() != "cookie"}
+
+    def _persist_rotated_cookies(self, session: requests.Session) -> None:
+        """把服务端轮换后的 Cookie 回写，延长免登录时间。"""
+        pairs = {cookie.name: cookie.value for cookie in session.cookies}
+        if not pairs:
+            return
+        cookie_text = "; ".join(f"{name}={value}" for name, value in pairs.items())
+        if cookie_text == self._cookie:
+            return
+        previous = self.get_data("glados_session") or {}
+        previous = dict(previous) if isinstance(previous, dict) else {}
+        previous["cookie"] = cookie_text
+        previous["email"] = previous.get("email") or self._email
+        previous["login_at"] = previous.get("login_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        previous["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        previous["ts"] = int(time.time() * 1000)
+        self._cookie = cookie_text
+        self.save_data("glados_session", previous)
+        logger.info(f"会话 Cookie 已更新并持久化（{len(pairs)} 项）")
+
+    def _save_account_email(self, email: str) -> None:
+        email = str(email or "").strip().lower()
+        if not email:
+            return
+        self._email = email
+        self.save_data("glados_account", {
+            "email": email,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
     # ------------------------------------------------------------------ 登录流程
 
     def send_login_code(self, email: str) -> Dict[str, Any]:
@@ -419,8 +480,7 @@ class gladossign(_PluginBase):
         logger.info(f"发码响应: code={data.get('code')}, method={data.get('method')}, 耗时={time.time() - started:.1f}s")
 
         if data.get("code") == 0:
-            self._email = email
-            self.update_config(self._initial_config())
+            self._save_account_email(email)
             logger.info(f"验证码已发送: {email}（method={data.get('method')}）")
             return {"code": 0, "msg": "验证码已发送，请查收邮箱（注意垃圾箱）"}
         message = str(data.get("message") or data.get("reason") or "发送失败")
@@ -491,9 +551,8 @@ class gladossign(_PluginBase):
             logger.warning("登录返回成功但未拿到 Cookie")
             return {"code": -1, "msg": "登录成功但未获取到会话 Cookie，请重试"}
 
-        self._email = email
+        self._save_account_email(email)
         self._save_session(cookie_str, email)
-        self.update_config(self._initial_config())
         logger.info(f"登录成功: {email}, Cookie 项={len(cookies)}, 耗时={time.time() - started:.1f}s")
 
         # 资料刷新放后台，避免把登录响应拖过反代超时
@@ -612,9 +671,15 @@ class gladossign(_PluginBase):
             for attempt in range(1, self._max_attempts + 1):
                 try:
                     start_ms = int(time.time() * 1000)
-                    resp = requests.post(
-                        url, json=body, headers=headers, timeout=self._timeout_seconds, proxies=proxy
+                    http = self._new_http_session()
+                    resp = http.post(
+                        url,
+                        json=body,
+                        headers=self._strip_cookie(headers),
+                        timeout=self._timeout_seconds,
+                        proxies=proxy,
                     )
+                    self._persist_rotated_cookies(http)
                     cost_ms = int(time.time() * 1000) - start_ms
                     data = {}
                     try:
@@ -785,13 +850,16 @@ class gladossign(_PluginBase):
     def _fetch_user_summary(self, headers: Dict[str, str], proxies: Optional[Dict[str, str]]) -> Dict[str, Any]:
         """拉取点数、历史与账号信息。"""
         timeout = max(10, min(self._timeout_seconds, 30))
+        headers = self._strip_cookie(headers)
+        http = self._new_http_session()
         try:
-            resp = requests.get(
+            resp = http.get(
                 f"{self._base_url.rstrip('/')}/api/user/points",
                 headers=headers,
                 timeout=timeout,
                 proxies=proxies,
             )
+            self._persist_rotated_cookies(http)
             if resp.status_code == 200:
                 data = resp.json() or {}
                 if data.get("code") == 0:
@@ -801,12 +869,13 @@ class gladossign(_PluginBase):
             logger.warning(f"获取 Points 失败: {error}")
 
         try:
-            resp = requests.get(
+            resp = http.get(
                 f"{self._base_url.rstrip('/')}/api/user/status",
                 headers=headers,
                 timeout=timeout,
                 proxies=proxies,
             )
+            self._persist_rotated_cookies(http)
             data = resp.json() or {}
             if data.get("code") == 0 and isinstance(data.get("data"), dict):
                 payload = data["data"]
@@ -907,13 +976,15 @@ class gladossign(_PluginBase):
             return f"积分不足（{current}/{required}），未兑换{plan['label']}"
 
         try:
-            resp = requests.post(
+            http = self._new_http_session()
+            resp = http.post(
                 f"{self._base_url.rstrip('/')}/api/user/exchange",
                 json={"planType": plan["plan_type"]},
-                headers=headers,
+                headers=self._strip_cookie(headers),
                 timeout=self._timeout_seconds,
                 proxies=proxies,
             )
+            self._persist_rotated_cookies(http)
             data = resp.json() or {}
         except Exception as error:
             logger.warning(f"自动兑换请求失败: {error}")

@@ -52,8 +52,8 @@
               density="compact"
               class="mb-3 text-caption"
             >
-              登录由 MoviePilot 服务器直接完成，设备身份固定，无需从浏览器复制 Cookie。
-              验证码有效期较短，收到邮件后请尽快填写。
+              登录由 MoviePilot 服务器直接完成，设备身份每套安装独立生成，无需从浏览器复制 Cookie。
+              登录状态会持久化保存：MoviePilot 重启后仍然有效，无需重复登录；仅当 GlaDOS 主动失效会话时才需重新登录。
             </v-alert>
 
             <v-row dense>
