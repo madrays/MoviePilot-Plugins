@@ -63,6 +63,9 @@ const api = {
   },
   async post(path, body) {
     calls.push({ method: 'POST', path, body })
+    if (path.endsWith('/login') && window.__hangLogin) {
+      return new Promise(() => {})  // 模拟后端永不返回
+    }
     if (path.endsWith('/checkin')) return { code: 0, status: '签到成功', msg: '签到成功！获得 12 点数' }
     if (path.endsWith('/send_code')) return { code: 0, msg: '验证码已发送，请查收邮箱' }
     if (path.endsWith('/login')) { loggedIn = true; return { code: 0, msg: '登录成功', leftDays: 62 } }

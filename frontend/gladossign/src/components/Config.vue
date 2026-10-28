@@ -76,10 +76,10 @@
                   color="primary"
                   prepend-icon="mdi-send"
                   :loading="sending"
-                  :disabled="!email || session.logged_in"
+                  :disabled="!email || session.logged_in || sending || cooldown > 0"
                   @click="sendCode"
                 >
-                  发送验证码
+                  {{ cooldown > 0 ? `重新发送（${cooldown}s）` : '发送验证码' }}
                 </v-btn>
               </v-col>
             </v-row>
@@ -104,7 +104,7 @@
                   color="primary"
                   prepend-icon="mdi-login"
                   :loading="loggingIn"
-                  :disabled="!email || !code || session.logged_in"
+                  :disabled="!email || !code || session.logged_in || loggingIn"
                   @click="login"
                 >
                   登录
@@ -221,6 +221,18 @@
                 />
               </v-col>
               <v-col cols="12" md="4">
+                <v-select
+                  v-model="config.device_platform"
+                  label="设备平台"
+                  :items="platformItems"
+                  density="compact"
+                  variant="outlined"
+                  hide-details="auto"
+                  hint="每套安装独立随机生成；修改后需重新登录"
+                  persistent-hint
+                />
+              </v-col>
+              <v-col cols="12" md="4">
                 <v-text-field
                   v-model="config.base_url"
                   label="Base URL"
@@ -302,7 +314,8 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { friendlyError, withTimeout } from '../utils/request'
 
 const props = defineProps({
   api: { type: Object, default: null },
@@ -320,11 +333,19 @@ const messageType = ref('success')
 const sending = ref(false)
 const loggingIn = ref(false)
 const saving = ref(false)
+const cooldown = ref(0)
+let cooldownTimer = null
 
 const email = ref('')
 const code = ref('')
 const session = reactive({ logged_in: false, email: '', login_at: '', cookie_items: 0 })
 const device = reactive({ platform: '', screen: '', ua: '', fingerprint: '' })
+const platformItems = [
+  { title: '自动（跟随 MP 宿主机）', value: 'auto' },
+  { title: 'Windows', value: 'windows' },
+  { title: 'macOS', value: 'macos' },
+  { title: 'Linux', value: 'linux' },
+]
 
 const config = reactive({
   enabled: false,
@@ -339,6 +360,7 @@ const config = reactive({
   retry_no_proxy_fallback: true,
   retry_interval_seconds: 300,
   history_days: 30,
+  device_platform: 'auto',
 })
 
 // 宿主会传入 initialConfig，先落地为本地配置
@@ -371,19 +393,36 @@ async function loadState() {
   Object.assign(device, data.device || {})
 }
 
+function startCooldown(seconds = 60) {
+  cooldown.value = seconds
+  if (cooldownTimer) clearInterval(cooldownTimer)
+  cooldownTimer = setInterval(() => {
+    cooldown.value -= 1
+    if (cooldown.value <= 0) {
+      clearInterval(cooldownTimer)
+      cooldownTimer = null
+    }
+  }, 1000)
+}
+
 async function sendCode() {
-  if (!props.api) return
+  if (!props.api || cooldown.value > 0) return
   sending.value = true
   error.value = ''
   try {
-    const result = await props.api.post(`plugin/${pluginId.value}/send_code`, { email: email.value })
+    const result = await withTimeout(
+      props.api.post(`plugin/${pluginId.value}/send_code`, { email: email.value }),
+      25000,
+      '发送验证码',
+    )
     if (result && result.code === 0) {
       showMessage(result.msg || '验证码已发送')
+      startCooldown(60)
     } else {
       showMessage((result && result.msg) || '发送失败', 'error')
     }
   } catch (err) {
-    error.value = `发送验证码失败：${err}`
+    error.value = `发送验证码失败：${friendlyError(err)}`
   } finally {
     sending.value = false
   }
@@ -394,10 +433,14 @@ async function login() {
   loggingIn.value = true
   error.value = ''
   try {
-    const result = await props.api.post(`plugin/${pluginId.value}/login`, {
-      email: email.value,
-      code: code.value,
-    })
+    const result = await withTimeout(
+      props.api.post(`plugin/${pluginId.value}/login`, {
+        email: email.value,
+        code: code.value,
+      }),
+      45000,
+      '登录',
+    )
     if (result && result.code === 0) {
       showMessage(`登录成功（剩余 ${result.leftDays ?? '—'} 天）`)
       code.value = ''
@@ -407,7 +450,7 @@ async function login() {
       showMessage((result && result.msg) || '登录失败', 'error')
     }
   } catch (err) {
-    error.value = `登录失败：${err}`
+    error.value = `登录失败：${friendlyError(err)}`
   } finally {
     loggingIn.value = false
   }
@@ -416,7 +459,7 @@ async function login() {
 async function logout() {
   if (!props.api) return
   try {
-    await props.api.post(`plugin/${pluginId.value}/logout`, {})
+    await withTimeout(props.api.post(`plugin/${pluginId.value}/logout`, {}), 15000, '退出登录')
     showMessage('已退出登录')
     await loadState()
   } catch (err) {
@@ -444,6 +487,9 @@ watch(() => props.api, (value) => {
 })
 
 onMounted(loadState)
+onBeforeUnmount(() => {
+  if (cooldownTimer) clearInterval(cooldownTimer)
+})
 </script>
 
 <style scoped>

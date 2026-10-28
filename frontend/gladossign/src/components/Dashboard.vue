@@ -57,6 +57,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { friendlyError, withTimeout } from '../utils/request'
 
 const props = defineProps({
   api: { type: Object, default: null },
@@ -77,14 +78,14 @@ async function load() {
   if (!props.api) return
   loading.value = true
   try {
-    const data = await props.api.get(`plugin/${pluginId.value}/state`)
+    const data = await withTimeout(props.api.get(`plugin/${pluginId.value}/state`), 20000, '加载状态')
     if (data) {
       Object.assign(session, data.session || {})
       Object.assign(summary, data.summary || {})
       Object.assign(device, data.device || {})
     }
   } catch (err) {
-    message.value = `加载失败：${err}`
+    message.value = `加载失败：${friendlyError(err)}`
     messageType.value = 'error'
   } finally {
     loading.value = false
@@ -95,12 +96,12 @@ async function checkin() {
   if (!props.api) return
   loading.value = true
   try {
-    const result = await props.api.post(`plugin/${pluginId.value}/checkin`, {})
+    const result = await withTimeout(props.api.post(`plugin/${pluginId.value}/checkin`, {}), 45000, '签到')
     message.value = (result && (result.msg || result.status)) || '签到完成'
     messageType.value = result && result.code === 0 ? 'success' : 'error'
     await load()
   } catch (err) {
-    message.value = `签到失败：${err}`
+    message.value = `签到失败：${friendlyError(err)}`
     messageType.value = 'error'
   } finally {
     loading.value = false

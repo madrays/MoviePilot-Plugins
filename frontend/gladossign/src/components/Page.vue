@@ -159,6 +159,7 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { friendlyError, withTimeout } from '../utils/request'
 
 const props = defineProps({
   api: { type: Object, default: null },
@@ -191,7 +192,7 @@ function showMessage(text, type = 'success') {
 
 async function loadState() {
   if (!props.api) return
-  const data = await props.api.get(`plugin/${pluginId.value}/state`)
+  const data = await withTimeout(props.api.get(`plugin/${pluginId.value}/state`), 20000, '加载状态')
   if (!data) return
   Object.assign(state.session, data.session || {})
   Object.assign(state.summary, data.summary || {})
@@ -201,7 +202,7 @@ async function loadState() {
 
 async function loadHistory() {
   if (!props.api) return
-  const rows = await props.api.get(`plugin/${pluginId.value}/history`)
+  const rows = await withTimeout(props.api.get(`plugin/${pluginId.value}/history`), 20000, '加载历史')
   history.value = Array.isArray(rows) ? rows.slice(0, 8) : []
 }
 
@@ -217,7 +218,7 @@ async function loadAll() {
     await loadHistory()
     loaded.value = true
   } catch (err) {
-    error.value = `加载状态失败：${err}`
+    error.value = `加载状态失败：${friendlyError(err)}`
   } finally {
     loading.value = false
   }
@@ -228,7 +229,11 @@ async function checkin() {
   checkinLoading.value = true
   error.value = ''
   try {
-    const result = await props.api.post(`plugin/${pluginId.value}/checkin`, {})
+    const result = await withTimeout(
+      props.api.post(`plugin/${pluginId.value}/checkin`, {}),
+      45000,
+      '签到',
+    )
     if (result && result.code === 0) {
       showMessage(result.msg || '签到成功')
     } else {
@@ -237,7 +242,7 @@ async function checkin() {
     await loadAll()
     emit('action')
   } catch (err) {
-    error.value = `签到失败：${err}`
+    error.value = `签到失败：${friendlyError(err)}`
   } finally {
     checkinLoading.value = false
   }

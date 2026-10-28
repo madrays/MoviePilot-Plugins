@@ -1,5 +1,7 @@
 import random
+import re
 import string
+import threading
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -25,7 +27,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "邮箱验证码登录，服务端自动签到；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "4.0.0"
+    plugin_version = "4.0.1"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -41,6 +43,7 @@ class gladossign(_PluginBase):
     _cookie = ""
     _device_id = ""
     _device_ua = ""
+    _device_platform = "auto"
     _auto_exchange = ""
     _proxy_enabled = False
     _timeout_seconds = 30
@@ -53,12 +56,30 @@ class gladossign(_PluginBase):
     # 控制台登录/发码接口里的 site 是固定内部键，与控制台前端保持一致
     _SITE_KEY = "glados.network"
 
-    # 服务端登录使用固定的设备身份：登录与签到必须完全一致，否则服务端判定设备不一致
+    # 设备身份按安装随机生成：登录与签到必须一致，但不同安装之间不应相同。
+    # 平台默认跟随 MoviePilot 宿主机操作系统，也可在配置里手动指定。
+    _UA_TEMPLATES = {
+        "windows": (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36'
+        ),
+        "macos": (
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36'
+        ),
+        "linux": (
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+            '(KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36'
+        ),
+    }
+    _UA_VERSIONS = (138, 139, 140, 141, 142, 143)
+    # 常见桌面分辨率（height, width），与指纹后缀 -{h}-{w} 对应
+    _SCREENS = [(1080, 1920), (900, 1440), (1152, 2048), (1080, 2560), (864, 1536), (1200, 1920)]
     _DEFAULT_UA = (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
         '(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
     )
-    _DEVICE_SCREEN = (1080, 1920)  # (height, width)，与指纹后缀 -{h}-{w} 对应
+    _DEVICE_SCREEN = (1080, 1920)  # 兼容旧引用
 
     # 兑换接口的 planType 是字符串枚举（见控制台前端：plan100 / plan200 / plan500）
     _EXCHANGE_PLANS = {
@@ -79,6 +100,9 @@ class gladossign(_PluginBase):
             base_url = str(config.get("base_url") or "").strip()
             self._base_url = base_url or "https://glados.cloud"
             self._email = str(config.get("email") or "").strip()
+            self._device_platform = str(config.get("device_platform") or "auto").strip().lower()
+            if self._device_platform not in ("auto", "windows", "macos", "linux"):
+                self._device_platform = "auto"
             self._auto_exchange = str(config.get("auto_exchange") or "").strip()
             if self._auto_exchange not in self._EXCHANGE_PLANS:
                 self._auto_exchange = ""
@@ -149,6 +173,7 @@ class gladossign(_PluginBase):
             "cron": self._cron,
             "base_url": self._base_url,
             "email": self._email,
+            "device_platform": self._device_platform,
             "auto_exchange": self._auto_exchange,
             "proxy_enabled": self._proxy_enabled,
             "timeout_seconds": self._timeout_seconds,
@@ -187,25 +212,66 @@ class gladossign(_PluginBase):
         if not isinstance(device, dict):
             device = {}
         changed = False
+        desired_platform = self._resolve_platform()
+        # 已存在身份：仅当用户在配置里换了平台时才重新生成 UA（需重新登录）
+        if device.get("id") and desired_platform and device.get("platform") != desired_platform:
+            ua = self._random_ua(desired_platform)
+            device["ua"] = ua
+            device["platform"] = self._ua_platform(ua).strip('"')
+            device["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            changed = True
+            self._clear_session()
+            logger.info(f"设备平台已切换为 {device.get('platform')}，已清除旧会话，需要重新登录")
         if not device.get("id"):
-            height, width = self._DEVICE_SCREEN
+            platform = desired_platform or self._host_platform()
+            ua = self._random_ua(platform)
+            height, width = random.SystemRandom().choice(self._SCREENS)
             fingerprint = "".join(random.SystemRandom().choice(string.digits) for _ in range(32))
             device["id"] = f"{fingerprint}-{height}-{width}"
             device["screen"] = f"{width}x{height}"
-            device["ua"] = self._DEFAULT_UA
-            device["platform"] = self._ua_platform(self._DEFAULT_UA).strip('"')
+            device["ua"] = ua
+            device["platform"] = self._ua_platform(ua).strip('"')
             device["created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             changed = True
         if not device.get("ua"):
-            device["ua"] = self._DEFAULT_UA
-            device["platform"] = self._ua_platform(self._DEFAULT_UA).strip('"')
+            platform = self._host_platform()
+            ua = self._random_ua(platform)
+            device["ua"] = ua
+            device["platform"] = self._ua_platform(ua).strip('"')
             changed = True
         if changed:
             self.save_data("glados_device", device)
-            logger.info(f"已生成设备身份: 平台={device.get('platform')}, 指纹={str(device.get('id'))[:8]}…")
+            logger.info(
+                f"设备身份: 平台={device.get('platform')}, 屏幕={device.get('screen')}, "
+                f"指纹={str(device.get('id'))[:8]}…"
+            )
         self._device_id = str(device.get("id") or "")
         self._device_ua = str(device.get("ua") or self._DEFAULT_UA)
         return device
+
+    def _resolve_platform(self) -> str:
+        """配置指定优先；auto 时跟随宿主机平台。"""
+        if self._device_platform in self._UA_TEMPLATES:
+            return self._device_platform
+        return self._host_platform()
+
+    @staticmethod
+    def _host_platform() -> str:
+        try:
+            import platform as _platform
+            system = _platform.system().lower()
+        except Exception:
+            system = ""
+        if "windows" in system:
+            return "windows"
+        if "darwin" in system:
+            return "macos"
+        return "linux"
+
+    def _random_ua(self, platform: str) -> str:
+        template = self._UA_TEMPLATES.get(platform) or self._UA_TEMPLATES["linux"]
+        version = random.SystemRandom().choice(self._UA_VERSIONS)
+        return template.format(version=version)
 
     @staticmethod
     def _ua_platform(ua: str) -> str:
@@ -220,6 +286,31 @@ class gladossign(_PluginBase):
         if "Linux" in text:
             return '"Linux"'
         return '"macOS"'
+
+    @staticmethod
+    def _sec_ch_ua(ua: str) -> str:
+        """按 UA 里的 Chrome 主版本生成 Sec-CH-UA，保持与声明一致。"""
+        match = re.search(r"Chrome/(\d+)", ua or "")
+        major = match.group(1) if match else "142"
+        return f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not?A_Brand";v="99"'
+
+    def _login_session(self) -> requests.Session:
+        """创建会话并先访问登录页，尽量拿到 Cloudflare 等边缘节点下发的 Cookie。"""
+        session = requests.Session()
+        try:
+            warm = session.get(
+                f"{self._base_url.rstrip('/')}/login",
+                headers=self._build_headers(with_cookie=False),
+                timeout=max(6, min(self._timeout_seconds, 12)),
+                proxies=self._get_proxies(),
+                allow_redirects=False,
+            )
+            logger.info(
+                f"登录预热: GET /login -> HTTP {warm.status_code}, Cookie 项={len(session.cookies)}"
+            )
+        except Exception as error:
+            logger.warning(f"登录预热失败（继续尝试登录）: {error}")
+        return session
 
     def _origin(self) -> str:
         base = self._base_url.rstrip("/")
@@ -239,6 +330,10 @@ class gladossign(_PluginBase):
             "Referer": origin + "/console",
             "Sec-CH-UA-Mobile": "?0",
             "Sec-CH-UA-Platform": self._ua_platform(self._device_ua or self._DEFAULT_UA),
+            "Sec-CH-UA": self._sec_ch_ua(self._device_ua or self._DEFAULT_UA),
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
             "Authorization": self._device_id,
         }
         if with_cookie and self._cookie:
@@ -300,18 +395,24 @@ class gladossign(_PluginBase):
         email = str(email or "").strip().lower()
         if not email or "@" not in email:
             return {"code": -1, "msg": "请填写正确的邮箱地址"}
+        started = time.time()
         try:
             resp = requests.post(
                 f"{self._base_url.rstrip('/')}/api/authorization",
                 json={"address": email, "site": self._SITE_KEY},
                 headers=self._build_headers(with_cookie=False),
-                timeout=self._timeout_seconds,
+                timeout=max(8, min(self._timeout_seconds, 20)),
                 proxies=self._get_proxies(),
             )
             data = resp.json() or {}
+        except requests.exceptions.Timeout:
+            logger.warning(f"发送验证码超时（{time.time() - started:.1f}s）")
+            return {"code": -1, "msg": "发送验证码超时：服务器到 GlaDOS 无响应，请稍后重试或检查出网"}
         except Exception as error:
             logger.warning(f"发送验证码失败: {error}")
             return {"code": -1, "msg": f"发送验证码失败: {error}"}
+
+        logger.info(f"发码响应: code={data.get('code')}, method={data.get('method')}, 耗时={time.time() - started:.1f}s")
 
         if data.get("code") == 0:
             self._email = email
@@ -337,19 +438,42 @@ class gladossign(_PluginBase):
             return {"code": -1, "msg": "请填写邮箱收到的验证码"}
 
         self._ensure_device()
-        session = requests.Session()
+        session = self._login_session()
+        # 反代通常 30s 就回 504，登录请求必须在此前给出结果
+        request_timeout = max(8, min(self._timeout_seconds, 20))
+        started = time.time()
         try:
             resp = session.post(
                 f"{self._base_url.rstrip('/')}/api/login",
                 json={"method": "email", "site": self._SITE_KEY, "email": email, "mailcode": code},
                 headers=self._build_headers(with_cookie=False),
-                timeout=self._timeout_seconds,
+                timeout=request_timeout,
                 proxies=self._get_proxies(),
+                # 不跟随跳转：登录成功可能 302 到 /console，跟随会去拉页面而阻塞
+                allow_redirects=False,
             )
-            data = resp.json() or {}
+            data = {}
+            try:
+                data = resp.json() or {}
+            except Exception:
+                data = {}
+            # 302/303 且已下发 Cookie 时视为登录成功
+            if resp.status_code in (301, 302, 303, 307, 308) and len(session.cookies) > 0:
+                data = {"code": 0, "message": "redirect login ok"}
+        except requests.exceptions.Timeout:
+            elapsed = time.time() - started
+            logger.warning(f"登录请求超时（{elapsed:.1f}s）: 服务器到 GlaDOS 的 /api/login 无响应")
+            return {
+                "code": -1,
+                "msg": f"登录请求超时（{elapsed:.0f}s 无响应）：服务器到 GlaDOS 的 /api/login 被阻塞，"
+                       f"请检查 MoviePilot 服务器出网或稍后重试",
+            }
         except Exception as error:
-            logger.warning(f"登录请求失败: {error}")
+            elapsed = time.time() - started
+            logger.warning(f"登录请求失败（{elapsed:.1f}s）: {error}")
             return {"code": -1, "msg": f"登录请求失败: {error}"}
+
+        logger.info(f"登录响应: code={data.get('code')}, message={data.get('message')}, 耗时={time.time() - started:.1f}s")
 
         if data.get("code") != 0:
             message = str(data.get("message") or data.get("reason") or "登录失败")
@@ -366,20 +490,31 @@ class gladossign(_PluginBase):
         self._email = email
         self._save_session(cookie_str, email)
         self.update_config(self._initial_config())
+        logger.info(f"登录成功: {email}, Cookie 项={len(cookies)}, 耗时={time.time() - started:.1f}s")
 
-        summary = self._fetch_user_summary(self._build_headers(), self._get_proxies())
-        logger.info(
-            f"登录成功: {email}, Cookie 项={len(cookies)}, 剩余天数={summary.get('leftDays')}"
-        )
+        # 资料刷新放后台，避免把登录响应拖过反代超时
+        try:
+            threading.Thread(target=self._refresh_profile, daemon=True).start()
+        except Exception:
+            pass
+
+        cached_user = self.get_data("glados_user") or {}
         return {
             "code": 0,
             "msg": "登录成功",
             "email": email,
             "cookie_items": len(cookies),
-            "leftDays": summary.get("leftDays"),
+            "leftDays": cached_user.get("leftDays"),
             "points": self._current_points(),
             "platform": self._ua_platform(self._device_ua).strip('"'),
         }
+
+    def _refresh_profile(self) -> None:
+        """后台刷新账号资料，失败不影响登录结果。"""
+        try:
+            self._fetch_user_summary(self._build_headers(), self._get_proxies())
+        except Exception as error:
+            logger.warning(f"后台刷新账号资料失败: {error}")
 
     def logout(self) -> Dict[str, Any]:
         self._clear_session()
