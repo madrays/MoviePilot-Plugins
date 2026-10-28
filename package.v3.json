@@ -198,11 +198,12 @@
     "name": "GlaDOS 签到",
     "description": "邮箱验证码登录，服务端自动签到；积累点数可兑换 10~100 天套餐时长",
     "labels": "签到,GlaDOS,VPN",
-    "version": "4.0.4",
+    "version": "4.0.5",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png",
     "author": "madrays",
     "level": 2,
     "history": {
+      "v4.0.5": "终端风 UI（跟随明暗主题、Morphicons 动态图标、主视觉信号与 7 日点数图）、AFF 图片回归；通知体系重做；重试间隔默认 10s；V2 不再更新",
       "v4.0.4": "全新终端风 UI（跟随 MP 明暗主题、Morphicons 动态图标、主视觉信号与 7 日点数图、AFF 图片回归）；通知体系重做（登录失效/超时/Cloudflare 拦截/业务失败分类，失败去重）；重试间隔默认 10s",
       "v4.0.3": "会话持久化：登录与发码不再触发插件重载；签到/查询全程使用 Session 并自动回写服务端轮换 Cookie，MP 重启后免登录",
       "v4.0.2": "修复设备平台比较大小写不一致导致每次插件重载都清空会话（登录成功但签到提示未登录）",
