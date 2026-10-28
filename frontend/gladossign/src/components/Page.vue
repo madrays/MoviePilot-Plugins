@@ -169,7 +169,6 @@ const props = defineProps({
 const emit = defineEmits(['switch', 'action', 'close'])
 
 const pluginId = computed(() => props.pluginId || 'gladossign')
-const PLUGIN_ID = pluginId  // 兼容原有调用写法
 const loading = ref(false)
 const loaded = ref(false)
 const checkinLoading = ref(false)
@@ -217,7 +216,6 @@ async function loadAll() {
     await loadState()
     await loadHistory()
     loaded.value = true
-    emit('action')
   } catch (err) {
     error.value = `加载状态失败：${err}`
   } finally {
@@ -237,6 +235,7 @@ async function checkin() {
       showMessage((result && (result.msg || result.status)) || '签到失败', 'error')
     }
     await loadAll()
+    emit('action')
   } catch (err) {
     error.value = `签到失败：${err}`
   } finally {
