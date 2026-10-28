@@ -27,7 +27,7 @@ class gladossign(_PluginBase):
     plugin_name = "GlaDOS 签到"
     plugin_desc = "邮箱验证码登录，服务端自动签到；积累点数可兑换 10~100 天套餐时长"
     plugin_icon = "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png"
-    plugin_version = "4.0.1"
+    plugin_version = "4.0.2"
     plugin_author = "madrays"
     author_url = "https://github.com/madrays"
     plugin_config_prefix = "gladossign_"
@@ -213,8 +213,12 @@ class gladossign(_PluginBase):
             device = {}
         changed = False
         desired_platform = self._resolve_platform()
-        # 已存在身份：仅当用户在配置里换了平台时才重新生成 UA（需重新登录）
-        if device.get("id") and desired_platform and device.get("platform") != desired_platform:
+        # 已存在身份：仅当平台确实变化时才重新生成 UA（需重新登录）。
+        # 注意比较时统一小写：device["platform"] 存的是展示值（"Linux"），
+        # 而 desired_platform 是内部键（"linux"），直接比较会永远不等，
+        # 导致每次插件 reload 都误判换平台、重建 UA 并清空会话。
+        stored_platform = str(device.get("platform") or "").strip().lower()
+        if device.get("id") and desired_platform and stored_platform != desired_platform.lower():
             ua = self._random_ua(desired_platform)
             device["ua"] = ua
             device["platform"] = self._ua_platform(ua).strip('"')

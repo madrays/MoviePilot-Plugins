@@ -198,11 +198,12 @@
     "name": "GlaDOS 签到",
     "description": "邮箱验证码登录，服务端自动签到；积累点数可兑换 10~100 天套餐时长",
     "labels": "签到,GlaDOS,VPN",
-    "version": "4.0.1",
+    "version": "4.0.2",
     "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/glados.png",
     "author": "madrays",
     "level": 2,
     "history": {
+      "v4.0.2": "修复设备平台比较大小写不一致导致每次插件重载都清空会话（登录成功但签到提示未登录）",
       "v4.0.1": "设备身份按安装随机生成（平台跟随宿主机，可手选）；登录请求不跟随跳转、20s 内失败返回；验证码 60s 冷却；前端请求超时兜底，避免 504 无限转圈",
       "v4.0.0": "改为 Vue 联邦插件 + 服务器端登录：邮箱验证码登录，Cookie/UA/设备指纹全部由插件固定生成，不再依赖浏览器；内置发码、登录、立即签到与历史记录页面",
       "v3.0.1": "适配 glados.space 控制台的设备不一致提示；新增可选积分自动兑换套餐",
